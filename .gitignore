@@ -3,3 +3,33 @@
 
 # Ada Library Information
 *.ali
+
+# ===== AI-BIM =====
+
+# 运行/调试产物：tools/*.js 截图脚本跑出来的 PNG、生成的模型数据
+outputs/
+
+# ASR 语音模型权重（体积大，可重新下载，不进仓库）
+#   vosk 小模型：bash tools/getasr.sh
+#   sherpa paraformer（mzh）：https://github.com/k2-fsa/sherpa-onnx/releases
+tools/asr/mzh/
+tools/asr/vosk-model-*/
+tools/asr/parts/
+tools/asr/**/*.onnx
+tools/asr/**/*.fst
+tools/asr/**/*.mdl
+tools/asr/**/*.ie
+tools/asr/**/*.zip
+# 注意：tools/asr/*.wav、tools/asr/gen/*.wav 是自检用的测试音频，保留
+
+# 密钥（本地真实 Key，禁止入库；用 tools/.llm_key.example 作模板）
+tools/.llm_key
+*.llm_key
+.env
+
+# 通用
+__pycache__/
+*.py[cod]
+node_modules/
+.DS_Store
+*.log

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AIbim 运维系统</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">AI</div>
+      <div class="brand-txt"><b>AIbim 运维系统</b><i>滨海科创中心 A 座</i></div>
+      <button class="ic-btn" id="btnSound" title="语音播报开关">
+        <svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path class="w1" d="M16 8.5a4.5 4.5 0 0 1 0 7"/><path class="w1" d="M18.5 6a8 8 0 0 1 0 12"/></svg>
+      </button>
+    </div>
+    <div class="chat" id="chat"></div>
+    <div class="ctxbar" id="ctxBar">
+      <span class="ctx-now" id="ctxNow"><i></i>还没开始</span>
+      <button class="ai-chip" id="btnAI" title="大模型设置"><u></u><span id="aiTxt">本地理解</span></button>
+    </div>
+    <div class="composer">
+      <button class="mic" id="btnMic" title="点击开始语音对话">
+        <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>
+      </button>
+      <div class="input-wrap">
+        <input id="txt" autocomplete="off" spellcheck="false" placeholder="说一句话，例如“把空压机放到 2 楼 202”">
+      </div>
+      <button class="send" id="btnSend" title="发送">
+        <svg viewBox="0 0 24 24"><path d="M4 12h14"/><path d="M12 5l7 7-7 7"/></svg>
+      </button>
+    </div>
+    <div class="listen" id="listenBar" hidden><span class="wave"><i></i><i></i><i></i><i></i></span><b id="listenState">我在听</b><span id="listenTxt"></span><button id="btnVoiceDone" class="v-done" title="说完点这里，立刻发送">说完</button></div>
+  </aside>
+
+  <main class="stage" id="stage">
+    <canvas id="cv"></canvas>
+
+    <div class="chip-mode" id="modeChip" hidden>
+      <span id="modeTxt"></span>
+      <button id="modeCancel" title="取消">×</button>
+    </div>
+
+    <div class="panel tree" id="pTree" hidden>
+      <div class="p-head"><b>模型树</b><span class="t-meta" id="treeMeta"></span><button class="p-x" data-close="pTree">×</button></div>
+      <div class="t-search"><input id="treeQ" spellcheck="false" autocomplete="off" placeholder="搜索房间号 / 构件编号 / 设备名"></div>
+      <div class="p-body t-body" id="treeBody"></div>
+    </div>
+
+    <div class="panel" id="pProps" hidden>
+      <div class="p-head"><b id="propsTitle">属性</b><button class="p-x" data-close="pProps">×</button></div>
+      <div class="p-body" id="propsBody"></div>
+    </div>
+
+    <div class="panel" id="pEquip" hidden>
+      <div class="p-head"><b>设备库</b><button class="p-x" data-close="pEquip">×</button></div>
+      <div class="p-body list" id="equipBody"></div>
+      <div class="p-foot"><label class="up">上传设备清单<input type="file" id="fileEquip" accept=".json,.csv,.txt" hidden></label></div>
+    </div>
+
+    <div class="panel" id="pTopo" hidden>
+      <div class="p-head"><b id="topoTitle">管线影响</b><button class="p-x" data-close="pTopo">×</button></div>
+      <div class="p-body" id="topoBody"></div>
+    </div>
+
+    <div class="panel calc" id="pCalc" hidden>
+      <div class="p-head"><b>单板承载力计算书</b>
+        <span class="p-actions"><button id="calcDl" title="下载计算书">下载</button><button class="p-x" data-close="pCalc">×</button></span>
+      </div>
+      <div class="p-body doc" id="calcBody"></div>
+    </div>
+
+    <div class="panel ai" id="pAI" hidden>
+      <div class="p-head"><b>大模型接入</b><button class="p-x" data-close="pAI">×</button></div>
+      <div class="p-body form">
+        <div class="p-presets" id="llmPresets">
+          <button data-ep="https://api.deepseek.com/v1" data-model="deepseek-chat">DeepSeek</button>
+          <button data-ep="https://dashscope.aliyuncs.com/compatible-mode/v1" data-model="qwen-plus">通义千问</button>
+          <button data-ep="https://open.bigmodel.cn/api/paas/v4" data-model="glm-4-flash">智谱 GLM</button>
+          <button data-ep="https://api.moonshot.cn/v1" data-model="moonshot-v1-8k">Kimi</button>
+          <button data-ep="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
+          <button data-ep="http://127.0.0.1:11434/v1" data-model="qwen2.5:7b" data-key="local">本地 Ollama</button>
+          <button data-ep="/llm/v1" data-model="" class="hot">本机直连（无跨域）</button>
+        </div>
+        <label>接口地址<input id="llmEp" spellcheck="false" placeholder="https://api.deepseek.com/v1 或 /llm/v1"></label>
+        <label>模型名称<input id="llmModel" spellcheck="false" placeholder="deepseek-chat / gpt-4o-mini"></label>
+        <div class="p-line"><button class="p-link" id="llmModels">不知道模型名？点这里从服务拉取</button></div>
+        <div class="p-models" id="llmModelList" hidden></div>
+        <label>API Key<input id="llmKey" type="password" spellcheck="false" placeholder="sk-...（本机直连时由服务端注入，可留空）"></label>
+        <label>超时（毫秒）<input id="llmTo" type="number" min="3000" step="1000" value="12000"></label>
+        <p class="p-note">直连服务商的 API（DeepSeek / 通义 / Kimi 等）填完整地址；遇到<b>跨域被拦</b>（预检 403、Failed to fetch）就改用 <b>/llm/v1</b> + <b>tools/serve.py</b>，页面与转发同源，浏览器不会发预检。</p>
+      </div>
+      <div class="p-tools">
+        <div class="p-tools-hd"><b>AI 能直接调用的工具（MCP 风格）</b><span id="toolCount"></span></div>
+        <div class="p-tools-list" id="toolList"></div>
+      </div>
+      <div class="p-diag" id="llmDiag" hidden></div>
+      <div class="p-foot row">
+        <button class="btn" id="llmTest">测试连接</button>
+        <button class="btn primary" id="llmSave">保存</button>
+      </div>
+    </div>
+
+    <div class="toolbar" id="toolbar"></div>
+    <div class="toast" id="toast"></div>
+    <div class="tip" id="tip"></div>
+  </main>
+</div>
+
+<div id="err" style="display:none;position:fixed;left:0;top:0;z-index:99999;background:#c00;color:#fff;font:12px monospace;padding:8px;max-width:100%;white-space:pre-wrap"></div>
+<script>
+window.__errs=[];
+window.addEventListener('error',function(e){
+  window.__errs.push((e.message||'')+' @ '+(e.filename||'').split('/').pop()+':'+(e.lineno||''));
+  var d=document.getElementById('err');d.style.display='block';d.textContent=window.__errs.join('\n');
+});
+</script>
+<script src="js/vendor/three.min.js"></script>
+<script src="js/vendor/OrbitControls.js"></script>
+<script src="data/model-data.js"></script>
+<script src="data/ifc-data.js"></script>
+<script src="js/calc.js"></script>
+<script src="js/nlp.js"></script>
+<script src="js/routes.js"></script>
+<script src="js/ifc.js"></script>
+<script src="js/agent.js"></script>
+<script src="js/mcp.js"></script>
+<script src="js/scene.js"></script>
+<script src="js/detail.js"></script>
+<script src="js/equip.js"></script>
+<script src="js/tree.js"></script>
+<script src="js/app.js"></script>
+<input type="file" id="fileIfc" accept=".ifc" hidden>
+</body>
+</html>
