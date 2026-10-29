@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+docs
+outputs
+tools/asr
+tools/*.js
+tools/*.py.bak
+tools/.llm_key
+**/__pycache__
+**/*.pyc
+.DS_Store
