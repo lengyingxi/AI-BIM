@@ -1,20 +1,28 @@
-# AI-BIM 运行镜像：web 静态资源 + tools/serve.py 服务端（含同源 LLM 代理）
-# 服务端只用 Python 标准库，不装任何 pip 包，镜像保持精简。
-# BASE_IMAGE 可覆盖：国内构建/拉取受限时改用镜像加速源
-# docker build --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-alpine .
+# AI-BIM 运行镜像：web 静态资源 + tools/serve.py 服务端（含同源 LLM 代理、离线语音）
 #
-# 用 alpine（musl libc）而不是 slim（Debian 12 / glibc 2.36）：
-# glibc 2.34+ 的 pthread_create 走 clone3 系统调用，Docker 20.10.10 以前的默认
-# seccomp profile 不放行 clone3，在 Docker 18/19 上会直接 "can't start new thread"，
-# 一个工作线程都开不出来。musl 只用传统的 clone，不受此限制。
-ARG BASE_IMAGE=python:3.11-alpine
+# 基础镜像固定用 Debian 11（bullseye），不要换成 bookworm/slim：
+#   1) glibc 2.31 < 2.34，pthread_create 走传统 clone 系统调用。
+#      glibc 2.34+ 改走 clone3，而 Docker 20.10.10 以前的默认 seccomp profile
+#      不放行 clone3，在 Docker 18/19 上会 "can't start new thread"，
+#      一个工作线程都开不出来，服务起得来但所有请求被掐断。
+#   2) sherpa-onnx 只提供 manylinux wheel，musl（alpine）装不上。
+#
+# BASE_IMAGE 可覆盖：国内构建/拉取受限时改用镜像加速源
+#   docker build --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-slim-bullseye .
+# PIP_INDEX_URL 可覆盖：国内 pip 慢时指定镜像源
+ARG BASE_IMAGE=python:3.11-slim-bullseye
 FROM ${BASE_IMAGE}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8823
 
+ARG PIP_INDEX_URL=
+
 WORKDIR /app
+
+# 离线语音识别依赖（模型不进镜像，运行时挂载到 /app/tools/asr）
+RUN pip install --no-cache-dir ${PIP_INDEX_URL:+--index-url $PIP_INDEX_URL} sherpa-onnx
 
 # 只带运行必需的东西：前端资源 + 服务端脚本
 COPY web/                /app/web/
@@ -25,7 +33,7 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 # ASR 离线语音模型不进镜像（体积大且未入库），留空目录供运行时挂载
 RUN mkdir -p /app/tools/asr \
     && chmod +x /app/docker-entrypoint.sh \
-    && adduser -D -u 10001 app \
+    && useradd -m -u 10001 app \
     && chown -R app:app /app
 
 USER app
