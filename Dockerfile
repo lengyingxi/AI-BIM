@@ -22,7 +22,9 @@ ARG PIP_INDEX_URL=
 WORKDIR /app
 
 # 离线语音识别依赖（模型不进镜像，运行时挂载到 /app/tools/asr）
-RUN pip install --no-cache-dir ${PIP_INDEX_URL:+--index-url $PIP_INDEX_URL} sherpa-onnx
+# numpy 必须显式装：sherpa-onnx 2.x 不再自带，而 _sherpa_feed 要用它把
+# int16 PCM 转成 float32，缺了会静默返回空文本（表现为"听得见但识别不出字"）
+RUN pip install --no-cache-dir ${PIP_INDEX_URL:+--index-url $PIP_INDEX_URL} sherpa-onnx numpy
 
 # 只带运行必需的东西：前端资源 + 服务端脚本
 COPY web/                /app/web/
