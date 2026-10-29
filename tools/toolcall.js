@@ -144,21 +144,31 @@ const ok = (n, c, e) => { console.log((c ? '  ✅ ' : '  ❌ ') + n + (e ? '  �
   ok('有实时预览文字', /空压机/.test(prev.bar) && /空压机/.test(prev.box), JSON.stringify(prev));
   ok('状态显示"听到了"', prev.state === '听到了', prev.state);
   await p.screenshot({ path: OUT + 'tool-7-voice.png' });
-  // 只给中间结果，等静音计时器自动发出去
-  const n7 = await aiCount();
+  // 只给中间结果，等静音计时器自动发出去。
+  // 判定看"这句话被提交了没有"（voice.last），不看 ai 条数——
+  // 大模型现在要跑多轮，回复可能好几秒，用条数判会把"已经发了"错判成"没发"。
+  const want7 = '把空压机放到2楼202靠墙';
+  let submitted = false;
   for (let i = 0; i < 40; i++) {
     await sleep(250);
-    if ((await aiCount()) > n7) break;
+    const st = await p.evaluate(() => BIM.app.voice.state());
+    if (st.last === want7) { submitted = true; break; }
   }
-  ok('静音 1.4 秒后自动结算发送', (await aiCount()) > n7, 'ai 条数 ' + n7 + ' → ' + (await aiCount()) + '  ' + JSON.stringify(await p.evaluate(() => BIM.app.voice.state())));
+  ok('静音 1.4 秒后自动结算发送', submitted, 'voice.last=' + (await p.evaluate(() => BIM.app.voice.state().last)));
   ok('输入框已清空', (await p.evaluate(() => document.getElementById('txt').value)) === '');
+  // 等这句的回复落地，免得下面【8】被上一条的 busy 挡住
+  for (let i = 0; i < 80; i++) {
+    await sleep(250);
+    const st = await p.evaluate(() => ({ busy: BIM.app.voice.state().busy, n: document.querySelectorAll('.msg.ai:not(.typing)').length }));
+    if (!st.busy) break;
+  }
 
   console.log('\n【8】「说完」按钮立刻发送');
   const n8 = await aiCount();
   await p.evaluate(() => window.__sr.inst.emit('看看3楼', false));
   await sleep(200);
   await p.evaluate(() => document.getElementById('btnVoiceDone').click());
-  for (let i = 0; i < 30; i++) { await sleep(200); if ((await aiCount()) > n8) break; }
+  for (let i = 0; i < 80; i++) { await sleep(250); if ((await aiCount()) > n8) break; }
   ok('不等静音也能发', (await aiCount()) > n8, 'ai 条数 ' + n8 + ' → ' + (await aiCount()));
 
   console.log('\n【9】语音服务连不上时明确停下来');

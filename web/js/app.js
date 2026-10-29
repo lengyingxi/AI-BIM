@@ -45,6 +45,8 @@
   let lastSay = '';        // 最后一条 AI 原话，多步任务收敛时补一次播报
   let lastHtml = '', sayBuf = [];
   let lastData = null;     // 结构化结果（工具层回给大模型用）
+  let loopQuiet = false;   // Agent 循环执行中：工具产生的中间话先攒着，最后统一说
+  let toolSteps = [];      // 这一轮模型实际调了哪几个工具（诊断/回归用）
   /* ST.mute：执行工具链时先把要说的话攒起来，最后一句话统一说，避免一句指令冒两三条回复 */
   function ai(text, html, speak) {
     lastSay = text.replace(/<[^>]+>/g, '');
@@ -1278,6 +1280,7 @@
      ob 里带着碰撞信息：pass=false 也照放，只是回复里把每一处冲突列出来并描红。 */
   function commitPlaceAt(room, dev, x, y, ob, moved, quiet) {
     if (!room || !dev) return null;
+    dropClr();                 // 位置变了，旧的净距标注不再成立
     const eq = Object.assign({}, dev, {
       id: 'EQP' + (ST.equipId++), lib: dev.lib || dev.id, x: x, y: y, floor: room.floor, room: room.id,
       floorElev: room.elev, name: dev.name, color: dev.color || '#4f7df3'
@@ -2005,16 +2008,91 @@
     if (x.el && x.el.parentNode) x.el.parentNode.removeChild(x.el);
   }
 
+  /* 工具执行器：Agent 循环每调一次工具都走这里，
+     顺便把"模型到底调了什么"记下来，诊断面板和回归脚本都看这份 */
+  async function toolExec(name, args) {
+    const A = window.BIM.agent;
+    const map = A.toolToStep || {};
+    let step = null;
+    if (map[name]) {
+      try { step = A.fillStep(Object.assign(map[name](args || {}), { text: '', tool: name })); }
+      catch (e) { step = null; }
+    }
+    const out = await window.BIM.mcp.call(name, args || {});
+    if (step) { step.ok = !!(out && out.ok !== false); toolSteps.push(step); }
+    return out;
+  }
+
   async function send(text) {
     if (!text || busy) return;
     me(text);
     busy = true;
     ST.mute = false; ST.quiet = false;
     const typing = startTyping();
-    let plan = null;
-    try {
-      plan = await window.BIM.agent.plan(text);
-    } catch (e) { plan = null; }
+    const A = window.BIM.agent;
+
+    let plan = null, loopRes = null;
+    lastSay = ''; lastHtml = ''; sayBuf = []; chipQ = []; lastData = null; toolSteps = [];
+
+    /* ① 先走 Agent 循环：模型可以连着调几次工具、看着执行结果改方案。
+       以前只发一次请求，模型根本看不到结果，只能反问用户——这就是"像没执行"的根。 */
+    if (A.cfg.on && A.loop) {
+      loopQuiet = true;
+      try { loopRes = await A.loop(text, toolExec); }
+      catch (e) { loopRes = { ok: false, err: String((e && e.message) || e) }; }
+      loopQuiet = false;
+
+      if (loopRes && loopRes.ok && loopRes.calls > 0) {
+        stopTyping(typing); busy = false;
+        window.BIM._lastPlan = {
+          source: 'llm', tools: loopRes.trace.map(t => t.name), steps: toolSteps.slice(),
+          reply: loopRes.reply, trace: loopRes.trace, rounds: loopRes.rounds, calls: loopRes.calls
+        };
+        const said = sayBuf.filter(Boolean);
+        const modelSay = String(loopRes.reply || '').trim();
+        const lastLocal = said.length ? said[sayBuf.length - 1] : '';
+        ST.mute = false;
+        /* 单步：本地回执最准（安全系数、两侧余量都是实算的）。
+           多步：模型看到了每一步的结果，让它综合说；它说得太空就把本地那条补上。 */
+        let body;
+        if (loopRes.calls > 1) {
+          const solid = modelSay && /[0-9]|米|系数|吨|室|门/.test(modelSay);
+          body = solid ? modelSay : (modelSay ? modelSay + (lastLocal ? '　' + lastLocal : '') : lastLocal);
+        } else {
+          body = lastLocal || modelSay;
+        }
+        if (body) ai(body, lastHtml || null, true);
+        else ai('这一步没办成，换个说法？比如「把空压机放到 5 楼 506 靠走廊」。');
+        flushChips();
+        paintAI();
+        notifyLLMDown();
+        return;
+      }
+
+      if (loopRes && !loopRes.ok) {
+        A.llmState = { ok: false, msg: loopRes.err || '未返回', hint: loopRes.hint || '', at: Date.now() };
+      }
+
+      /* 模型一个字都没动手：本地能解析出实质动作就本地办，实在办不了才用它那句回答 */
+      if (loopRes && loopRes.ok && !(loopRes.calls > 0)) {
+        const lp = A.local(text);
+        const real = lp.steps && lp.steps.length && lp.steps[0].act !== 'unknown';
+        if (real) { lp.reply = ''; plan = lp; }
+        else if (loopRes.reply) {
+          stopTyping(typing); busy = false;
+          window.BIM._lastPlan = { source: 'llm', tools: [], steps: [], reply: loopRes.reply };
+          ST.mute = false;
+          ai(loopRes.reply, null, true);
+          flushChips(); paintAI(); notifyLLMDown();
+          return;
+        }
+      }
+    }
+
+    /* ② 循环这条路不通（没接大模型 / 模型不认 tools）：退回一句一规划 */
+    if (!plan) {
+      try { plan = await A.plan(text); } catch (e) { plan = null; }
+    }
     stopTyping(typing);
     busy = false;
     paintAI();
@@ -2103,6 +2181,8 @@
     replace: async step => stepReplace(step),
     resize: async step => stepResize(step),
     devices: async step => stepDevices(step),
+    clearance: async step => stepClearance(step),
+    findroom: async step => stepFindRoom(step),
     suggest: async step => stepSuggest(step),
     dooroff: async step => stepDoorOff(step),
     doormove: async step => stepDoorMove(step),
@@ -2606,30 +2686,150 @@
     const o = opts || {};
     S.setFocus(room.floor, false);
     if (o.only) S.isolateRoom(room, true);
-    if (!S.inView || !S.inView(room.floor, room.x0, room.y0, room.x1, room.y1, 0.06, 0.12)) {
+    // tight：不管房间在不在画面里都重新取景。问净距必须这么干——
+    // 全楼视角下房间"确实在画面里"，可虚框上 0.5 m 的数字只剩三五个像素
+    if (o.tight || !S.inView || !S.inView(room.floor, room.x0, room.y0, room.x1, room.y1, 0.06, 0.12)) {
       S.frameBounds(room.floor, room.x0 - 0.6, room.y0 - 0.6, room.x1 + 0.6, room.y1 + 0.6, true, 0.86);
     }
     if (o.color !== false) S.highlightRoom(room, o.color || 0x10a394);
   }
 
 
+  /* 找一间放得下的房：纯查询，只给候选不动手 */
+  async function stepFindRoom(step) {
+    const A = window.BIM.agent;
+    const dev = (step.device ? A.deviceByName(step.device) : null) || A.mem.lastPlaced || ST.sel;
+    if (!dev) { ai('要放哪台设备？说个名字，我找哪间放得下。'); return false; }
+    const floor = step.floor != null ? step.floor : (A.mem.ctx.floor || (M.floors[0] && M.floors[0].level) || 1);
+    const list = roomsFitting(dev, floor);
+    if (!list.length) {
+      ai(floor + ' 楼没有能放下「' + dev.name + '」的房间了，换个楼层或者把这台换小一点。');
+      lastData = { floor: floor, device: dev.name, rooms: [] };
+      return false;
+    }
+    const n = Math.max(1, Math.min(6, step.want || 3));
+    const top = list.slice(0, n);
+    ai(floor + ' 楼放得下「' + dev.name + '」的有 ' + list.length + ' 间，' +
+      top.map(x => x.room.num + '（安全系数 ' + C.fmt(x.chk.K) + '）').join('、') +
+      '。想放到哪一间？', null, true);
+    chips(top.map(x => ({
+      label: '放到 ' + x.room.num, fn: () => send('把' + dev.name + '放到' + x.room.num + '室')
+    })));
+    lastData = {
+      floor: floor, device: dev.name,
+      rooms: list.map(x => ({ num: x.room.num, k: +C.fmt(x.chk.K), verdict: x.chk.verdict }))
+    };
+    return true;
+  }
+
+  /* 这一层哪些房间真放得下这台设备：搬家被拒时给替代方案用，不是拿面积糊弄 */
+  function roomsFitting(dev, floor) {
+    const out = [];
+    M.rooms.filter(r => r.floor === floor && r.zone !== 'corr' && r.zone !== 'core').forEach(r => {
+      const s = bestSpotFor(r, Object.assign({}, dev, { rot: null }), 'corridor', null);
+      if (!s) return;
+      const c = C.check({ room: r, equip: dev, cx: s.x, cy: s.y, others: othersIn(r).filter(e => e !== dev) });
+      if (c.verdict !== 'bad') out.push({ room: r, spot: s, chk: c });
+    });
+    // 余量大的排前面：用户要的是"哪间更放得下"，不是"哪间更近"
+    out.sort((a, b) => b.chk.K - a.chk.K);
+    return out;
+  }
+
+  /* 换到另一间房（搬家）。以前是先把 eq.room 改掉、再反问"你想怎么挪"，
+     结果设备落在新房间的旧坐标上，直接掉到楼板外面。现在反过来：
+     先在新房间把位置算出来、把承重和门洞都验一遍，全过了才真搬。 */
+  async function moveToRoom(eq, from, to, step) {
+    const A = window.BIM.agent;
+    const bare = Object.assign({}, eq, { rot: null });
+    const pref0 = step.pref || 'corridor';        // 搬家默认靠走廊：进出搬运路线最短
+    let prefTxt = N.PREF_CN[pref0] || '靠走廊';
+    let spot = bestSpotFor(to, bare, pref0, null);
+    if (!spot && pref0 !== 'inner') { spot = bestSpotFor(to, bare, 'inner', null); prefTxt = N.PREF_CN.inner || '靠里'; }
+
+    if (!spot) {
+      ai(to.num + ' 室里腾不出能放「' + eq.name + '」的地方，设备先留在 ' + from.num + ' 没动。');
+      const fit = roomsFitting(eq, to.floor).filter(x => x.room.id !== to.id);
+      if (fit.length) {
+        chips(fit.slice(0, 3).map(x => ({
+          label: '改放 ' + x.room.num, fn: () => send('把' + eq.name + '放到' + x.room.num + '室')
+        })));
+      }
+      return false;
+    }
+
+    const rot = spot.rot != null ? spot.rot
+      : C.rotOf({ x: spot.x, y: spot.y, room: to.id, rot: null, w: eq.w, d: eq.d });
+    const probe = Object.assign({}, eq, { rot: rot });
+    const r = C.check({ room: to, equip: probe, cx: spot.x, cy: spot.y, others: othersIn(to).filter(e => e !== eq) });
+    if (r.verdict === 'bad') {
+      ai('先别搬：' + to.num + ' 室的楼板吃不消「' + eq.name + '」，安全系数只有 ' + C.fmt(r.K) +
+        '（' + r.v.word + '）。这间最多还能加 ' + Math.max(0, Math.round(r.Pmax_kg / 100) / 10) + ' 吨。设备留在 ' + from.num + '。');
+      const fit = roomsFitting(eq, to.floor).filter(x => x.room.id !== to.id && x.chk.verdict !== 'bad');
+      if (fit.length) chips(fit.slice(0, 3).map(x => ({ label: '改放 ' + x.room.num, fn: () => send('把' + eq.name + '放到' + x.room.num + '室') })));
+      return false;
+    }
+
+    /* 位置、承重都过了，才真搬 */
+    const before = { x: eq.x, y: eq.y, room: eq.room, floor: eq.floor, elev: eq.floorElev, rot: eq.rot };
+    S.removeEquipment(eq);
+    eq.room = to.id; eq.floor = to.floor; eq.floorElev = to.elev;
+    eq.x = spot.x; eq.y = spot.y;
+    S.addEquipment(eq);
+    applyRot(eq, rot);
+    if (eq._obj) eq._obj.position.set(eq.x, eq.floorElev, -eq.y);
+
+    ST.last = r; ST.sel = eq;
+    A.mem.lastResult = r; A.mem.lastPlaced = eq;
+    A.mem.ctx.room = to; A.mem.ctx.floor = to.floor; A.mem.ctx.device = eq.name;
+    pushUndo('把' + eq.name + '搬回 ' + from.num, () => {
+      S.removeEquipment(eq);
+      eq.room = before.room; eq.floor = before.floor; eq.floorElev = before.elev;
+      eq.x = before.x; eq.y = before.y;
+      S.addEquipment(eq);
+      applyRot(eq, before.rot);
+      if (eq._obj) eq._obj.position.set(eq.x, eq.floorElev, -eq.y);
+      A.mem.ctx.room = from; A.mem.ctx.floor = from.floor;
+    });
+    focusSoft(to, { color: r.verdict === 'bad' ? 0xdd534f : (r.verdict === 'warn' ? 0xdd9a2c : 0x10a394) });
+
+    const obf = C.obstruct({ room: to, equip: eq, cx: eq.x, cy: eq.y, others: othersIn(to).filter(e => e !== eq) });
+    markClash(obf);
+    const fi = faceInfo(to, eq);
+    /* 搬到新房间，门洞得按这间房重新量一遍：进不来就等于白搬 */
+    const pd = C.passDoor({ room: to, equip: eq });
+    eq._door = pd;
+    // 门的事先算出来（quiet：不单独说话），跟"搬到哪、多少系数"拼成一句话一起说
+    const doorNote = pd.ok ? '' : askDoorWiden(to, eq, pd, true);
+
+    ai('搬到 ' + to.num + ' 室了，放在' + prefTxt + '那边' + (fi ? '，' + faceTxt(fi) : '') +
+      '。按这间的新位置重算，安全系数 ' + C.fmt(r.K) + '（' + r.v.word + '）。' +
+      (obf.pass ? '' : '不过撞上了 ' + obf.blocks.length + ' 处东西：' + obf.blocks.map(x => x.t).join('；') + '。') +
+      (doorNote ? '另外，' + doorNote : ''),
+      card(r));
+
+    chips([
+      { label: '看计算书', fn: () => openCalc() },
+      { label: '换回 ' + from.num, fn: () => send('把' + eq.name + '搬回' + from.num + '室') }
+    ]);
+    lastData = {
+      moved_to: to.num, from: from.num, at: [+eq.x.toFixed(2), +eq.y.toFixed(2)],
+      pref: prefTxt, k: +C.fmt(r.K), verdict: r.verdict, door_ok: pd.ok
+    };
+    return true;
+  }
+
   async function stepMove(step) {
     const A = window.BIM.agent;
     const eq = resolveEq(step);
     if (!eq) { ai('现在还没有设备可挪。先放一台，或者点一下要挪的那台。'); return false; }
+    dropClr();
     let room = M.rooms.find(r => r.id === eq.room);
     if (!room) return false;
     // 说了房间就是搬家，没说就在原地挪
     const target = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null);
-    const moved = target && target.id !== eq.room;
+    if (target && target.id !== eq.room) return moveToRoom(eq, room, target, step);
     const before = { x: eq.x, y: eq.y, room: eq.room, floor: eq.floor, elev: eq.floorElev };
-    if (moved) {
-      S.removeEquipment(eq);
-      eq.room = target.id; eq.floor = target.floor; eq.floorElev = target.elev;
-      eq.rot = null;                       // 换了房间，朝向要按新房间重判
-      room = target;
-      S.addEquipment(eq);
-    }
 
     let nx = eq.x, ny = eq.y, prefTxt = '', realDist = 0, blocked = '', spotRot = null;
 
@@ -2691,13 +2891,13 @@
     }
 
     eq.x = nx; eq.y = ny;
-    if (moved || spotRot != null) {
-      const fe2 = C.foot(eq, spotRot == null ? null : spotRot);
-      eq.x = clamp(eq.x, room.x0 + fe2.w / 2 + 0.10, room.x1 - fe2.w / 2 - 0.10);
-      eq.y = clamp(eq.y, room.y0 + fe2.d / 2 + 0.10, room.y1 - fe2.d / 2 - 0.10);
-      if (spotRot != null) applyRot(eq, spotRot);
-      else setEquipRot(eq, room);
-    }
+    /* 先按落位后的实际朝向夹进房间，再定朝向。
+       原来这段写成 if (spotRot != null) { … if (spotRot != null) applyRot else setEquipRot }，
+       内层 else 永远走不到 —— 换方位时朝向不会被重判，设备会背对着新墙。 */
+    const fe2 = C.foot(eq, spotRot);
+    eq.x = clamp(eq.x, room.x0 + fe2.w / 2 + 0.10, room.x1 - fe2.w / 2 - 0.10);
+    eq.y = clamp(eq.y, room.y0 + fe2.d / 2 + 0.10, room.y1 - fe2.d / 2 - 0.10);
+    if (spotRot != null) applyRot(eq, spotRot);
     if (eq._obj) eq._obj.position.set(eq.x, eq.floorElev, -eq.y);
     const r = C.check({ room: room, equip: eq, cx: eq.x, cy: eq.y, others: othersIn(room).filter(e => e !== eq) });
     ST.last = r; ST.sel = eq;
@@ -2721,10 +2921,9 @@
     markClash(obf);
 
     const short = realDist && realDist < (step.dist || 0.4) - 0.02 ? ('（本来想挪 ' + (step.dist || 0.4).toFixed(1) + ' 米，' + (blocked === 'hit' ? '那边有设备' : '到头了') + '，只走了 ' + realDist.toFixed(2) + ' 米）') : '';
-    const head = moved ? ('搬到 ' + room.num + ' 室了，')
-      : (step.dir ? (prefTxt + '挪了 ' + realDist.toFixed(2) + ' 米，') : ('挪' + prefTxt + '了，'));
+    const head = step.dir ? (prefTxt + '挪了 ' + realDist.toFixed(2) + ' 米，') : ('挪' + prefTxt + '了，');
     ai(head + '安全系数 ' + C.fmt(r.K) + '。' + short + clashTxt, card(r));
-    if (!moved && realDist && realDist >= 0.2) {
+    if (realDist && realDist >= 0.2) {
       const alt = spotOptions(room, eq, 2).filter(o => o.pref !== step.pref);
       if (alt.length) chips(alt.map(o => ({ label: '改成' + o.label, fn: () => send('把' + eq.name + '挪到' + (N.PREF_CN[o.pref] || o.pref)) })));
     }
@@ -2733,6 +2932,7 @@
 
   async function stepRemove(step) {
     const A = window.BIM.agent;
+    dropClr();
     const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null);
     let list = [];
     if (step.all) {
@@ -3042,6 +3242,21 @@
       if (r0) return r0;
     }
     const ids = d.rooms || [];
+    // 一条长墙串好几间时，d.rooms 里排第一的不一定是这扇门所在的那间，
+    // 所以先挑"门确实落在它那段墙上"的；都对不上再退回第一个
+    const wall = M.walls.find(w => w.id === d.wall);
+    if (wall) {
+      const at = S.doorAt(d, wall) || 0;
+      const half = (d.w || 1) / 2;
+      let hit = null;
+      ids.forEach(id => {
+        const r = M.rooms.find(x => x.id === id && x.zone !== 'corr');
+        if (!r) return;
+        const sp = roomSpanOnWall(wall, r);
+        if (at - half >= sp.lo - 0.05 && at + half <= sp.hi + 0.05 && !hit) hit = r;
+      });
+      if (hit) return hit;
+    }
     for (let i = 0; i < ids.length; i++) {
       const r = M.rooms.find(x => x.id === ids[i] && x.zone !== 'corr');
       if (r) return r;
@@ -3197,44 +3412,70 @@
     const at = S.doorAt(d, wall);
     const before = { w: d.w, h: d.h };
     const eqs = ST.placed.filter(e => e.floor === wall.floor);
-    const chk = C.door({ wall: wall, at: at, w: nw, h: nh, equipments: eqs, room: room, self: d });
+    // 改宽也是拓门：先看两侧各能扩多少，再决定对半扩还是只往一侧挖
+    const plan = C.widenPlan({ wall: wall, at: at, w: d.w, h: nh, need: nw, room: room, equipments: eqs, self: d });
+    const best = plan.best;
 
-    // 尺寸变大可能顶到墙角/隔壁门：先顺着墙让一让，让不了再报错
-    let finalAt = at, note = '';
-    if (!chk.pass) {
-      const sug = C.suggestDoorAt({ wall: wall, room: room, at: at, w: nw, h: nh, equipments: eqs, self: d });
-      if (sug && sug.check && sug.check.pass && Math.abs(sug.at - at) <= 2.0) {
-        finalAt = sug.at;
-        note = '原位放不下 ' + nw.toFixed(2) + ' 米，我顺着墙让了 ' + Math.abs(sug.at - at).toFixed(2) + ' 米。';
-      } else {
-        S.highlightWall(wall, 0xdd534f);
-        ai(nw.toFixed(2) + '×' + nh.toFixed(2) + ' 米开不了：' + chk.blocks.map(b => b.t).join('；') +
-          '。要不门小一点，或者先把门挪个位置？',
-          '<div class="res bad"><div class="res-top"><span class="k">开不了</span><span class="tag">有碰撞</span></div>' +
-          '<div class="res-adv">' + chk.blocks.map(b => '<s>·</s> ' + b.t).join('<br>') + '</div></div>');
-        chips([
-          { label: '还是原尺寸', fn: () => { } },
-          { label: '把门挪一下', fn: () => send('把门往左挪半米') }
-        ]);
-        return false;
-      }
+    if (!best || best.w < nw - 1e-6) {
+      S.highlightWall(wall, 0xdd534f);
+      const cap = best ? '最多只能到 ' + best.w.toFixed(2) + ' m' : '两侧都扩不动';
+      const blocks = (best ? best.chk.blocks : (plan.blocked || [])).map(b => b.t);
+      ai(nw.toFixed(2) + '×' + nh.toFixed(2) + ' 米开不了：' + widenSidesTxt(plan) + '，' + cap + '。' +
+        (blocks.length ? blocks.join('；') + '。' : '') + '要不门小一点，或者先把门挪个位置？',
+        '<div class="res bad"><div class="res-top"><span class="k">开不了</span><span class="tag">有碰撞</span></div>' +
+        '<div class="res-adv">' + (blocks.length ? blocks.map(b => '<s>·</s> ' + b).join('<br>')
+          : '<s>·</s> ' + widenSidesTxt(plan)) + '</div></div>');
+      const cs = [{ label: '还是原尺寸', fn: () => { } }];
+      if (best) cs.push({ label: '改成 ' + best.w.toFixed(2) + ' m', fn: () => doWidenDoor(room, d, best.w, nh) });
+      cs.push({ label: '把门挪一下', fn: () => send('把门往左挪半米') });
+      chips(cs);
+      return false;
     }
 
-    const nd = S.replaceDoor(d, { at: finalAt, w: nw, h: nh });
+    const nd = S.replaceDoor(d, { at: best.at, w: best.w, h: nh });
     if (!nd) { ai('洞口改不回来，先撤回再试。'); return false; }
-    ST.lastDoor = { wall: wall, at: finalAt, w: nw, d: nd, chk: chk, room: room };
-    if (room) rememberDoor(room, null, nw, nh);
-    S.markDoorSpot(wall, finalAt, nw, nh, true);
+    const chk = best.chk;
+    ST.lastDoor = { wall: wall, at: best.at, w: best.w, d: nd, chk: chk, room: room };
+    if (room) rememberDoor(room, null, best.w, nh);
+    S.markDoorSpot(wall, best.at, best.w, nh, true);
     if (room) focusSoft(room);
     pushUndo('把门改回 ' + before.w.toFixed(2) + '×' + before.h.toFixed(2) + ' 米', () => {
-      const bak = S.replaceDoor(nd, { at: finalAt, w: before.w, h: before.h });
-      if (bak) ST.lastDoor = { wall: wall, at: finalAt, w: before.w, d: bak, room: room };
+      const bak = S.replaceDoor(nd, { at: best.at, w: before.w, h: before.h });
+      if (bak) ST.lastDoor = { wall: wall, at: best.at, w: before.w, d: bak, room: room };
     });
-    ai('门改成 ' + nw.toFixed(2) + ' 米宽、' + nh.toFixed(2) + ' 米高，' + (note || '位置没动，') + '能开。',
-      '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
-      '<div class="res-grid"><div><i>门宽</i><b>' + nw.toFixed(2) + ' m</b></div>' +
-      '<div><i>门高</i><b>' + nh.toFixed(2) + ' m</b></div></div></div>');
-    lastData = { width: nw, height: nh, moved: +Math.abs(finalAt - at).toFixed(2) };
+
+    // 门定下来以后，把房间里这台设备的安全系数重算一遍，并给计算书入口
+    const eq = ST.sel && ST.sel.room === (room && room.id) ? ST.sel
+      : (window.BIM.agent.mem.lastPlaced && window.BIM.agent.mem.lastPlaced.room === (room && room.id)
+        ? window.BIM.agent.mem.lastPlaced : null);
+    let r2 = null;
+    if (eq) {
+      r2 = C.check({ room: room, equip: eq, cx: eq.x, cy: eq.y, others: othersIn(room).filter(e => e !== eq) });
+      ST.last = r2; ST.sel = eq;
+      window.BIM.agent.mem.lastResult = r2;
+    }
+    const moved = Math.abs(best.at - at);
+    const growL = Math.max(0, (best.w - before.w) / 2 + (at - best.at));
+    const growR = Math.max(0, (best.w - before.w) / 2 - (at - best.at));
+    const note = (best.w - before.w) < 0.005
+      ? '宽度没变，只改了高度'
+      : (moved > 0.02
+        ? '原位放不下，' + (best.why || '顺墙让了 ' + moved.toFixed(2) + ' 米') + '，左侧扩 ' + growL.toFixed(2) + ' m、右侧扩 ' + growR.toFixed(2) + ' m'
+        : (best.why || '两侧各扩一半') + '，左侧扩 ' + growL.toFixed(2) + ' m、右侧扩 ' + growR.toFixed(2) + ' m');
+    ai('门改成 ' + best.w.toFixed(2) + ' 米宽、' + nh.toFixed(2) + ' 米高：' + note + '。开门校核通过。' +
+      (r2 ? '这间房里的「' + eq.name + '」顺势重算了一遍，最终安全系数 ' + C.fmt(r2.K) + '（' + r2.v.word + '）。' : ''),
+      (r2 ? card(r2) : '') +
+      '<div class="res ok" style="margin-top:8px"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
+      '<div class="res-grid"><div><i>门宽</i><b>' + best.w.toFixed(2) + ' m</b></div>' +
+      '<div><i>门高</i><b>' + nh.toFixed(2) + ' m</b></div>' +
+      '<div><i>左侧扩</i><b>' + growL.toFixed(2) + ' m</b></div>' +
+      '<div><i>右侧扩</i><b>' + growR.toFixed(2) + ' m</b></div></div></div>');
+    const cs = [];
+    if (r2) cs.push({ label: '看计算书', fn: () => openCalc() });
+    cs.push({ label: '看看这扇门', fn: () => stepDoorInfo({}) });
+    chips(cs);
+    lastData = { width: best.w, height: nh, moved: +moved.toFixed(2),
+                 grow: [+growL.toFixed(2), +growR.toFixed(2)], k: r2 ? +C.fmt(r2.K) : null };
     return true;
   }
 
@@ -3257,36 +3498,91 @@
      规则：设备最小包裹宽 min(w,d) + 0.12 ≤ 门净宽，高 + 0.08 ≤ 门高，才算搬得进去。
      拓宽必须过 C.door 校核（撞墙角、贴隔壁门、压柱、风管穿越、设备挡门都不合格），
      过不了就明说「门没动」——这就是「不影响开门才真正开启」。 */
-  function askDoorWiden(room, eq, pd) {
-    if (!pd || pd.ok) return;
-    if (!room) return;
+  /* 门两侧各剩多少，说人话。拓门不是两边对半长，所以这两个数必须摆出来 */
+  function widenSidesTxt(plan) {
+    const sd = plan.side;
+    if (!sd) return '';
+    const one = (v, near) => v < 0.02
+      ? '0（' + (near || '障碍') + '顶死）'
+      : v.toFixed(2) + ' m';
+    return '左侧可扩 ' + one(sd.left, sd.nearL) + '，右侧可扩 ' + one(sd.right, sd.nearR);
+  }
+
+  /* quiet=true：不自己说话，只把"要不要拓门"这段文案返回给调用方拼进自己的回执。
+     搬家时用得着——先说完"搬到 506 了、安全系数多少"，再顺带提门的事，
+     不然最后一句被门的话盖掉，用户以为没搬。 */
+  function askDoorWiden(room, eq, pd, quiet) {
+    const say = (t, h) => { if (!quiet) ai(t, h); return t; };
+    if (!pd || pd.ok) return '';
+    if (!room) return '';
     // 同一间房问过一次就不再问：连续放五台设备不该弹五遍同一个问题
-    if (ST.doorAsked[room.id]) return;
+    if (ST.doorAsked[room.id]) return '';
     ST.doorAsked[room.id] = true;
     if (pd.why === 'no-door') {
-      ai('「' + eq.name + '」放好了，但这间房没登记门 —— 等于搬不进来也搬不出去。要开一扇吗？',
-        '<div class="res warn"><div class="res-top"><span class="k">没门</span><span class="tag">搬不进去</span></div>' +
+      const t = '「' + eq.name + '」放好了，但这间房没登记门 —— 等于搬不进来也搬不出去。要开一扇吗？';
+      say(t, '<div class="res warn"><div class="res-top"><span class="k">没门</span><span class="tag">搬不进去</span></div>' +
         '<div class="res-adv">设备最小包裹尺寸 ' + pd.needW.toFixed(2) + ' × ' + pd.needH.toFixed(2) + ' m，门洞至少得这么大。</div></div>');
       chips([{
         label: '开一扇 ' + Math.max(1.2, pd.needW).toFixed(2) + ' 米门',
         fn: () => send('在' + room.num + '室靠走廊的位置开一个' + Math.max(1.2, pd.needW).toFixed(1) + '米宽的门')
       }]);
-      return;
+      return t;
     }
     const d = pd.door;
+    const wall = M.walls.find(w => w.id === d.wall);
+    if (!wall) return '';
+    const nw = Math.max(d.w, pd.needW), nh = Math.max(d.h, pd.needH);
+    const at = S.doorAt(d, wall);
+    const eqs = (ST.placed || []).filter(e => e.floor === wall.floor);
+    // 先看两侧：能对半扩、还是只能往一侧挖、还是得顺着墙让一段
+    const plan = C.widenPlan({ wall: wall, at: at, w: d.w, h: nh, need: nw, room: room, equipments: eqs, self: d });
     const why = pd.why === 'width'
       ? '门净宽只有 ' + d.w.toFixed(2) + ' m，「' + eq.name + '」立起来搬最窄也要 ' + pd.needW.toFixed(2) + ' m'
       : '门高只有 ' + d.h.toFixed(2) + ' m，「' + eq.name + '」高 ' + pd.needH.toFixed(2) + ' m';
-    const nw = Math.max(d.w, pd.needW), nh = Math.max(d.h, pd.needH);
-    ai('设备放得下，但搬不进来：' + why + '。要不要把「' + d.name + '」拓到 ' + nw.toFixed(2) + ' × ' + nh.toFixed(2) +
-      ' m？拓完我先做一次开门校核，确认不影响开门才真正改。',
+
+    if (!plan.best || plan.best.w < nw - 1e-6) {
+      // 两侧都量过了还是不够 —— 把"最多能到多少"说清楚，别让用户自己猜
+      const cap = plan.best
+        ? '原位最多只能拓到 ' + plan.best.w.toFixed(2) + ' m'
+        : '原位一点也扩不了';
+      const alt = altRoomFor(room, eq);
+      const t2 = '设备放得下，但搬不进来：' + why + '。我量了门洞两侧——' + widenSidesTxt(plan) +
+        '；' + cap + '，还差 ' + (nw - (plan.best ? plan.best.w : d.w)).toFixed(2) + ' m。';
+      say(t2,
+        '<div class="res bad"><div class="res-top"><span class="k">拓不到位</span><span class="tag">两侧余量不够</span></div>' +
+        '<div class="res-grid"><div><i>门洞现状</i><b>' + d.w.toFixed(2) + '×' + d.h.toFixed(2) + ' m</b></div>' +
+        '<div><i>至少需要</i><b>' + nw.toFixed(2) + '×' + nh.toFixed(2) + ' m</b></div></div>' +
+        '<div class="res-adv">' + widenSidesTxt(plan) + '。' + cap + '，差距 ' +
+        (nw - (plan.best ? plan.best.w : d.w)).toFixed(2) + ' m。</div></div>');
+      const cs = [];
+      if (alt && eq) cs.push({ label: '改放到 ' + alt.num + ' 室', fn: () => send('把' + eq.name + '放到' + alt.num + '室') });
+      if (eq) cs.push({ label: '把设备改小一点', fn: () => send('把' + eq.name + '改小一点') });
+      // 只能拓一部分时，给一个"就按能到的宽度先拓"的出口
+      if (plan.best && plan.best.w > d.w + 0.01) {
+        cs.push({
+          label: '先拓到 ' + plan.best.w.toFixed(2) + ' m',
+          fn: () => doWidenDoor(room, d, plan.best.w, nh)
+        });
+      }
+      chips(cs);
+      return t2;
+    }
+
+    const modeTxt = plan.best.mode === 'slide'
+      ? '原位两侧都放不下，得' + plan.best.why
+      : (plan.best.why || '原位加宽');
+    const t3 = '设备放得下，但搬不进来：' + why + '。要不要把「' + d.name + '」拓到 ' + nw.toFixed(2) + ' × ' + nh.toFixed(2) +
+      ' m？我量过两侧——' + widenSidesTxt(plan) + '，可以' + modeTxt + '。';
+    say(t3,
       '<div class="res warn"><div class="res-top"><span class="k">搬不进</span><span class="tag">门偏小</span></div>' +
       '<div class="res-grid"><div><i>门洞现状</i><b>' + d.w.toFixed(2) + '×' + d.h.toFixed(2) + ' m</b></div>' +
-      '<div><i>至少需要</i><b>' + nw.toFixed(2) + '×' + nh.toFixed(2) + ' m</b></div></div></div>');
+      '<div><i>至少需要</i><b>' + nw.toFixed(2) + '×' + nh.toFixed(2) + ' m</b></div></div>' +
+      '<div class="res-adv">' + widenSidesTxt(plan) + ' → ' + modeTxt + '</div></div>');
     chips([
       { label: '把门拓到 ' + nw.toFixed(2) + ' m', fn: () => doWidenDoor(room, d, nw, nh) },
       { label: '先不改门', fn: () => toast('门保持原样，设备先放着了') }
     ]);
+    return t3;
   }
 
   function doWidenDoor(room, d, nw, nh) {
@@ -3295,53 +3591,84 @@
     const eq = ST.sel || (window.BIM.agent.mem.lastPlaced) || null;
     const at = S.doorAt(d, wall);
     const eqs = (ST.placed || []).filter(e => e.floor === wall.floor);
-    const chk = C.door({ wall: wall, at: at, w: nw, h: nh, equipments: eqs, room: room, self: d });
+    const plan = C.widenPlan({ wall: wall, at: at, w: d.w, h: nh, need: nw, room: room, equipments: eqs, self: d });
+    const best = plan.best;
 
-    let finalAt = at, note = '';
-    if (!chk.pass) {
-      const sug = C.suggestDoorAt({ wall: wall, at: at, w: nw, h: nh, equipments: eqs, self: d });
-      if (sug && sug.check && sug.check.pass && Math.abs(sug.at - at) <= 2.0) {
-        finalAt = sug.at;
-        note = '原位放不下 ' + nw.toFixed(2) + ' 米，顺着墙让了 ' + Math.abs(sug.at - at).toFixed(2) + ' 米；';
-      } else {
-        // 校核没过 → 门一个字都不改（硬规则：为了塞设备把门改到开不了，不干）
-        S.highlightWall(wall, 0xdd534f);
-        const alt = altRoomFor(room, eq);
-        ai('这扇门拓不到 ' + nw.toFixed(2) + '×' + nh.toFixed(2) + ' m：' + chk.blocks.map(b => b.t).join('；') +
-          '。门没动 —— 拓完开不了门等于白拓。' + (alt ? '这层的 ' + alt.num + ' 室门够大，搬那边去？' : ''),
-          '<div class="res bad"><div class="res-top"><span class="k">不能拓</span><span class="tag">开门校核没过</span></div>' +
-          '<div class="res-adv">' + chk.blocks.map(b => '<s>·</s> ' + b.t).join('<br>') + '</div></div>');
-        const cs = [];
-        if (alt && eq) cs.push({ label: '改放到 ' + alt.num + ' 室', fn: () => send('把' + eq.name + '放到' + alt.num + '室') });
-        if (eq) cs.push({ label: '把设备改小一点', fn: () => send('把' + eq.name + '改小一点') });
-        chips(cs);
-        return false;
-      }
+    // 两侧都量过仍不够 → 门一个字都不改（硬规则：为了塞设备把门改到开不了，不干）
+    if (!best || best.w < nw - 1e-6) {
+      S.highlightWall(wall, 0xdd534f);
+      const alt = altRoomFor(room, eq);
+      const cap = best ? '最多只能拓到 ' + best.w.toFixed(2) + ' m' : '原位一点也扩不了';
+      const blocks = (best ? best.chk.blocks : (plan.blocked || [])).map(b => b.t);
+      ai('拓不到 ' + nw.toFixed(2) + '×' + nh.toFixed(2) + ' m：' + widenSidesTxt(plan) + '，' + cap +
+        '。' + (blocks.length ? blocks.join('；') + '。' : '') +
+        '门没动 —— 拓完开不了门等于白拓。' + (alt ? '这层的 ' + alt.num + ' 室门够大，搬那边去？' : ''),
+        '<div class="res bad"><div class="res-top"><span class="k">不能拓</span><span class="tag">开门校核没过</span></div>' +
+        '<div class="res-adv">' + (blocks.length ? blocks.map(b => '<s>·</s> ' + b).join('<br>')
+          : '<s>·</s> 两侧余量加起来不够 ' + nw.toFixed(2) + ' m') + '</div></div>');
+      const cs = [];
+      if (alt && eq) cs.push({ label: '改放到 ' + alt.num + ' 室', fn: () => send('把' + eq.name + '放到' + alt.num + '室') });
+      if (eq) cs.push({ label: '把设备改小一点', fn: () => send('把' + eq.name + '改小一点') });
+      chips(cs);
+      return false;
     }
 
-    const nd = S.replaceDoor(d, { at: finalAt, w: nw, h: nh });
+    const nd = S.replaceDoor(d, { at: best.at, w: best.w, h: nh });
     if (!nd) { ai('洞口没改成功，先撤回再试。'); return false; }
-    ST.lastDoor = { wall: wall, at: finalAt, w: nw, d: nd, chk: chk, room: room };
-    if (room) rememberDoor(room, null, nw, nh);
-    S.markDoorSpot(wall, finalAt, nw, nh, true);
+    const chk = best.chk;
+    ST.lastDoor = { wall: wall, at: best.at, w: best.w, d: nd, chk: chk, room: room };
+    if (room) rememberDoor(room, null, best.w, nh);
+    S.markDoorSpot(wall, best.at, best.w, nh, true);
     if (room) focusSoft(room);
     pushUndo('把门改回 ' + d.w.toFixed(2) + '×' + d.h.toFixed(2) + ' 米', () => {
-      const bak = S.replaceDoor(nd, { at: finalAt, w: d.w, h: d.h });
-      if (bak) ST.lastDoor = { wall: wall, at: finalAt, w: d.w, d: bak, room: room };
+      const bak = S.replaceDoor(nd, { at: best.at, w: d.w, h: d.h });
+      if (bak) ST.lastDoor = { wall: wall, at: best.at, w: d.w, d: bak, room: room };
     });
 
     // 改完复核：设备现在能不能过、门口还留没留出开启范围
     let pd2 = null;
     if (eq) { pd2 = C.passDoor({ room: room, equip: eq }); eq._door = pd2; }
     const passTxt = pd2 ? (pd2.ok ? '「' + eq.name + '」现在搬得进去了。' : '设备最小包裹宽 ' + pd2.needW.toFixed(2) + ' m，还差一点。') : '';
-    ai('「' + d.name + '」拓到 ' + nw.toFixed(2) + ' m 宽、' + nh.toFixed(2) + ' m 高。' + note +
-      '开门校核通过：' + ((chk.warns && chk.warns[0]) || '门口 0.9 m 开启范围里没有设备，门能正常开合') + '。' + passTxt,
-      '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">校核通过</span></div>' +
-      '<div class="res-grid"><div><i>门宽</i><b>' + nw.toFixed(2) + ' m</b></div>' +
-      '<div><i>门高</i><b>' + nh.toFixed(2) + ' m</b></div></div></div>');
-    toast('门已拓宽到 ' + nw.toFixed(2) + ' m，开门校核通过');
+
+    // 最终验算：门定下来以后，设备在这个位置的安全系数重新算一遍
+    let r2 = null;
+    if (eq) {
+      const rm = M.rooms.find(r => r.id === eq.room) || room;
+      r2 = C.check({ room: rm, equip: eq, cx: eq.x, cy: eq.y, others: othersIn(rm).filter(e => e !== eq) });
+      ST.last = r2; ST.sel = eq;
+      window.BIM.agent.mem.lastResult = r2;
+      window.BIM.agent.mem.lastPlaced = eq;
+    }
+
+    const moved = Math.abs(best.at - at);
+    const shiftTxt = best.mode === 'slide' || moved > 0.005
+      ? '（' + best.why + '，门心挪了 ' + moved.toFixed(2) + ' m）' : '（' + (best.why || '原位加宽') + '）';
+    const growL = ((best.w - d.w) / 2 + (at - best.at));
+    const growR = ((best.w - d.w) / 2 - (at - best.at));
+    const growTxt = '左侧扩了 ' + Math.max(0, growL).toFixed(2) + ' m、右侧扩了 ' + Math.max(0, growR).toFixed(2) + ' m';
+
+    ai('「' + d.name + '」拓到 ' + best.w.toFixed(2) + ' m 宽、' + nh.toFixed(2) + ' m 高' + shiftTxt +
+      '：' + growTxt + '。开门校核通过：' + ((chk.warns && chk.warns[0]) || '门口 0.9 m 开启范围里没有设备，门能正常开合') +
+      '。' + passTxt +
+      (r2 ? ' 门定了以后把设备的受力重算了一遍，最终安全系数 ' + C.fmt(r2.K) + '（' + r2.v.word + '）。' : ''),
+      (r2 ? card(r2) : '') +
+      '<div class="res ok" style="margin-top:8px"><div class="res-top"><span class="k">可以开</span><span class="tag">开门校核通过</span></div>' +
+      '<div class="res-grid"><div><i>门宽</i><b>' + best.w.toFixed(2) + ' m</b></div>' +
+      '<div><i>门高</i><b>' + nh.toFixed(2) + ' m</b></div>' +
+      '<div><i>左侧扩</i><b>' + Math.max(0, growL).toFixed(2) + ' m</b></div>' +
+      '<div><i>右侧扩</i><b>' + Math.max(0, growR).toFixed(2) + ' m</b></div></div></div>');
+
+    // 验算完了，下面直接给计算书入口
+    const cs = [];
+    if (r2) cs.push({ label: '看计算书', fn: () => openCalc() });
+    if (eq && pd2 && !pd2.ok) cs.push({ label: '把设备改小一点', fn: () => send('把' + eq.name + '改小一点') });
+    cs.push({ label: '看看这扇门', fn: () => stepDoorInfo({}) });
+    chips(cs);
+
+    toast('门已拓宽到 ' + best.w.toFixed(2) + ' m，开门校核通过');
     if (room) delete ST.doorAsked[room.id];       // 门变宽了，以后再放大设备要能重新问
-    lastData = { door: d.name, width: nw, height: nh, pass: true, equip_pass: pd2 ? pd2.ok : null };
+    lastData = { door: d.name, width: best.w, height: nh, pass: true, equip_pass: pd2 ? pd2.ok : null,
+                 k: r2 ? +C.fmt(r2.K) : null, grow: [+Math.max(0, growL).toFixed(2), +Math.max(0, growR).toFixed(2)] };
     if (window.BIM.tree) window.BIM.tree.rebuild();
     return true;
   }
@@ -3551,6 +3878,76 @@
       doors: addedDoors.map(d => ({ name: d.name, width: d.w, height: d.h, floor: d.floor })),
       context: { room: ctxRoom ? ctxRoom.num : null, floor: A.mem.ctx.floor || null, device: A.mem.lastPlaced ? A.mem.lastPlaced.name : null },
       view: vi ? { floor: vi.floor, looking: vi.looking, rightIs: vi.rightIs } : null
+    };
+    return true;
+  }
+
+  /* ---------------- 设备四周净距 ---------------- */
+  /* 模型一改（放/挪/删/换），之前的净距虚框就过期了，直接收掉 */
+  function dropClr() {
+    if (S.clearClearance) S.clearClearance();
+    ST.lastClr = null;
+  }
+
+  /* 净距卡片：四个方向并排，最窄那条顶在最上面 */
+  function clrCard(cl) {
+    const cls = cl.minV < 0.3 ? 'bad' : (cl.minV < 0.7 ? 'warn' : 'ok');
+    const cell = (cn, s) => {
+      const c2 = s.v < 0.05 ? ' class="bad"' : (s.v < 0.7 ? ' class="warn"' : '');
+      return '<div><i>' + cn + '</i><b' + c2 + '>' + (s.v < 0.05 ? '贴死' : s.v.toFixed(2) + ' m') + '</b></div>';
+    };
+    return '<div class="res ' + cls + '">' +
+      '<div class="res-top"><span class="k">' + cl.minV.toFixed(2) + '</span><span class="kl">最窄一侧 · ' +
+      cl.minCn + '</span><span class="tag">' + C.clearWord(cl.minV) + '</span></div>' +
+      '<div class="res-grid">' + cell('左侧', cl.west) + cell('右侧', cl.east) +
+      cell('南侧', cl.south) + cell('北侧', cl.north) + '</div>' +
+      '<div class="res-adv"><s>·</s> 最窄处卡在' + cl.minWho + '。<br>' +
+      '<s>·</s> 正面朝' + cl.faceCn + '，检修面 ' + cl.faceV.toFixed(2) + ' m，' +
+      C.clearWord(cl.faceV, true) + '。<br>' +
+      '<s>·</s> 模型楼板上已经用虚线框把四周范围标出来了。</div></div>';
+  }
+
+  /* 量设备四周的净距，并在模型上画虚框标出来 */
+  async function stepClearance(step) {
+    const A = window.BIM.agent;
+    const eq = resolveEq(step);
+    if (!eq) { ai('先放一台设备，或者点一下要量的那台。'); return false; }
+    const room = step.roomRef || M.rooms.find(r => r.id === eq.room);
+    if (!room) { ai('这台设备不在任何房间里，量不了四周净距。'); return false; }
+    const cl = C.clearance({ room: room, equip: eq, x: eq.x, y: eq.y, others: othersIn(room) });
+    if (!cl) { ai('这台设备的净距量不出来，换个位置再试。'); return false; }
+
+    const drawn = step.show !== false;
+    if (drawn && S.showClearance) S.showClearance(room, eq, cl);
+    focusSoft(room, { tight: true });   // 一定要拉近，否则虚框上的米数看不清
+    ST.lastClr = { room: room, eq: eq, cl: cl };
+    A.mem.lastClr = cl;
+
+    const one = s => (s.v < 0.05 ? '0（' + s.who + '）' : s.v.toFixed(2) + ' m');
+    const narrow = cl.minV < 0.3 ? '，这块基本卡住了，人过不去'
+      : (cl.minV < 0.7 ? '，只能侧着身子过' : '');
+    ai('「' + eq.name + '」四周的净距：左侧 ' + one(cl.west) + '、右侧 ' + one(cl.east) +
+      '、南侧 ' + one(cl.south) + '、北侧 ' + one(cl.north) + '。' +
+      '最窄的是' + cl.minCn + ' ' + cl.minV.toFixed(2) + ' m（' + cl.minWho + '）' + narrow + '；' +
+      '正面朝' + cl.faceCn + '，检修面还有 ' + cl.faceV.toFixed(2) + ' m，' + C.clearWord(cl.faceV, true) +
+      (drawn ? '。模型上已经用虚框标出来了。' : '。'),
+      clrCard(cl));
+
+    chips([
+      { label: '收掉虚框', fn: () => { if (S.clearClearance) S.clearClearance(); toast('虚框收起来了'); } },
+      { label: '看计算书', fn: () => openCalc() },
+      { label: '挪个位置', fn: () => send('把' + eq.name + '挪一下') }
+    ]);
+
+    lastData = {
+      device: eq.name, room: room.num,
+      clearance_m: {
+        west: +cl.west.v.toFixed(2), east: +cl.east.v.toFixed(2),
+        south: +cl.south.v.toFixed(2), north: +cl.north.v.toFixed(2)
+      },
+      narrowest: { side: cl.minCn, m: +cl.minV.toFixed(2), against: cl.minWho },
+      front: { side: cl.faceCn, m: +cl.faceV.toFixed(2) },
+      drawn: drawn
     };
     return true;
   }
@@ -3880,7 +4277,9 @@
       step.tool = step.tool || 'mcp';          // 标明"这是工具点名的"，直接执行别等人点
       const st = A.fillStep(step);
       const prev = ST.mute;
-      ST.mute = false;
+      // 循环里一次请求可能连调好几个工具：中间那段别逐条往外说，
+      // 最后统一讲一句结论，否则一句话指令会冒出三四条回复。
+      ST.mute = loopQuiet ? true : false;
       lastData = null;
       try {
         const ok = await io[st.act](st, { steps: [st] });
@@ -3906,7 +4305,9 @@
         height: a.height, weight: kg(a.weight)
       }),
       query_equipment: a => runTool({ act: 'info', text: '', target: a.target }),
+      query_clearance: a => runTool({ act: 'clearance', text: '', target: a.target, room: a.room, show: a.show !== false }),
       list_devices: a => runTool({ act: 'devices', text: '', room: a.room, floor: a.floor }),
+      find_rooms_for_equipment: a => runTool({ act: 'findroom', text: '', device: a.device, floor: a.floor, want: a.count || 3 }),
       suggest_positions: a => runTool({ act: 'suggest', text: '', device: a.device, room: a.room, floor: a.floor, want: a.count || 3, apply: a.apply !== false }),
       show_properties: () => runTool({ act: 'info', text: '' }),
       query_capacity: () => runTool({ act: 'ask', kind: 'capacity', text: '' }),

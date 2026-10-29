@@ -314,7 +314,9 @@
 
   /* ---------------- 文字 ---------------- */
   // 画布宽度按文字长度自适应，长名字不会被切掉；世界高度固定，宽度按比例
-  function labelSprite(text, w) {
+  // opt：{ bg, fg, bd } 换底色/字色/描边，净距标注要用它区分"够宽 / 紧 / 卡死"
+  function labelSprite(text, w, opt) {
+    const o = opt || {};
     const FS = 44, PADX = 24;
     const c = document.createElement('canvas');
     let x = c.getContext('2d');
@@ -325,20 +327,24 @@
     c.height = 96;
     x = c.getContext('2d');
     const r = 20, ox = 5, oy = 9, pw = c.width - 10, ph = 78;
-    x.fillStyle = 'rgba(255,255,255,.95)';
+    x.fillStyle = o.bg || 'rgba(255,255,255,.95)';
     x.beginPath();
     x.moveTo(ox + r, oy); x.lineTo(ox + pw - r, oy); x.quadraticCurveTo(ox + pw, oy, ox + pw, oy + r);
     x.lineTo(ox + pw, oy + ph - r); x.quadraticCurveTo(ox + pw, oy + ph, ox + pw - r, oy + ph);
     x.lineTo(ox + r, oy + ph); x.quadraticCurveTo(ox, oy + ph, ox, oy + ph - r);
     x.lineTo(ox, oy + r); x.quadraticCurveTo(ox, oy, ox + r, oy); x.closePath(); x.fill();
-    x.strokeStyle = 'rgba(150,168,185,.55)'; x.lineWidth = 2; x.stroke();
-    x.fillStyle = '#46525f';
+    x.strokeStyle = o.bd || 'rgba(150,168,185,.55)'; x.lineWidth = 2; x.stroke();
+    x.fillStyle = o.fg || '#46525f';
     x.font = font;
     x.textAlign = 'center'; x.textBaseline = 'middle';
     x.fillText(text, c.width / 2, 48);
     const tex = new THREE.CanvasTexture(c);
     tex.anisotropy = 4;
-    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true, depthWrite: false }));
+    // depthTest 默认开着（设备名要能被墙挡），但净距标注必须永远浮在最上面，
+    // 不然一面 3.3 m 的墙就把数字全吃了，用户只会看到几条断线
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: tex, transparent: true, depthTest: o.noDepth ? false : true, depthWrite: false
+    }));
     const hh = w / 2, ww = hh * (c.width / c.height);
     sp.scale.set(ww, hh, 1);
     sp.renderOrder = 12;
@@ -1415,6 +1421,149 @@
     scene.add(g); doorMark = g;
   };
 
+  /* ---------------- 四周净距的虚框标注 ----------------
+     问"这台设备旁边还有多少空间"时，在楼板上画出四块虚框色带：
+     设备轮廓（蓝虚线）+ 四条从设备边铺到墙的余量带（带宽就是净距）+
+     带中间标米数、正面标检修面。哪边宽哪边窄、差多少米，一眼看出来。 */
+  let clrGroup = null;
+  S.clearClearance = function () {
+    if (!clrGroup) return;
+    scene.remove(clrGroup);
+    clrGroup.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (o.material.map) o.material.map.dispose();
+        o.material.dispose();
+      }
+    });
+    clrGroup = null;
+  };
+
+  S.showClearance = function (room, eq, cl) {
+    S.clearClearance();
+    if (!room || !eq || !cl) return null;
+    const Y = (room.elev || 0) + 0.06;
+    const P = (bx, by) => new THREE.Vector3(bx, Y, -by);
+    const g = new THREE.Group();
+
+    const C_OK = 0x10a394, C_TIGHT = 0xdd9a2c, C_BAD = 0xdd534f;
+    const colorOf = v => (v < 0.3 ? C_BAD : (v < 0.7 ? C_TIGHT : C_OK));
+    const R = cl.rect;
+
+    // 标签尺寸跟着房间走：6 m 的小房间用 1.25，30 m 的大开间得放大到 2.2，
+    // 否则镜头拉到能看全房间的距离时，数字就成了一粒灰
+    const span = Math.max(room.x1 - room.x0, room.y1 - room.y0, 4);
+    const LW = Math.min(2.2, Math.max(1.05, span * 0.19));
+
+    // depthTest 关掉：标注永远浮在楼板上面，不会被设备和家具挡住
+    const dash = (pts, color, op) => {
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineDashedMaterial({
+        color: color, dashSize: 0.14, gapSize: 0.10,
+        transparent: true, opacity: op == null ? 0.95 : op, depthTest: false, depthWrite: false
+      });
+      const l = new THREE.Line(geo, mat);
+      l.computeLineDistances();
+      l.renderOrder = 9;
+      l.userData.dash = true;      // 统计用：不然 ArrowHelper 自带的线也算进虚线里
+      return l;
+    };
+    // 半透明色带：这一侧的"余量"整块铺在地面上，比一条线更像"范围"
+    const band = (x0, y0, x1, y1, color, op) => {
+      const w = Math.max(x1 - x0, 0.001), d = Math.max(y1 - y0, 0.001);
+      const geo = new THREE.PlaneGeometry(w, d);
+      const mat = new THREE.MeshBasicMaterial({
+        color: color, transparent: true, opacity: op, depthTest: false, depthWrite: false, side: THREE.DoubleSide
+      });
+      const m = new THREE.Mesh(geo, mat);
+      m.rotation.x = -Math.PI / 2;
+      m.position.set((x0 + x1) / 2, Y - 0.01, -(y0 + y1) / 2);
+      m.renderOrder = 6;
+      m.userData.band = true;      // 统计用：不然 ArrowHelper 里的锥体也被算成色带
+      return m;
+    };
+
+    // 1) 设备轮廓：所有距离都从这里量起
+    g.add(dash([P(R.x0, R.y0), P(R.x1, R.y0), P(R.x1, R.y1), P(R.x0, R.y1), P(R.x0, R.y0)], 0x2f6df6, 0.95));
+
+    // 2) 四条余量带：从设备边一直铺到对应的墙，带的宽度就是净距
+    const sides = [
+      { key: 'west',  v: cl.west.v,  cn: '左侧', box: [room.x0, R.y0, R.x0, R.y1], mid: [(room.x0 + R.x0) / 2, (R.y0 + R.y1) / 2] },
+      { key: 'east',  v: cl.east.v,  cn: '右侧', box: [R.x1, R.y0, room.x1, R.y1], mid: [(R.x1 + room.x1) / 2, (R.y0 + R.y1) / 2] },
+      { key: 'south', v: cl.south.v, cn: '南侧', box: [R.x0, room.y0, R.x1, R.y0], mid: [(R.x0 + R.x1) / 2, (room.y0 + R.y0) / 2] },
+      { key: 'north', v: cl.north.v, cn: '北侧', box: [R.x0, R.y1, R.x1, room.y1], mid: [(R.x0 + R.x1) / 2, (R.y1 + room.y1) / 2] }
+    ];
+    sides.forEach(s => {
+      const v = Math.max(0, s.v);
+      const col = colorOf(v);
+      const b = s.box;
+      if (v > 0.04) {
+        g.add(band(b[0], b[1], b[2], b[3], col, v < 0.3 ? 0.30 : (v < 0.7 ? 0.24 : 0.18)));   // 越窄越显眼
+        g.add(dash([P(b[0], b[1]), P(b[2], b[1]), P(b[2], b[3]), P(b[0], b[3]), P(b[0], b[1])], col, 0.92));
+      }
+      // 数值标签。检修面那一侧直接标在同一个标签上——
+      // 单独再画一个"检修面 x.xx m"会正好压在这条标签上，读出来是两个数叠在一起
+      const isFace = s.key === cl.face;
+      const txt = v < 0.05 ? '贴死' : ((isFace ? '检修面 ' : '') + v.toFixed(2) + ' m');
+      const sp = labelSprite(txt, isFace ? LW * 1.12 : LW, {
+        noDepth: true,
+        bg: v < 0.05 ? 'rgba(221,83,79,.96)' : (v < 0.7 ? 'rgba(255,246,230,.97)' : 'rgba(240,252,250,.97)'),
+        fg: v < 0.05 ? '#ffffff' : (v < 0.7 ? '#a86412' : '#0b7d72'),
+        bd: isFace ? 'rgba(47,109,246,.85)' : (v < 0.05 ? 'rgba(255,255,255,.45)' : (v < 0.7 ? 'rgba(221,154,44,.75)' : 'rgba(16,163,148,.6)'))
+      });
+      sp.position.set(s.mid[0], Y + LW * 0.40, -s.mid[1]);
+      sp.renderOrder = 13;
+      g.add(sp);
+      sp.userData.side = s.cn + (isFace ? '·检修面' : '');
+    });
+
+    // 3) 正面箭头：检修面朝哪边，就指哪边——那一边才需要留够空间
+    const fc = { west: [-1, 0], east: [1, 0], south: [0, -1], north: [0, 1] }[cl.face] || [0, 1];
+    const midX = (R.x0 + R.x1) / 2, midY = (R.y0 + R.y1) / 2;
+    const halfW = Math.abs(fc[0]) > 0 ? (R.x1 - R.x0) / 2 : (R.y1 - R.y0) / 2;
+    const sx = midX + fc[0] * halfW, sy = midY + fc[1] * halfW;
+    const len = Math.max(LW * 0.8, Math.min(cl.faceV * 0.85, 1.6));
+    const arrow = new THREE.ArrowHelper(
+      new THREE.Vector3(fc[0], 0, -fc[1]).normalize(),
+      new THREE.Vector3(sx, Y + 0.03, -sy),
+      len, 0x2f6df6, 0.22, 0.13
+    );
+    arrow.renderOrder = 10;
+    g.add(arrow);
+
+    scene.add(g);
+    clrGroup = g;
+    return g;
+  };
+
+  /* 当前标注里到底画了什么（自检/调试用，也给验收脚本数数） */
+  S.clearanceInfo = function () {
+    if (!clrGroup) return null;
+    let lines = 0, sprites = 0, arrows = 0, bands = 0;
+    clrGroup.traverse(o => {
+      if (o.type === 'ArrowHelper') arrows++;
+      else if (o.isSprite) sprites++;
+      else if (o.isLine && o.userData.dash) lines++;
+      else if (o.isMesh && o.userData.band) bands++;
+    });
+    return { lines: lines, sprites: sprites, arrows: arrows, bands: bands, children: clrGroup.children.length };
+  };
+
+  /* 每个净距标签在屏幕上实际占多少像素（验收/调试用）：
+     世界尺寸对，"看起来"也可能小得读不出来——只有换成像素才是用户真实的观感 */
+  S.clearanceScreen = function () {
+    if (!clrGroup || !camera || !renderer) return null;
+    const h = renderer.domElement.clientHeight || 0;
+    const out = [];
+    clrGroup.traverse(o => {
+      if (!o.isSprite) return;
+      const a = o.position.clone(); a.y -= o.scale.y / 2; a.project(camera);
+      const b = o.position.clone(); b.y += o.scale.y / 2; b.project(camera);
+      out.push({ side: o.userData.side || '', px: Math.round(Math.abs(b.y - a.y) * h / 2) });
+    });
+    return out;
+  };
+
   S.focusAt = function (floor, x, y) {
     S.setFocus(floor, false);
     const f = floorGroups.find(q => q.level === floor);
@@ -1460,6 +1609,7 @@
 
   /* ---------------- 调试 / 投影 ---------------- */
   S.camera = () => camera;
+  S.controls = () => controls;
   S.project = function (x, y, z) {
     const v = new THREE.Vector3(x, z, -y).project(camera);
     const r = renderer.domElement.getBoundingClientRect();

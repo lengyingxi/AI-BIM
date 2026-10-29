@@ -276,11 +276,122 @@
   /* ---------------- 设备能不能搬进这间房 ----------------
      按最小包裹尺寸算：设备竖起来搬时占的宽度 = min(w, d)，两侧各留 6 cm 才不蹭门框；
      高度同理（顶上留 8 cm 才抬得进去）。门不够宽 = 设备根本进不了这间房。 */
+  /* 设备四周的净距：左/右/前/后各能走多远才碰到东西。
+     用户问"旁边还有多少空间""离墙多远""够不够检修"时用——
+     同一份结果既喂给场景里的虚框标注，也用来组织回答文字。
+
+     口径：设备按实际朝向摆正后的矩形（foot），沿 ±x / ±y 各找最近的东西。
+     墙面算本房间的边界；同房间的其他设备、本层框架柱按矩形投影算。 */
+  C.clearance = function (o) {
+    const room = o.room, eq = o.equip;
+    if (!room || !eq) return null;
+    const R = eqRect(eq, o.x, o.y, 0);
+    const F = foot(eq);
+    const S = {
+      west: { key: 'west', v: R.x0 - room.x0, who: room.num + ' 室西墙', cn: '左侧' },
+      east: { key: 'east', v: room.x1 - R.x1, who: room.num + ' 室东墙', cn: '右侧' },
+      south: { key: 'south', v: R.y0 - room.y0, who: room.num + ' 室南墙', cn: '南侧' },
+      north: { key: 'north', v: room.y1 - R.y1, who: room.num + ' 室北墙', cn: '北侧' }
+    };
+
+    const put = (k, v, who) => {
+      if (v < -1e-6) return;
+      if (v < S[k].v - 1e-6) { S[k].v = v; S[k].who = who; }
+    };
+    const M = window.BIM_MODEL || {};
+
+    // 同房间的其他设备：只有在另一轴上有重叠，才算挡在那一侧
+    (o.others || []).forEach(e => {
+      if (!e || e === eq) return;
+      const b = eqRect(e, null, null, 0);
+      const name = '「' + (e.name || '设备') + '」';
+      if (b.y1 > R.y0 + 1e-6 && b.y0 < R.y1 - 1e-6) {
+        if (b.x1 <= R.x0) put('west', R.x0 - b.x1, name);
+        if (b.x0 >= R.x1) put('east', b.x0 - R.x1, name);
+      }
+      if (b.x0 < R.x1 - 1e-6 && b.x1 > R.x0 + 1e-6) {
+        if (b.y1 <= R.y0) put('south', R.y0 - b.y1, name);
+        if (b.y0 >= R.y1) put('north', b.y0 - R.y1, name);
+      }
+    });
+
+    // 本层框架柱
+    (M.columns || []).filter(c => c.floor === room.floor).forEach(c => {
+      const h = (c.s || 0.5) / 2;
+      const b = { x0: c.x - h, x1: c.x + h, y0: c.y - h, y1: c.y + h };
+      if (b.y1 > R.y0 + 1e-6 && b.y0 < R.y1 - 1e-6) {
+        if (b.x1 <= R.x0) put('west', R.x0 - b.x1, '框架柱');
+        if (b.x0 >= R.x1) put('east', b.x0 - R.x1, '框架柱');
+      }
+      if (b.x0 < R.x1 - 1e-6 && b.x1 > R.x0 + 1e-6) {
+        if (b.y1 <= R.y0) put('south', R.y0 - b.y1, '框架柱');
+        if (b.y0 >= R.y1) put('north', b.y0 - R.y1, '框架柱');
+      }
+    });
+
+    // 正面（检修面）：rot 决定正面朝哪，那一侧够不够开柜门
+    const rot = F.rot;
+    const cs = Math.cos(rot), sn = Math.sin(rot);
+    const face = Math.abs(sn) > 0.5 ? (sn > 0 ? 'east' : 'west') : (cs > 0 ? 'south' : 'north');
+    const FACE_CN = { west: '西', east: '东', south: '南', north: '北' };
+
+    let minK = 'west';
+    ['east', 'south', 'north'].forEach(k => { if (S[k].v < S[minK].v) minK = k; });
+    const stuck = ['west', 'east', 'south', 'north'].filter(k => S[k].v < 0.05);
+
+    return {
+      room: room, equip: eq, x: o.x == null ? eq.x : o.x, y: o.y == null ? eq.y : o.y,
+      rect: R, foot: F,
+      west: S.west, east: S.east, south: S.south, north: S.north,
+      face: face, faceCn: FACE_CN[face], faceV: S[face].v, faceWho: S[face].who,
+      minKey: minK, minV: S[minK].v, minWho: S[minK].who, minCn: S[minK].cn,
+      stuck: stuck
+    };
+  };
+
+  /* 净距 → 人话 */
+  C.clearWord = function (v, forService) {
+    if (v < 0.05) return '贴死了';
+    if (v < 0.3) return '基本过不去';
+    if (v < 0.6) return '只能侧身过';
+    if (v < 0.9) return forService ? '检修有点挤' : '人能过';
+    if (v < 1.5) return forService ? '够开柜门检修' : '走人不挤';
+    return '很宽敞，搬运也够';
+  };
+
+  /* 一间房在某面墙上占的是哪一段（沿墙轴的投影区间） */
+  function spanOn(room, wall, ux, uy) {
+    const [ax, ay] = wall.p1;
+    const ts = [[room.x0, room.y0], [room.x1, room.y0], [room.x0, room.y1], [room.x1, room.y1]]
+      .map(q => (q[0] - ax) * ux + (q[1] - ay) * uy);
+    return { lo: Math.min.apply(null, ts), hi: Math.max.apply(null, ts) };
+  }
+
+  /* 这扇门是不是真落在这间房的墙段上。
+     长墙（比如 W-5F-005 一条 33 米挂了五间房的门）数据里 d.rooms 会把整面墙的
+     房间都算进去，只按 d.rooms 判断就会拿隔壁的门来量这间房——505 的"门净宽
+     1.00 m"其实量的是 501 的门，拓门自然怎么算都出界。 */
+  function doorInRoom(d, room) {
+    const wall = window.BIM_MODEL.walls.find(w => w.id === d.wall);
+    if (!wall) return false;
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / L, uy = (by - ay) / L;
+    const at = SELF_AT(d, wall, ux, uy);
+    const sp = spanOn(room, wall, ux, uy);
+    const half = (d.w || 1) / 2;
+    return at - half >= sp.lo - 0.05 && at + half <= sp.hi + 0.05;
+  }
+  C.doorInRoom = doorInRoom;
+
   C.passDoor = function (o) {
     const M = window.BIM_MODEL;
     const room = o.room, eq = o.equip;
     if (!room || !eq) return { ok: true, door: null, needW: 0, needH: 0 };
-    const doors = (M.doors || []).filter(d => d.floor === room.floor && (d.rooms || []).indexOf(room.id) >= 0);
+    let doors = (M.doors || []).filter(d => d.floor === room.floor && (d.rooms || []).indexOf(room.id) >= 0);
+    // 先用"门确实在这段墙上"筛；一条都没有时才退回原列表（宁可量错也别当成没门）
+    const exact = doors.filter(d => doorInRoom(d, room));
+    if (exact.length) doors = exact;
     const packW = Math.min(eq.w, eq.d);
     const needW = +(Math.ceil((packW + 0.12) * 20) / 20).toFixed(2);   // 取 5 cm 整数档
     const needH = +(Math.ceil((eq.h + 0.08) * 20) / 20).toFixed(2);
@@ -380,6 +491,20 @@
   }
 
   /* ---------------- 开门碰撞检查 ---------------- */
+  /* 洞口是不是"就是这扇门自己"。模型自带的洞口在 wall.openings 里没有 ref，
+     只按 op.ref === self.id 判断会把"自己"当成挡道的老门，结果每扇原有门都报
+     "和原来的门重叠了"，永远改不动。所以再按 原中心位置 + 原宽度 认一遍。 */
+  function SELF_AT(d, wall, ux, uy) {
+    const [ax, ay] = wall.p1;
+    return (d.pos[0] - ax) * ux + (d.pos[1] - ay) * uy;
+  }
+  function isSelf(op, self, selfAt) {
+    if (!self) return false;
+    if (op.ref && op.ref === self.id) return true;
+    if (selfAt == null) return false;
+    return Math.abs(op.at - selfAt) < 0.03 && Math.abs(op.w - (self.w || 0)) < 0.03;
+  }
+
   C.door = function (o) {
     const M = window.BIM_MODEL;
     const wall = o.wall, at = o.at, w = o.w, h = o.h || 2.1;
@@ -405,9 +530,11 @@
       }
     }
 
+    // 改门时别把自己当成"挡道的旧门"：模型自带的洞口没有 ref，只能按原位置+原宽度认
+    const selfAt = o.self ? SELF_AT(o.self, wall, ux, uy) : null;
     wall.openings.forEach(op => {
       if (op._new) return;
-      if (o.self && op.ref && op.ref === o.self.id) return;   // 改门时别拿它跟自己比
+      if (isSelf(op, o.self, selfAt)) return;
       const gap = Math.abs(op.at - at) - (op.w + w) / 2;
       if (gap < 0.25) {
         const kind = op.kind === 'door' ? '门' : '窗';
@@ -493,8 +620,9 @@
       }
     }
 
+    const selfAtW = o.self ? SELF_AT(o.self, wall, ux, uy) : null;
     wall.openings.forEach(op => {
-      if (o.self && op.ref && op.ref === o.self.id) return;
+      if (isSelf(op, o.self, selfAtW)) return;
       const gap = Math.abs(op.at - at) - (op.w + w) / 2;
       if (gap < 0.3) {
         const kind = op.kind === 'door' ? '门' : '窗';
@@ -601,6 +729,128 @@
       if (!best || d < best.d) best = { at: at, d: d, check: c };
     }
     return best;
+  };
+
+  /* ---------------- 拓门：先量两侧各剩多少 ----------------
+     门能不能加宽，不是"以门心为轴两边各长一半"就算完 —— 现场十有八九是一侧贴着
+     墙角或隔壁门，另一侧还有墙垛可挖。所以先把门洞左右两条边到障碍的净距离分别量出来，
+     再据此生成「两侧各半 / 只扩左 / 只扩右」三个方案，最后仍由 C.door 做一次总校核。
+     量的是沿墙方向的距离：墙角留 0.22 m 墙垛、洞口之间留 0.25 m、房间墙面留 0.05 m。 */
+  C.doorRoom = function (o) {
+    const M = window.BIM_MODEL;
+    const wall = o.wall, at = o.at, w = o.w;
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / L, uy = (by - ay) / L;
+    const proj = (x, y) => (x - ax) * ux + (y - ay) * uy;
+    const perp = (x, y) => Math.abs(-(x - ax) * uy + (y - ay) * ux);
+    const eL = at - w / 2, eR = at + w / 2;
+    const JAMB = 0.22, GAP = 0.25;
+
+    const L_ = [], R_ = [];                       // {lim, name}：门边最多能推到哪
+    L_.push({ lim: JAMB, name: '这头墙角' });
+    R_.push({ lim: L - JAMB, name: '另一头墙角' });
+    if (o.room) {
+      const ts = [[o.room.x0, o.room.y0], [o.room.x1, o.room.y0],
+                  [o.room.x0, o.room.y1], [o.room.x1, o.room.y1]].map(p => proj(p[0], p[1]));
+      L_.push({ lim: Math.min.apply(null, ts) + 0.05, name: '房间这头的墙端' });
+      R_.push({ lim: Math.max.apply(null, ts) - 0.05, name: '房间那头的墙端' });
+    }
+    const selfAt0 = o.self ? SELF_AT(o.self, wall, ux, uy) : null;
+    (wall.openings || []).forEach(op => {
+      if (op._new) return;
+      if (isSelf(op, o.self, selfAt0)) return;
+      if (op.kind !== 'door' && op.kind !== 'window') return;
+      const name = op.kind === 'door' ? '原来的门' : '原来的窗';
+      const l = op.at - op.w / 2, r = op.at + op.w / 2;
+      if (r <= eL + 1e-6) L_.push({ lim: r + GAP, name: name });
+      else if (l >= eR - 1e-6) R_.push({ lim: l - GAP, name: name });
+      else { L_.push({ lim: eL, name: name }); R_.push({ lim: eR, name: name }); }
+    });
+    (M.columns || []).filter(c => c.floor === wall.floor).forEach(c => {
+      if (perp(c.x, c.y) > wall.t / 2 + c.s / 2) return;
+      const tc = proj(c.x, c.y), l = tc - c.s / 2, r = tc + c.s / 2;
+      if (r <= eL + 1e-6) L_.push({ lim: r, name: '框架柱' });
+      else if (l >= eR - 1e-6) R_.push({ lim: l, name: '框架柱' });
+    });
+
+    // 门边最多能推到哪：左边取所有"下限"里最大的那个，右边取所有"上限"里最小的那个
+    const goL = L_.reduce((a, b) => (b.lim > a.lim ? b : a), { lim: -1e9, name: '' });
+    const goR = R_.reduce((a, b) => (b.lim < a.lim ? b : a), { lim: 1e9, name: '' });
+    return {
+      at: at, w: w, eL: eL, eR: eR, L: L,
+      left: Math.max(0, Math.min(eL, +(eL - goL.lim).toFixed(3))),
+      right: Math.max(0, Math.min(L - eR, +(goR.lim - eR).toFixed(3))),
+      nearL: goL.name, nearR: goR.name
+    };
+  };
+
+  /* 拓门方案：按「两侧各半 → 只扩余量大的一侧 → 顺墙平移 → 退而求其次的宽度」依次试，
+     每个方案都过 C.door。返回第一个能过的，以及两侧余量（回执里要报给用户）。 */
+  C.widenPlan = function (o) {
+    const wall = o.wall, at = o.at, w = o.w, h = o.h;
+    const need = Math.max(o.need || w, w);
+    const D = +(need - w).toFixed(3);
+    const side = C.doorRoom({ wall: wall, at: at, w: w, room: o.room, self: o.self });
+    const equipments = o.equipments || [];
+    const cands = [];
+    const add = (mode, at2, w2, why) => {
+      const chk = C.door({ wall: wall, at: at2, w: w2, h: h, room: o.room,
+                           equipments: equipments, self: o.self });
+      cands.push({ mode: mode, at: +at2.toFixed(3), w: +w2.toFixed(3), h: h,
+                   chk: chk, pass: chk.pass, why: why || '' });
+    };
+
+    if (D <= 1e-6) add('sym', at, w);                       // 只改高度
+    else {
+      add('sym', at, need, '两侧各扩一半');
+      // 只扩一侧：先试余量大的那侧
+      const order = side.left >= side.right ? ['left', 'right'] : ['right', 'left'];
+      order.forEach(sd => {
+        const avail = sd === 'left' ? side.left : side.right;
+        if (avail < D - 1e-6) return;
+        add(sd, sd === 'left' ? at - D / 2 : at + D / 2, need,
+            sd === 'left' ? '只往左侧扩' : '只往右侧扩');
+      });
+    }
+
+    // 原位三个方案都不行 → 顺墙平移（但别让门跑到墙的另一头去，最多让 2 m）
+    let slide = null;
+    if (!cands.some(c => c.pass)) {
+      const sug = C.suggestDoorAt({ wall: wall, room: o.room, at: at, w: need, h: h,
+                                    equipments: equipments, self: o.self });
+      if (sug && sug.check && sug.check.pass && Math.abs(sug.at - at) <= 2.0) {
+        slide = { mode: 'slide', at: +sug.at.toFixed(3), w: need, h: h,
+                  chk: sug.check, pass: true, why: '顺墙让 ' + Math.abs(sug.at - at).toFixed(2) + ' 米',
+                  shift: +(sug.at - at).toFixed(3) };
+        cands.push(slide);
+      }
+    }
+
+    // 还是不行：找出"最多能拓到多宽"，好把话说清楚（差多少、差在哪）
+    let reach = null;
+    if (!cands.some(c => c.pass) && D > 1e-6) {
+      for (let i = 1; i <= 40; i++) {
+        const w2 = +(need - i * 0.05).toFixed(2);
+        if (w2 <= w + 1e-6) break;
+        const d2 = +(w2 - w).toFixed(3);
+        const tries = [[at, 'sym'], [at - d2 / 2, 'left'], [at + d2 / 2, 'right']];
+        let hit = null;
+        for (const [at2, mode] of tries) {
+          const chk = C.door({ wall: wall, at: at2, w: w2, h: h, room: o.room,
+                               equipments: equipments, self: o.self });
+          if (chk.pass) {
+            hit = { mode: mode, at: +at2.toFixed(3), w: w2, h: h, chk: chk, pass: true, why: '' };
+            break;
+          }
+        }
+        if (hit) { reach = hit; cands.push(hit); break; }
+      }
+    }
+
+    const best = cands.find(c => c.pass) || null;
+    return { side: side, need: need, D: D, cands: cands, best: best, reach: reach,
+             blocked: best ? null : (cands[0] ? cands[0].chk.blocks : []) };
   };
 
   // 两线段交点参数（返回 0~1 比例）

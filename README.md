@@ -1,4 +1,4 @@
-# AI-BIM / AIbim 运维系统TEST
+# AI-BIM / AIbim 运维系统
 
 浏览器端的 BIM 运维演示系统：**三维模型浏览 + 自然语言对话操控 + 离线语音指令 + 结构校核**。
 
@@ -19,6 +19,7 @@
 | IFC 读取 | `web/js/ifc.js`，读取 `web/assets/*.ifc` 换模型 |
 | 管线路由 | `web/js/routes.js`，风管路由、关阀查下游影响 |
 | 结构校核 | `web/js/calc.js`，板厚 / 配筋 / 活荷载，出单板承载力计算书（GB 50010 口径） |
+| 四周净距 | `calc.js` 量设备到四面墙 / 柱 / 邻机的最小余量，`scene.js` 在楼板上画虚框色带标注；大模型可经 `query_clearance` 调用 |
 | 对话智能体 | `web/js/agent.js` + `nlp.js` + `mcp.js`，自然语言指令转工具调用 |
 | 离线语音 | `tools/serve.py` 的 `/asr/*`，sherpa-onnx 流式识别，全程不出本机 |
 

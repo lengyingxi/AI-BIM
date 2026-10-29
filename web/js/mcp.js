@@ -5,6 +5,11 @@
    这一层要覆盖设备与门的两大类增删改查移，加上视图聚焦/隔离，
    并在 T.guide 里写清"什么时候调哪个、参数怎么填"，一起发给模型。
 
+   注意：这些工具跑在 agent.js 的 A.loop 里，一次对话可以连着调好几轮——
+   模型看得到每次执行的结果（安全系数、两侧余量、候选位置），
+   所以"放不下就换房间""门太窄先拓门"这类要求它能自己拐弯，
+   不需要每次都把球踢回给用户。
+
    用法：
      BIM.mcp.bind({ place_equipment: async (args) => ({ ok:true, say:'…' }), … })
      BIM.mcp.tools                                  // 送给模型的 tools 数组
@@ -22,13 +27,30 @@
   /* ---------------- 调用逻辑（和工具一起发给模型，比只给 schema 稳得多） ---------------- */
   T.guide = [
     '【能力范围】你能对模型做的全部操作都在工具里，分三类：',
-    '· 设备：增 place_equipment｜删 remove_equipment｜改 resize_equipment｜替换 replace_equipment｜移动 move_equipment｜查 query_equipment、list_devices｜引导 suggest_positions',
+    '· 设备：增 place_equipment｜删 remove_equipment｜改 resize_equipment｜替换 replace_equipment｜移动 move_equipment｜查 query_equipment、query_clearance、list_devices｜找房 find_rooms_for_equipment｜引导 suggest_positions',
     '· 门：增 open_door｜删 remove_door｜改 resize_door｜移动 move_door｜查 query_door、list_doors',
     '· 视图与拓扑：聚焦 focus_view｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
     '【方向语义】用户说的左/右/前/后/上/下 都是他当前屏幕的方向，你只传 left/right/front/back/up/down，系统按相机换算；只有明说东/南/西/北才传 east/south/west/north。选墙的 side 同理——"左边那面墙开个门"就传 left，别自己换算成 west，用户转过镜头之后会开错墙。"开窗"走 open_window，参数和 open_door 一样多一个 sill（窗台高）；用户说落地窗就传 sill=0.1。',
     '【默认值】"一点"≈0.3 米，"半米"=0.5；没说距离给 0.4；没说数量给 1；没说什么门按 1.0×2.1 米。这些不用反问。',
     '【模糊需求】用户说"放得合适一点/你看怎么挪好/不太对"这类模糊话时，先想清楚他大概想改善什么（省地方 / 不挡门 / 靠墙整齐 / 别压梁）：调 suggest_positions，系统会自动挑最合适的位置直接放好并把备选返回，你只需用一句话说明"为什么放这儿"和"还能怎么改"。不要反问"你要放哪"，也不要只给建议不动手。',
+    '【拓门】"门太窄搬不进去""门加宽到 1.5 米"都走 resize_door。系统会**分别量门洞左右两侧**还能扩多少，再决定"两侧各扩一半 / 只扩余量大的一侧 / 顺墙让一段"——不会硬按两边对半。三个方案都要过开门校核，过不了就门一个字都不改。回答要讲清：两侧各剩多少、最后往哪边扩了多少、拓完设备能不能过、以及设备在最终位置的安全系数（旁边给"看计算书"的入口）。',
+    '【净距】"旁边还有多少空间""离墙多远""够不够检修""周边余量"都走 query_clearance。系统会在楼板上画虚框标出四周，',
+    '  你回答时按"左/右/南/北各多少米 + 哪边最窄 + 正面检修面多少"来讲，数字直接用工具返回的，别自己估，也别换算成别的方向。',
+    '  用户接着问"那能不能再放一台""挪一下会不会更宽"，就用返回的数字判断，不要重新量一遍。',
     '【上下文】"这台/它/刚才那台"=当前选中的设备；"这个门"=最近开的门；省略房间沿用上下文房间。真的缺房间号才问一句。',
+    '【放还是搬——最容易搞错的一条】"把空压机放到 203"没有指代词，就是**在这间新放一台**（place_equipment）；',
+    '  只有明确指着已有的那台（"把这个空压机放到 203""把它搬到 203""这台挪到 203"）才是 move_equipment。',
+    '  两者结果差很多：一个是多一台，一个是把那台搬走。拿不准的时候，句子里有"这/那/它"才当搬家。',
+    '【不许自作主张】只能做用户明确要的事：用户没说"开门"就别 open_door，没说"换台小的"就别 resize_equipment，没说"拆"就别 remove_*。',
+    '  遇到障碍（门太窄搬不进来、楼板吃不消、位置占不下）时，按这个顺序想办法：① 换方位/换房间（move_equipment、suggest_positions）② 拓现有门（resize_door）③ 停下来把原因和可选方案讲清楚。',
+    '  拓门失败、房间放不下这类，属于"要用户拍板"的事，别自己新增门洞或改建筑，把选择权交回去。',
+    '【特殊要求怎么接】用户一句话里带多个条件时，全都要满足，别只挑一个好做的：',
+    '  · "放到 506 靠窗、别挡门"→ place_equipment(pref=window)，结果里看碰撞和门洞，不满足就再调一次换方位；',
+    '  · "挪到靠窗/靠墙/墙角"（说的是已有的那台）→ move_equipment(pref=window/wall/corner)，别用 place 再放一台；',
+    '  · "搬到 3 楼去"没说哪间 → 先 find_rooms_for_equipment 找放得下的，再 move_equipment 搬过去；',
+    '  · "这间太挤了，收拾一下"→ list_devices 看清有什么，再逐台 move_equipment(pref=wall/corner) 排开；',
+    '  · "放不下就算了"→ 试一次就停，把失败原因说清楚，不要反复重试；',
+    '  · 用户给的数字（1.5 米、2 吨、0.3 米）一律照用，不要自己改。',
     '【聚焦】改模型之后系统会自动聚焦并淡出无关楼层，不用你再调 focus_view；只有用户明确说"挡住看不清/只看这间/把那层藏起来"时，才调 focus_view 且 only_this=true。',
     '【回答】做完用一两句口语说清"改了什么、结果怎样（安全系数/能不能通行）"，再给一个可选的下一步。不要念参数、不要提工具名。'
   ].join('\n');
@@ -76,16 +98,31 @@
       type: 'function',
       function: {
         name: 'move_equipment',
-        description: '【设备·移动】挪设备：① 方向+距离（"往左一点"）② 挪到某个方位（"靠里""贴墙""墙角"）③ 搬到别的房间（给 room）。默认操作当前这台。',
+        description: '【设备·移动】挪设备：① 方向+距离（"往左一点"）② 挪到某个方位（"靠里""贴墙""墙角"）③ 搬到别的房间（给 room，系统会在新房间自动挑最合适的位置并重算承重）。默认操作当前这台。',
         parameters: {
           type: 'object',
           properties: {
             target: { type: 'string', description: '设备名；省略=当前这台' },
             direction: { type: 'string', enum: dirEnum, description: '相对方向：left/right/front/back/up/down 按用户屏幕；in/out 往房间里/门口；east/south/west/north 按方位' },
             distance: { type: 'number', description: '挪多远（米）；"一点"0.3、"半米"0.5，没说要给 0.4' },
-            pref: { type: 'string', enum: prefEnum, description: '直接挪到某个方位时填（靠里/贴墙/墙角/靠窗/居中）' },
-            room: { type: 'string', description: '搬到另一间房时给房号' },
+            pref: { type: 'string', enum: prefEnum, description: '直接挪到某个方位时填（靠里/贴墙/墙角/靠窗/居中）；搬家时填了就在新房间按这个方位放' },
+            room: { type: 'string', description: '搬到另一间房时给房号（"把它放到 506"就是这个）；不填=原地挪' },
             floor: { type: 'integer', description: '楼层' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'find_rooms_for_equipment',
+        description: '【设备·找位】在某一层里找出真放得下这台设备的房间，按楼板余量排序。用户说"哪间能放""这层哪儿有地方""换个房间"时用。只查不改。',
+        parameters: {
+          type: 'object',
+          properties: {
+            device: { type: 'string', description: '设备名；省略=当前这台' },
+            floor: { type: 'integer', description: '楼层；省略=当前楼层' },
+            count: { type: 'integer', description: '返回几个候选，默认 3' }
           }
         }
       }
@@ -131,6 +168,21 @@
         parameters: {
           type: 'object',
           properties: { target: { type: 'string', description: '设备名；省略=当前这台' } }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'query_clearance',
+        description: '【设备·查】量设备四周净距，并在模型楼板上用虚框把左/右/南/北各多少米标出来（还会指出正面检修面朝哪边、剩多少）。用户问"旁边还有多少空间""离墙多远""够不够检修""周边余量"时用。只量不改。',
+        parameters: {
+          type: 'object',
+          properties: {
+            target: { type: 'string', description: '设备名；省略=当前这台' },
+            room: { type: 'string', description: '房号，可选' },
+            show: { type: 'boolean', description: '默认 true=在模型上画虚框；false=只报数字不动画面' }
+          }
         }
       }
     },
@@ -274,7 +326,7 @@
       type: 'function',
       function: {
         name: 'resize_door',
-        description: '【门·改】改门宽/门高（"加宽到 1.5 米""门矮一点 2 米"）。改完重新判断能不能开。',
+        description: '【门·改】改门宽/门高（"加宽到 1.5 米""门矮一点 2 米"）。系统分别量门洞左右两侧余量，自动选"两侧各扩一半 / 只扩余量大的一侧 / 顺墙让一段"，并重新做开门校核；改完把设备的最终安全系数一并给出。',
         parameters: {
           type: 'object',
           properties: {

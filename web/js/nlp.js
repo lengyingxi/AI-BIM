@@ -280,6 +280,10 @@
       if (floor != null) {
         let r = M.rooms.find(x => x.floor === floor && x.num === String(num));
         if (r) return { room: r };
+        // 房号本身在全楼唯一时以房号为准：用户把"5 楼 505"说成"2 楼 505"，
+        // 该去的是 505 而不是猜成 205。楼层说错了按房号纠正，别把设备放到别人房间。
+        r = M.rooms.find(x => x.num === String(num));
+        if (r) return { room: r, floorFix: r.floor !== floor, said: num };
         const last2 = String(num).padStart(3, '0').slice(-2);
         r = M.rooms.find(x => x.floor === floor && x.num === String(floor) + last2);
         if (r) return { room: r, guess: true, said: num };
@@ -376,7 +380,7 @@
     if (rn != null) {
       out.roomNum = rn;
       const r = N.resolveRoom(out.floor, rn);
-      if (r.room) { out.room = r.room; out.floor = r.room.floor; out.guess = !!r.guess; out.said = r.said; }
+      if (r.room) { out.room = r.room; out.floor = r.room.floor; out.guess = !!r.guess; out.said = r.said; out.floorFix = !!r.floorFix; }
     }
     // 特殊空间：只有没点名房间号时，"走廊/楼梯"才指这层的那一间
     // （"306 靠走廊的墙" 说的是方位，不是要把 306 换成走廊）
@@ -392,6 +396,14 @@
     const hasDoor = (/门|洞口/.test(tNoValve) && /开|打|凿|加|装|做|洞|留|放|位置|设/.test(tNoValve)) || /开洞|门洞|打洞/.test(tNoValve);
     const hasWindow = hasWin(tNoWinPref);
     const hasPlace = /放|摆|安装|搬|移动|移到|搁|布置|安置|放到|装到/.test(t);
+    // 问"旁边还有多少空间 / 离墙多远 / 够不够检修" → 量设备四周净距（并在模型上画虚框）
+    // 注意别和"往旁边挪"抢：那是 move，已经在 hasMove 里判过了
+    const hasClear = !/往.{0,3}(旁边|边上)/.test(t) && (
+      /(旁边|周围|四周|边上|周边|附近|两侧|里侧|外侧|墙角).{0,8}(空间|多少|多大|多宽|多长|余量|净距|距离|够不)/.test(t)
+      || /净距|检修(空间|距离|间距)|离(墙|柱|设备|柜子|墙边).{0,6}(多远|多少|几米|距离)/.test(t)
+      || /(够不够|够不|能不能).{0,6}(检修|过人|走人|搬进来|进去)/.test(t)
+      || /(旁边|周围|四周).{0,4}(还有|留|剩).{0,4}(多少|几米|多宽)/.test(t)
+    );
     // 只是挪一下（不说"放到哪"）：往左一点 / 挪到墙角 / 移一下
     const hasMove = /挪|移动|移一下|移过去|挪过去|搬一下|往.{0,3}(左|右|前|后|里|外|东|南|西|北)|换个位置|换个地方/.test(t)
       && !/放到|摆到|装到|安装到|摆到/.test(t);
@@ -400,6 +412,7 @@
     else if (hasWindow) out.intent = 'window';
     else if (hasValve && !hasDoor) out.intent = 'valve';
     else if (hasDoor) out.intent = 'door';
+    else if (hasClear) out.intent = 'clearance';
     else if (hasPlace) out.intent = 'place';
     else if (/属性|信息|参数|详情|资料|这是啥|这是什么/.test(t)) out.intent = 'info';
     else if (/复位|全览|整体|全楼|总览|回到|鸟瞰/.test(t)) out.intent = 'view';

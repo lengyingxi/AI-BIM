@@ -625,6 +625,8 @@
         }
       }
       if (last.status === 400 || last.status === 422) {
+        // 多轮循环里不再降级：中途把 tools 抽掉会让模型以为工具没了
+        if (opt.strictTools) break;
         if (body.parallel_tool_calls !== undefined && /parallel_tool_calls/i.test(low)) {
           delete body.parallel_tool_calls; note = '这个服务不认并行工具调用，已去掉'; continue;
         }
@@ -689,7 +691,12 @@
     '能一次调多个就并行调；用户说了房间号就用他的，没说就沿用上下文。',
     '不能操作的问题（解释、建议、为什么）直接用一句口语回答，不要再调工具。',
     '回答用中文，简短，不要提工具名、参数、JSON。',
-    '设备名对不上时选最接近的那台（"水冷机组"→"风冷冷水机组"），不要反问。'
+    '设备名对不上时选最接近的那台（"水冷机组"→"风冷冷水机组"），不要反问。',
+    '【放还是搬】"把空压机放到 203"=新放一台（place_equipment）；"把这个/它/刚才那台放到 203"=搬走已有那台（move_equipment）。结果差一台设备，别混。',
+    '【多轮】工具调完会立刻把执行结果回给你（ok/安全系数/两侧余量/候选位置都在里面）。',
+    '每拿到一次结果就判断一次：成了就收尾；没成（ok 为 false 或结果里说放不下、撞了、搬不进来）就换方案再调一次——',
+    '例如换房间、换方位、把设备改小、拓门、先挪走挡道的。最多 4 轮，别原地重试同一个调用。',
+    '【收尾】最后一次不要再调工具，用一两句口语把"改了什么、结果怎样（真实数字）、还有什么要注意"讲完。'
   ].join('\n');
 
   /* 工具的用法说明放在 mcp.js 里，和 schema 一起维护；这里拼进去 */
@@ -729,6 +736,10 @@
       height: a.height || null, weight: kg(a.weight)
     }),
     query_equipment: a => ({ act: 'info', target: a.target || null }),
+    query_clearance: a => ({ act: 'clearance', target: a.target || null, room: a.room || null, show: a.show !== false }),
+    find_rooms_for_equipment: a => ({
+      act: 'findroom', device: a.device || null, floor: a.floor || null, want: a.count || 3
+    }),
     list_devices: a => ({ act: 'devices', room: a.room || null, floor: a.floor || null }),
     suggest_positions: a => ({
       act: 'suggest', device: a.device || null, room: a.room || null, floor: a.floor || null,
@@ -774,6 +785,7 @@
     query_impact: a => ({ act: 'impact', room: a.room || null, valve: a.valve || null }),
     undo_last: () => ({ act: 'undo' })
   };
+  A.toolToStep = TOOL2STEP;      // 给 Agent 循环用：每次工具调用顺手记一笔内部步骤
 
   /* 这句是不是"要动手"的话：要动手就逼模型调工具，别让它嘴上说做了 */
   const ACTY = /开|关|放|摆|挪|移|搬|撤|删|改|换|替换|加宽|加高|调小|调大|缩小|扩大|聚焦|只显示|隐藏|切到|看看|显示|查一下|列出|加上|去掉|撤回|撤销/;
@@ -809,6 +821,94 @@
     const weak = want && !calls.length && !legacyOk;
     return { ok: true, calls: calls, reply: reply, weak: weak, note: r.note || '' };
   }
+
+  /* ---------------- 多轮工具调用（Agent 循环） ----------------
+     以前一次请求只够"听懂一句、挑一个工具"，模型根本看不到执行结果，
+     于是"搬不进去就换台小的""先试试不行再说"这类要求全部落空，
+     表现就是：模型像没执行一样反问用户。
+     现在改成：模型调工具 → 真执行 → 结果回灌 → 模型判断 → 继续或收尾。 */
+  A.MAX_ROUNDS = 4;
+  A.MAX_CALLS = 8;
+
+  function briefOut(T, out) {
+    if (out && T && T.brief) return T.brief(out);
+    try { return JSON.stringify(out || {}).slice(0, 600); } catch (e) { return '{"ok":false}'; }
+  }
+
+  A.loop = async function (text, exec) {
+    const T = window.BIM.mcp;
+    if (!T || !T.tools) return { ok: false, err: '工具层没加载' };
+    if (typeof exec !== 'function') return { ok: false, err: '没有执行器' };
+
+    const msgs = buildMsgs(text, toolSys());
+    const trace = [];
+    const want = looksAction(text);
+    let calls = 0;
+
+    for (let round = 0; round < A.MAX_ROUNDS; round++) {
+      const first = round === 0;
+      const r = await post(msgs, {
+        tools: T.tools,
+        // 第一轮是明确的动手指令就逼它调工具；之后交给模型自己判断该不该收尾
+        toolChoice: first ? (want ? 'required' : 'auto') : 'auto',
+        json: false, maxTokens: 700, think: false, strictTools: !first,
+        timeout: Math.max(A.cfg.timeout || 0, 60000)
+      });
+      A.diag = {
+        at: Date.now(), ok: r.ok, url: r.url, status: r.status, ms: r.ms,
+        err: r.err || '', hint: r.hint || '', body: r.body || '', note: r.note || '',
+        mode: 'loop', round: round + 1, calls: calls
+      };
+      if (!r.ok) return { ok: false, err: r.err, hint: r.hint, trace: trace, calls: calls };
+
+      const tcs = (r.calls || []).filter(tc => (tc.function || tc).name);
+      if (!tcs.length) {
+        return { ok: true, reply: String(r.raw || '').trim(), trace: trace, calls: calls, rounds: round + 1 };
+      }
+
+      // 模型这一轮的 tool_calls 必须原样回填，后面才接得上 tool 结果
+      msgs.push({
+        role: 'assistant',
+        content: String(r.raw || ''),
+        tool_calls: tcs.map((tc, i) => {
+          const fn = tc.function || tc;
+          return {
+            id: tc.id || ('call_' + calls + '_' + i),
+            type: 'function',
+            function: {
+              name: fn.name,
+              arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments || {})
+            }
+          };
+        })
+      });
+
+      for (let i = 0; i < tcs.length; i++) {
+        const fn = tcs[i].function || tcs[i];
+        const name = fn.name;
+        const args = parseArgs(fn.arguments != null ? fn.arguments : fn.args);
+        const id = tcs[i].id || ('call_' + calls + '_' + i);
+        if (calls >= A.MAX_CALLS) {
+          msgs.push({ role: 'tool', tool_call_id: id, name: name, content: '{"ok":false,"say":"操作次数到上限了，先停在这里"}' });
+          continue;
+        }
+        calls++;
+        let out;
+        try { out = await exec(name, args); }
+        catch (e) { out = { ok: false, say: '执行出错了：' + (e && e.message ? e.message : e) }; }
+        out = out || {};
+        trace.push({ name: name, args: args, ok: out.ok !== false, say: String(out.say || '').slice(0, 240) });
+        msgs.push({ role: 'tool', tool_call_id: id, name: name, content: briefOut(T, out) });
+      }
+    }
+
+    // 轮数用完：把工具收走逼它总结，免得卡在"再调一次"里空转
+    const fin = await post(msgs, { tools: T.tools, toolChoice: 'none', json: false, maxTokens: 400, think: false, strictTools: true });
+    return {
+      ok: true, reply: fin.ok ? String(fin.raw || '').trim() : '', trace: trace,
+      calls: calls, rounds: A.MAX_ROUNDS, truncated: true
+    };
+  };
 
   async function askLLM(text, opt) {
     opt = opt || {};
