@@ -1,0 +1,31 @@
+services:
+  aibim:
+    # 部署前把 XXX 换成实际镜像版本号，例如 latest / main-a1b2c3d / 20261029-a1b2c3d
+    image: registry.cn-hangzhou.aliyuncs.com/lengyingxi/aibim:XXX
+    container_name: aibim
+    restart: unless-stopped
+
+    ports:
+      - "8823:8823"          # 宿主端口:容器端口，改前面即可换对外端口
+
+    environment:
+      PORT: "8823"                                  # 容器内监听端口
+      # 大模型上游地址（含 /v1）。留空则用镜像内置默认值
+      LLM_TARGET: "https://llmapi.siruijie.com.cn/v1"
+      LLM_MODEL: ""                                 # 默认模型名，留空由服务自动挑选
+      LLM_KEY: ""                                   # 上游 Key；也可改用下面的 key 文件挂载
+
+    volumes:
+      # 方式一（推荐）：Key 放文件，不进镜像也不进命令行
+      # 宿主机先执行：echo 'sk-你的key' > ./secrets/llm_key
+      - ./secrets/llm_key:/app/tools/.llm_key:ro
+
+      # 离线语音模型目录。挂进去且非空时自动启用本地识别；为空或删掉这段则退回浏览器识别
+      # 宿主机准备：mkdir -p ./asr && 把 sherpa-onnx 或 vosk 模型放进 ./asr
+      - ./asr:/app/tools/asr:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
