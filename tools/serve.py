@@ -558,8 +558,11 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def log_message(self, fmt, *a):
+        # 注意：log_error() 内部也是转调这个方法，此时第一个参数是 HTTP 状态码
+        # （Python 3.13 起还是 HTTPStatus 枚举），不能拿来做 'in' 判断，
+        # 否则 404 之类一发生就抛 TypeError 把请求线程带崩。
         p = a[0] if a else ''
-        if '/llm' in p or '/asr/' in p:
+        if isinstance(p, str) and ('/llm' in p or '/asr/' in p):
             return
         sys.stderr.write('  %s\n' % (fmt % a))
 
