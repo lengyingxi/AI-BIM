@@ -757,6 +757,10 @@
       width: a.width || 1.5, height: a.height || 1.5, sill: a.sill == null ? .9 : a.sill, pref: a.pref || null
     }),
     remove_window: a => ({ act: 'windowoff', window: a.window || null, room: a.room || null, floor: a.floor || null }),
+    move_window: a => ({
+      act: 'winmove', window: a.window || null, room: a.room || null, floor: a.floor || null,
+      dir: a.direction || null, dist: a.distance != null ? Math.abs(+a.distance) : null
+    }),
     remove_door: a => ({
       act: 'dooroff', door: a.door || null, room: a.room || null, floor: a.floor || null, side: a.side || null
     }),

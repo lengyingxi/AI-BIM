@@ -29,8 +29,14 @@
     '【能力范围】你能对模型做的全部操作都在工具里，分三类：',
     '· 设备：增 place_equipment｜删 remove_equipment｜改 resize_equipment｜替换 replace_equipment｜移动 move_equipment｜查 query_equipment、query_clearance、list_devices｜找房 find_rooms_for_equipment｜引导 suggest_positions',
     '· 门：增 open_door｜删 remove_door｜改 resize_door｜移动 move_door｜查 query_door、list_doors',
+    '· 窗：增 open_window｜删 remove_window｜移动 move_window（挪位置/改窗台高）',
     '· 视图与拓扑：聚焦 focus_view｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
     '【方向语义】用户说的左/右/前/后/上/下 都是他当前屏幕的方向，你只传 left/right/front/back/up/down，系统按相机换算；只有明说东/南/西/北才传 east/south/west/north。选墙的 side 同理——"左边那面墙开个门"就传 left，别自己换算成 west，用户转过镜头之后会开错墙。"开窗"走 open_window，参数和 open_door 一样多一个 sill（窗台高）；用户说落地窗就传 sill=0.1。',
+    '【挪窗——上下和左右不是一回事】窗在墙上只有两个自由度，别混：',
+    '  · "往上/往下""抬高/降低""窗台高一点" → move_window(direction=up/down)，改的是窗台标高，窗宽窗高不变；',
+    '  · "往左/往右""沿着墙挪""挪到墙中间" → move_window(direction=left/right/center)，沿着墙滑；',
+    '  · 用户转过镜头之后，"往左"永远是他在屏幕上看到的左——你只传 left，不要自己算成 east/west。',
+    '  · 挪不动（压墙角、贴到别的门窗、顶到梁）时系统会返回原因，照实说，并给"往反方向挪 / 抬低一点 / 把窗做矮"这类可选动作，不要硬试。',
     '【默认值】"一点"≈0.3 米，"半米"=0.5；没说距离给 0.4；没说数量给 1；没说什么门按 1.0×2.1 米。这些不用反问。',
     '【模糊需求】用户说"放得合适一点/你看怎么挪好/不太对"这类模糊话时，先想清楚他大概想改善什么（省地方 / 不挡门 / 靠墙整齐 / 别压梁）：调 suggest_positions，系统会自动挑最合适的位置直接放好并把备选返回，你只需用一句话说明"为什么放这儿"和"还能怎么改"。不要反问"你要放哪"，也不要只给建议不动手。',
     '【拓门】"门太窄搬不进去""门加宽到 1.5 米"都走 resize_door。系统会**分别量门洞左右两侧**还能扩多少，再决定"两侧各扩一半 / 只扩余量大的一侧 / 顺墙让一段"——不会硬按两边对半。三个方案都要过开门校核，过不了就门一个字都不改。回答要讲清：两侧各剩多少、最后往哪边扩了多少、拓完设备能不能过、以及设备在最终位置的安全系数（旁边给"看计算书"的入口）。',
@@ -284,6 +290,27 @@
             window: { type: 'string', description: '窗编号；省略=最近开的那扇' },
             room: { type: 'string', description: '房号' },
             floor: { type: 'integer', description: '楼层' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'move_window',
+        description: '【窗·改】挪一扇已经开好的窗，整扇平移、窗宽窗高不变。上下=抬降窗台标高，左右前后=沿着墙滑。用户说"把窗往上挪一点/抬高一些/降下来/往左挪半米/挪到墙中间"时用。方向按当前镜头换算（用户说左就填 left，别自己换算成东南西北）。会自动校核压墙角、撞柱、贴上别的门窗、顶到梁；挪不过去会返回卡在哪。返回挪了多少、现在轴位与窗台高、两头离墙角还剩多少。',
+        parameters: {
+          type: 'object',
+          properties: {
+            window: { type: 'string', description: '窗编号；省略=最近操作的那扇' },
+            room: { type: 'string', description: '房号，可选' },
+            floor: { type: 'integer', description: '楼层，可选' },
+            direction: {
+              type: 'string',
+              enum: ['up', 'down', 'left', 'right', 'front', 'back', 'center', 'east', 'south', 'west', 'north'],
+              description: 'up/down=抬高或降低窗台；left/right/front/back=沿墙滑（按当前镜头）；center=滑到这段墙的中间；东南西北只有用户明说才用'
+            },
+            distance: { type: 'number', description: '挪多少米，默认 0.3。用户说"一点"就 0.3，"半米"就 0.5' }
           }
         }
       }

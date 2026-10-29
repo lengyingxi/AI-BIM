@@ -156,6 +156,24 @@
   }
   N.hasWin = hasWin;
 
+  /* 挪动已有的窗，不是新开一扇：
+     "把窗往上挪""窗台抬高一点""这扇窗往左移半米"。
+     判据是——提到了窗 + 带位移/升降动词，且没有"开/加/装/做"这类新开动作。 */
+  const WIN_UP = /往上|向上|上移|升高|抬高|提高|调高|挪高|再高|高一点|高一些|高些|高点儿|抬一点|提一点/;
+  const WIN_DOWN = /往下|向下|下移|降低|压低|调低|挪低|再低|低一点|低一些|低些|低点儿|降一点|沉一点/;
+  function hasWinMove(t) {
+    if (!/窗/.test(t)) return false;
+    if (/拆|封|删掉|去掉|不要了/.test(t)) return false;         // 那是拆窗
+    // 明确在说"开一扇"就不算挪
+    if (/(开|加|装|做|打|留|设|新开|再来|来)[一1两2几]?[个道扇]?(大)?(落地窗|飘窗|窗|窗户|窗口)/.test(t)) return false;
+    if (/(窗|窗户|窗口)[^,]{0,4}(开|加|装|做|留)/.test(t)) return false;
+    if (WIN_UP.test(t) || WIN_DOWN.test(t)) return true;
+    return /(挪|移|滑|动一下|调一下|换个位置)/.test(t) && /(窗|窗户|窗口)/.test(t);
+  }
+  N.hasWinMove = hasWinMove;
+  N.WIN_UP = WIN_UP;
+  N.WIN_DOWN = WIN_DOWN;
+
   function winSize(t) {
     const out = { w: null, h: null, sill: null };
     const num = s => +s;
@@ -395,6 +413,7 @@
     const hasValve = /阀|管网|管路|管线|风管|通风|新风|送风|影响|波及|关掉|关闭|停掉/.test(t);
     const hasDoor = (/门|洞口/.test(tNoValve) && /开|打|凿|加|装|做|洞|留|放|位置|设/.test(tNoValve)) || /开洞|门洞|打洞/.test(tNoValve);
     const hasWindow = hasWin(tNoWinPref);
+    const winMove = hasWinMove(tNoWinPref);        // 挪已有的窗（不是新开一扇）
     const hasPlace = /放|摆|安装|搬|移动|移到|搁|布置|安置|放到|装到/.test(t);
     // 问"旁边还有多少空间 / 离墙多远 / 够不够检修" → 量设备四周净距（并在模型上画虚框）
     // 注意别和"往旁边挪"抢：那是 move，已经在 hasMove 里判过了
@@ -408,7 +427,8 @@
     const hasMove = /挪|移动|移一下|移过去|挪过去|搬一下|往.{0,3}(左|右|前|后|里|外|东|南|西|北)|换个位置|换个地方/.test(t)
       && !/放到|摆到|装到|安装到|摆到/.test(t);
 
-    if (hasMove && !hasDoor && !hasWindow) out.intent = 'move';
+    if (winMove) out.intent = 'winmove';           // 挪窗优先于开窗：句子里已经带位移动作了
+    else if (hasMove && !hasDoor && !hasWindow) out.intent = 'move';
     else if (hasWindow) out.intent = 'window';
     else if (hasValve && !hasDoor) out.intent = 'valve';
     else if (hasDoor) out.intent = 'door';
@@ -434,6 +454,14 @@
       out.dir = findDir(t);
       out.dist = findDist(t);
       out.pref = findPref(t.replace(/往(里|外)/g, ''));   // "往里挪"是方向，"靠里"才是方位
+    }
+
+    if (out.intent === 'winmove') {
+      // 上下 = 抬降窗台；左右/前后 = 沿墙滑；"墙中间" = 滑到本段中点。
+      // 方向词都按当前镜头换算，换算交给执行层（dirVec → S.viewAxes）
+      out.dir = /墙中间|墙中心|居中|正中间/.test(t) ? 'center'
+        : (WIN_UP.test(t) ? 'up' : (WIN_DOWN.test(t) ? 'down' : findDir(t)));
+      out.dist = findDist(t);
     }
 
     if (out.intent === 'valve') {

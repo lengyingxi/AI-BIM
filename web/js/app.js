@@ -11,7 +11,7 @@
 
   const ST = {
     mode: 'idle', pending: null, device: null, placed: [],
-    last: null, sound: true, ducts: true, xray: false, focus: 0, equipId: 1, quiet: false, sel: null,
+    last: null, sound: false, ducts: true, xray: false, focus: 0, equipId: 1, quiet: false, sel: null,
     flowOn: false,       // 流向是否正在展示（只在看阀门影响时亮）
     doorAsked: {}        // 哪几间房已经问过「要不要拓门」，别一台一台重复问
   };
@@ -107,7 +107,9 @@
 
   /* ---------------- 语音 ---------------- */
   const TTS = {
-    on: true, voice: null,
+    // 默认不播报：播报期间要把麦克风闭住（不然会把 AI 自己的声音当成用户说话），
+    // 一段长回复念十几秒，用户就得干等十几秒才能说下一句。默认关掉，需要时点顶栏那个喇叭。
+    on: false, voice: null,
     init() {
       if (!window.speechSynthesis) return;
       const pick = () => {
@@ -125,18 +127,20 @@
         // 播报时先收麦，免得把 AI 自己的声音再收进去
         const wasLive = listening;
         if (wasLive) { hush = true; try { rec && rec.stop(); } catch (e) { } }
-        ttsUntil = Date.now() + Math.min(14000, 1200 + text.length * 240);
+        // 播报期间的闭麦时长要卡死上限：原来按字数算能到 12 秒，
+        // 一句话说完麦克风半天不回魂，用户会以为语音坏了。
+        ttsUntil = Date.now() + Math.min(6000, 1400 + text.length * 130);
         const u = new SpeechSynthesisUtterance(N.speakable(text).slice(0, 120));
         u.lang = 'zh-CN'; u.rate = 1.06; u.pitch = 1.02;
         if (this.voice) u.voice = this.voice;
         const back = () => {
           hush = false;
-          hushUntil = Date.now() + 350;      // 播报有回声尾，稍等一下再收
+          hushUntil = Date.now() + 250;      // 播报有回声尾，稍等一下再收
           if (wasLive && listening && rec) { try { rec.start(); } catch (e) { } }
         };
         u.onend = back; u.onerror = back;
         speechSynthesis.speak(u);
-        if (wasLive) setTimeout(back, Math.min(12000, 2600 + text.length * 260));
+        if (wasLive) setTimeout(back, Math.min(5000, 1800 + text.length * 140));
       } catch (e) { }
     },
     stop() { if (window.speechSynthesis) speechSynthesis.cancel(); }
@@ -751,6 +755,7 @@
       list_devices: '列设备', suggest_positions: '给建议位', show_properties: '看属性', query_capacity: '算余量',
       open_door: '开门', remove_door: '拆门', move_door: '挪门',
       resize_door: '改门尺寸', query_door: '查门', list_doors: '列门',
+      open_window: '开窗', remove_window: '拆窗', move_window: '挪窗',
       focus_view: '聚焦看图', show_all: '显示全部', set_view: '切楼层', list_scene: '读场景',
       toggle_valve: '开关阀门', query_impact: '查阀影响', undo_last: '撤回一步'
     };
@@ -2168,6 +2173,7 @@
       return stepWindow(step, auto);
     },
     windowoff: async step => stepWindowOff(step),
+    winmove: async step => stepMoveWindow(step),
     door: async (step, plan) => {
       // 说清了在哪面墙（或靠哪边）就直接开，别再让用户点一下；
       // 只有"给我开个门"这种什么都没说的，才进点选模式
@@ -2473,6 +2479,169 @@
       '<div class="kv"><i>窗顶标高</i><b>' + ((wins[0].pos && wins[0].pos[2]) || 0).toFixed(2) + ' m 附近</b></div>' +
       '</div></div>', false);
     lastData = { count: wins.length, items: wins.map(d => ({ name: d.name, width: d.w, height: d.h, sill: d.sill })) };
+    return true;
+  }
+
+  /* 找"要挪的那扇窗"：明确点名 > 刚开的那扇 > 这间房最近的一扇 */
+  function resolveWindow(step) {
+    if (step.window) {
+      const d = M.windows.find(x => x.id === step.window || x.name === step.window);
+      if (d) return d;
+    }
+    if (ST.lastWin && ST.lastWin.d) return ST.lastWin.d;
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    if (room) {
+      const c = M.windows.filter(x => (x.rooms || []).indexOf(room.id) >= 0);
+      const added = c.filter(x => x.added);
+      if (added.length) return added[added.length - 1];
+      if (c.length) return c[c.length - 1];
+    }
+    return null;
+  }
+
+  /* 挪窗。窗在墙上只有两个自由度，所以方向语义要分开：
+     · 往上 / 往下 → 改窗台高 sill（窗宽窗高不变，整扇窗抬起来）
+     · 往左 / 往右 / 前 / 后 → 沿着墙滑动 at
+       这里的方向一律按**当前镜头**换算（走 dirVec → S.viewAxes），
+       用户把模型转过去之后说"往左"，动的还是他眼睛看到的左边，不会反过来。
+     每次挪完都重新跑一遍窗的校核：压墙角、撞柱、贴上别的门窗、顶到梁，都拦下来说清原因。 */
+  async function stepMoveWindow(step) {
+    const d = resolveWindow(step);
+    if (!d) {
+      ai('现在没有可以挪的窗。先说「在 306 开个窗」，或者用鼠标点一下要挪的那扇。');
+      return false;
+    }
+    if (!d.added) {
+      ai('「' + d.name + '」是模型里原有的窗，挪不了。只说我新建的窗才能挪。');
+      return false;
+    }
+    const wall = M.walls.find(w => w.id === d.wall);
+    if (!wall) { ai('找不到这扇窗挂在哪面墙上了。'); return false; }
+    const room = step.roomRef || M.rooms.find(r => r.id === (d.rooms || [])[0]) || null;
+    const at0 = S.windowAt(d, wall);
+    if (at0 == null) { ai('这扇窗的位置读不出来，可能墙上的洞口已经被改掉了。'); return false; }
+    const sill0 = d.sill == null ? 0.9 : d.sill;
+    const w = d.w, h = d.h;
+    const dist = step.dist || 0.3;
+    const dir = step.dir;
+
+    if (!dir) {
+      ai('往哪边挪？「往上挪」是把窗抬高等，也可以说「往左挪半米」沿墙滑。');
+      chips([
+        { label: '抬高 0.3 m', fn: () => send('把窗往上挪一点') },
+        { label: '降低 0.3 m', fn: () => send('把窗往下挪一点') },
+        { label: '沿墙往左', fn: () => send('把窗往左挪半米') },
+        { label: '沿墙往右', fn: () => send('把窗往右挪半米') }
+      ]);
+      return false;
+    }
+
+    const vertical = (dir === 'up' || dir === 'down');
+    const span = roomSpanOnWall(wall, room);
+    let at = at0, sill = sill0, dirTxt = '';
+    if (vertical) {
+      sill = sill0 + (dir === 'up' ? dist : -dist);
+      dirTxt = dir === 'up' ? '往上' : '往下';
+    } else if (dir === 'center') {
+      at = (span.lo + span.hi) / 2;
+      dirTxt = '往墙中间';
+    } else {
+      const v = dirVec(dir, room);
+      if (!v) { ai('没听懂往哪边挪。「往上」「往下」「往左」「往右」这几个说法都行。'); return false; }
+      const ax = S.wallAxis(wall);
+      const sgn = (v.x * ax.x + v.y * ax.y) >= 0 ? 1 : -1;
+      at = at0 + sgn * dist;
+      dirTxt = '往' + (v.txt || '旁边');
+    }
+
+    // 先夹进"这面墙、这间房"能用的范围，别一挪就跑到隔壁房间去
+    const loA = span.lo + w / 2 + 0.12, hiA = Math.max(loA, span.hi - w / 2 - 0.12);
+    const atC = vertical ? at0 : clamp(at, loA, hiA);
+    const sillMax = Math.max(0.12, wall.h - h - 0.28);
+    const sillC = vertical ? clamp(sill, 0.12, sillMax) : sill0;
+
+    const movedAt = Math.abs(atC - at0), movedSill = Math.abs(sillC - sill0);
+    if (movedAt < 0.01 && movedSill < 0.01) {
+      S.highlightWall(wall, 0xdd9a2c);
+      const why = vertical
+        ? '窗已经到' + (dir === 'up' ? '顶了，窗顶顶住上面的梁（墙净高 ' + wall.h.toFixed(2) + ' 米）' : '底了，窗台再低就落地了')
+        : '已经挪到头了，再过去就出房间墙面了';
+      ai(why + '。' + (dir === 'up' ? '想再高得先把窗做矮一点。' : ''), null);
+      chips(vertical
+        ? [{ label: '把窗做矮 0.3 m', fn: () => send('把这扇窗的窗高改成' + Math.max(0.5, h - 0.3).toFixed(1) + '米') }]
+        : [{ label: '反过来挪', fn: () => send('把窗往' + (dir === 'left' ? '右' : '左') + '挪半米') }]);
+      return false;
+    }
+
+    const eqs = ST.placed.filter(e => e.floor === wall.floor);
+    let chk = C.window({ wall: wall, at: atC, w: w, h: h, sill: sillC, equipments: eqs, room: room, self: d });
+    let atF = atC, note = '';
+
+    // 目标位置被挡时不要一口回绝：用户要的是"朝这边动一动"，
+    // 不是"必须正好挪 0.4 米"。顺着同一个方向找最近的合法位置（限 2 米内），
+    // 找到了就退一点落位，并在回执里说清让了多少。
+    if (!chk.pass && !vertical) {
+      const sug = C.suggestWindowAt({ wall: wall, room: room, at: atC, w: w, h: h, sill: sillC, equipments: eqs, self: d });
+      const sameWay = sug && sug.at != null && Math.sign(sug.at - at0) === Math.sign(atC - at0 || 1);
+      if (sameWay && sug.check && sug.check.pass && Math.abs(sug.at - atC) < 2.0 && Math.abs(sug.at - at0) > 0.01) {
+        atF = sug.at;
+        chk = sug.check;
+        note = (chk.blocks[0] ? chk.blocks[0].t : '那边有点挤') + '，顺着墙让到了 ' + atF.toFixed(2) + ' 米的位置。';
+      }
+    }
+
+    if (!chk.pass) {
+      S.highlightWall(wall, 0xdd534f);
+      const bs = (chk.blocks || []).slice(0, 3).map(b => b.t).join('；') || '这个位置不行';
+      ai('这个位置挪不过去：' + bs + '。',
+        '<div class="res bad"><div class="res-top"><span class="k">挪不了</span><span class="tag">有冲突</span></div>' +
+        '<div class="res-adv">' + (chk.blocks || []).map(b => '<s>·</s> ' + b.t).join('<br>') + '</div></div>');
+      chips(vertical
+        ? [{ label: '往上挪', fn: () => send('把窗往上挪一点') },
+           { label: '往下挪', fn: () => send('把窗往下挪一点') }]
+        : [{ label: '往左挪', fn: () => send('把窗往左挪半米') },
+           { label: '往右挪', fn: () => send('把窗往右挪半米') },
+           { label: '挪到墙中间', fn: () => send('把窗挪到墙中间') }]);
+      return false;
+    }
+
+    const nd = S.replaceWindow(d, { at: atF, sill: sillC, w: w, h: h });
+    if (!nd) { ai('这扇窗挪不过去，墙上原来的洞口找不到了。'); return false; }
+    ST.lastWin = { wall: wall, at: atF, w: w, h: h, d: nd, chk: chk, room: room };
+    const sp = doorSpot(wall, atF);
+    S.markDoorSpot(wall, atF, w, h, true);
+    if (room) focusSoft(room);
+    if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, atF, room);
+
+    pushUndo('把窗挪回原来的位置', () => {
+      const bak = S.replaceWindow(nd, { at: at0, sill: sill0, w: w, h: h });
+      if (bak) ST.lastWin = { wall: wall, at: at0, w: w, h: h, d: bak, room: room };
+    });
+
+    // 回执要能直接回答"挪了多少、现在到哪了、还剩多少余地"
+    const left = atF - w / 2 - span.lo, right = span.hi - atF - w / 2;
+    const upLeft = (wall.h - 0.28) - (sillC + h);
+    const movedAt2 = Math.abs(atF - at0);
+    const bits = [];
+    if (movedSill > 0.01) bits.push('窗台高 ' + sill0.toFixed(2) + ' → ' + sillC.toFixed(2) + ' 米');
+    if (movedAt2 > 0.01) bits.push('沿墙 ' + dirTxt + '滑了 ' + movedAt2.toFixed(2) + ' 米');
+    ai('把 ' + (room ? room.num + ' 室那扇窗' : nd.name) + dirTxt + '挪了 ' + Math.max(movedAt2, movedSill).toFixed(2) + ' 米：' +
+      bits.join('，') + '。' +
+      (vertical
+        ? '窗顶离梁还有 ' + Math.max(0, upLeft).toFixed(2) + ' 米。'
+        : '两头到墙角分别还有 ' + left.toFixed(2) + ' / ' + right.toFixed(2) + ' 米。') +
+      (note ? '（' + note + '）' : '') +
+      (chk.warns && chk.warns.length ? chk.warns[0] + '。' : ''),
+      winCard(w, h, sillC, chk));
+    lastData = {
+      window: nd.name, room: room ? room.num : null,
+      moved: { dir: dirTxt, by_m: +Math.max(movedAt2, movedSill).toFixed(2) },
+      at: +atF.toFixed(2), sill: +sillC.toFixed(2),
+      corner_left_m: +left.toFixed(2), corner_right_m: +right.toFixed(2),
+      headroom_m: +Math.max(0, upLeft).toFixed(2),
+      slid_to_fit: !!note
+    };
     return true;
   }
 
@@ -4155,10 +4324,21 @@
     });
     $('btnSend').onclick = () => { const v = $('txt').value.trim(); if (v) { $('txt').value = ''; send(v); } };
     $('txt').addEventListener('keydown', e => { if (e.key === 'Enter') { const v = $('txt').value.trim(); if (v) { $('txt').value = ''; send(v); } } });
-    $('btnSound').onclick = () => {
-      ST.sound = !ST.sound; TTS.on = ST.sound;
+    const syncSound = () => {
+      TTS.on = ST.sound;
       $('btnSound').classList.toggle('off', !ST.sound);
-      if (!ST.sound) TTS.stop();
+      $('btnSound').title = ST.sound ? '语音播报：开（点一下关掉）' : '语音播报：关（点一下打开）';
+    };
+    syncSound();                       // 默认关，跟 ST.sound 一致
+    $('btnSound').onclick = () => {
+      ST.sound = !ST.sound; syncSound();
+      if (!ST.sound) {
+        TTS.stop();
+        // 关键：关播报的同时把闭麦状态一并解除，
+        // 否则正在播报时关掉，麦克风还卡在"等播报结束"上
+        hush = false; hushUntil = 0; ttsUntil = 0;
+        if (listening && rec) { try { rec.start(); } catch (e) { } }
+      }
     };
     $('calcDl').onclick = downloadCalc;
     $('fileIfc').onchange = e => {
@@ -4322,6 +4502,10 @@
         width: a.width, height: a.height, sill: a.sill, pref: a.pref
       }),
       remove_window: a => runTool({ act: 'windowoff', text: '', window: a.window, room: a.room, floor: a.floor }),
+      move_window: a => runTool({
+        act: 'winmove', text: '', window: a.window, room: a.room, floor: a.floor,
+        dir: a.direction, dist: a.distance != null ? Math.abs(+a.distance) : null
+      }),
       remove_door: a => runTool({ act: 'dooroff', text: '', door: a.door, room: a.room, floor: a.floor, side: a.side }),
       move_door: a => runTool({
         act: 'doormove', text: '', door: a.door, along: a.along, dist: a.distance,
