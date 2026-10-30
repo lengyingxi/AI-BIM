@@ -74,6 +74,11 @@
     for (const e of lib) {
       if (t.indexOf(e.name.toLowerCase().replace(/\s/g, '')) >= 0 || t.indexOf(e.name) >= 0) return e;
     }
+    // 型号自带别名（"核磁""CT""加速器"）：医院设备基本靠这个认
+    for (const e of lib) {
+      const al = e.alias || [];
+      if (al.some(a => a && t.indexOf(a) >= 0)) return e;
+    }
     const keys = Object.keys(ALIAS).sort((a, b) => b.length - a.length);
     for (const k of keys) {
       if (t.indexOf(k) >= 0) return lib.find(e => e.name === ALIAS[k]) || null;
@@ -427,7 +432,20 @@
     const hasMove = /挪|移动|移一下|移过去|挪过去|搬一下|往.{0,3}(左|右|前|后|里|外|东|南|西|北)|换个位置|换个地方/.test(t)
       && !/放到|摆到|装到|安装到|摆到/.test(t);
 
+    /* 打通 / 拆墙：范围比"开门"大得多，必须排在门前面判，
+       否则"把这面墙砸个洞"会被当成"开一扇门"。 */
+    const hasPassage = /打通|拆墙|拆掉|拆除|拆了|拆这面|砸|破开|连通|连起来|连成一片|开放空间|合并成|合成一间/.test(t)
+      || (/洞/.test(t) && /打通|通到|连通|隔壁|两间/.test(t));
+    /* 电：分路 / 回路 / 断电。注意要排在阀门前面——
+       "关掉照明"里的"关掉"会被阀门那条正则抓走，但用户说的是电不是水。 */
+    const hasCircuit = /电路|分路|回路|配电|强电|断电|停电|合闸|拉闸|送电|照明回路|插座回路|动力回路|哪路电|几路电|几路线/.test(t);
+    const hasConduit = /线管|暗管|预埋管|穿线管/.test(t)
+      || /(墙里|墙内|墙中|墙里面).{0,8}(管|线|电缆|槽)/.test(t);
+
     if (winMove) out.intent = 'winmove';           // 挪窗优先于开窗：句子里已经带位移动作了
+    else if (hasPassage) out.intent = 'passage';   // 打通/拆墙优先于开门
+    else if (hasConduit && !hasDoor) out.intent = 'conduits';
+    else if (hasCircuit) out.intent = 'circuit';
     else if (hasMove && !hasDoor && !hasWindow) out.intent = 'move';
     else if (hasWindow) out.intent = 'window';
     else if (hasValve && !hasDoor) out.intent = 'valve';
@@ -467,6 +485,34 @@
     if (out.intent === 'valve') {
       out.valveAction = /打开|开启|恢复|开阀/.test(t) && !/关闭|关掉|关上|断开|停掉/.test(t) ? 'open' : 'close';
     }
+
+    if (out.intent === 'passage') {
+      /* "整面拆了"和"打个洞"是两件事：前者挖掉整段（留墙垛），后者只开一块 */
+      out.mode = /拆|整面|全拆|拆掉|拆了|墙不要了/.test(t) ? 'demolish' : 'cut';
+      applySide(out, findSide(t));
+      const pw = findWidth(t);
+      out.width = pw ? Math.min(6, Math.max(0.8, pw)) : (out.mode === 'demolish' ? null : 1.8);
+      const ph = findHeight(t);
+      out.height = ph ? Math.min(3.2, Math.max(1.2, ph)) : null;
+      // "和 307 打通" → 记下隔壁房号，选墙时优先共用墙
+      const m2 = t.match(/(?:和|跟|与|到)\s*(\d{3})/);
+      if (m2 && m2[1] !== out.roomNum) out.to = m2[1];
+    }
+
+    if (out.intent === 'circuit') {
+      /* 纯查询不能带动作：「306 房有几路电」「断掉照明会怎么样」都不该被执行成断电。
+         只有明确带祈使语气（把/给/对/帮…，或直接以动词开头）才算操作。 */
+      const askOnly = /会不会|有没有|怎么样|怎样|什么影响|影响(范围|哪些|多大|多少)|是否|有哪些|多少|几路|几回|几个分路/.test(t)
+        && !/^(把|给|对|帮|请|麻烦)/.test(t.trim());
+      const wantOn = !askOnly && /合闸|送电|恢复供电|通电|开启|打开/.test(t);
+      const wantOff = !askOnly && /断电|关掉|关闭|断开|停掉|拉闸|切掉|掐断|切断/.test(t);
+      if (wantOn || wantOff) { out.intent = 'circuitset'; out.action = wantOn ? 'on' : 'off'; }
+      out.kind = /照明|灯/.test(t) ? 'light' : (/插座/.test(t) ? 'socket' : (/动力|空调|设备/.test(t) ? 'power' : null));
+      const mc = t.match(/L\s*([1-5])\s*([ABC])/i);
+      if (mc) out.circuit = 'L' + mc[1] + mc[2].toUpperCase();
+      applySide(out, findSide(t));
+    }
+    if (out.intent === 'circuitset' || out.intent === 'conduits') applySide(out, findSide(t));
     if (out.intent === 'door') {
       applySide(out, findSide(t));
       out.pref = findPref(t);

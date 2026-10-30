@@ -111,6 +111,11 @@
     if (!s) return null;
     const exact = lib.find(e => e.name === s);
     if (exact) return exact;
+    /* 型号别名：库里那条如果带了 alias（"核磁""CT""加速器"这类口语说法），先认它。
+       医院设备尤其需要——没人会说"磁共振成像系统"全称。 */
+    const byAlias = lib.find(e => (e.alias || []).some(a =>
+      a && (s === a || s.indexOf(a) >= 0 || a.indexOf(s) >= 0)));
+    if (byAlias) return byAlias;
     const part = lib.find(e => e.name.indexOf(s) >= 0 || s.indexOf(e.name) >= 0);
     if (part) return part;
     // 逐字重合：用户说「水冷机组」，库里叫「风冷冷水机组」，按重合度挑最像的那台
@@ -375,6 +380,36 @@
           dir: p.dir || null, dist: p.dist || null,
           pref: p.pref || null,
           room: p.room ? p.room.num : null
+        });
+        return;
+      }
+
+      // 打通 / 拆墙
+      if (p.intent === 'passage') {
+        steps.push({
+          act: 'passage', text: part,
+          room: p.room ? p.room.num : (A.mem.ctx.room ? A.mem.ctx.room.num : null),
+          floor: p.floor, side: p.side || null, sideRel: p.sideRel || null,
+          width: p.width || null, height: p.height || null,
+          mode: p.mode || 'cut', to: p.to || null
+        });
+        return;
+      }
+      // 电：查分路 / 断合分路 / 查墙里埋了什么
+      if (p.intent === 'circuit' || p.intent === 'circuitset') {
+        steps.push({
+          act: p.intent === 'circuitset' ? 'circuitset' : 'circuit', text: part,
+          room: p.room ? p.room.num : (A.mem.ctx.room ? A.mem.ctx.room.num : null),
+          floor: p.floor, circuit: p.circuit || null,
+          kind: p.kind || null, action: p.action || 'off'
+        });
+        return;
+      }
+      if (p.intent === 'conduits') {
+        steps.push({
+          act: 'conduits', text: part,
+          room: p.room ? p.room.num : (A.mem.ctx.room ? A.mem.ctx.room.num : null),
+          floor: p.floor, side: p.side || null, sideRel: p.sideRel || null
         });
         return;
       }
@@ -774,6 +809,25 @@
     }),
     query_door: a => ({ act: 'doorinfo', door: a.door || null, room: a.room || null }),
     list_doors: a => ({ act: 'doors', room: a.room || null, floor: a.floor || null }),
+
+    /* ---- 墙：打穿 / 拆墙 ---- */
+    open_passage: a => ({
+      act: 'passage', room: a.room || null, floor: a.floor || null, to: a.to || null,
+      side: a.side || null, width: a.width || null, height: a.height || null,
+      mode: a.mode === 'demolish' ? 'demolish' : 'cut'
+    }),
+
+    /* ---- 电路 ---- */
+    query_circuits: a => ({
+      act: 'circuit', room: a.room || null, floor: a.floor || null, scope: a.scope || null
+    }),
+    toggle_circuit: a => ({
+      act: 'circuitset', circuit: a.circuit || null, room: a.room || null, floor: a.floor || null,
+      kind: a.kind || null, action: a.action === 'on' ? 'on' : 'off'
+    }),
+    query_conduits: a => ({
+      act: 'conduits', room: a.room || null, floor: a.floor || null, side: a.side || null
+    }),
 
     focus_view: a => ({
       act: 'focus', room: a.room || null, floor: a.floor || null, device: a.device || null,

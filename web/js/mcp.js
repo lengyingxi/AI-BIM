@@ -30,6 +30,8 @@
     '· 设备：增 place_equipment｜删 remove_equipment｜改 resize_equipment｜替换 replace_equipment｜移动 move_equipment｜查 query_equipment、query_clearance、list_devices｜找房 find_rooms_for_equipment｜引导 suggest_positions',
     '· 门：增 open_door｜删 remove_door｜改 resize_door｜移动 move_door｜查 query_door、list_doors',
     '· 窗：增 open_window｜删 remove_window｜移动 move_window（挪位置/改窗台高）',
+    '· 墙：打通/拆墙 open_passage（mode=cut 打一个洞，mode=demolish 整段拆）｜查墙里埋了什么 query_conduits',
+    '· 电：查分路 query_circuits｜断/合某个分路 toggle_circuit（相当于在远端控制箱上扳开关）',
     '· 视图与拓扑：聚焦 focus_view｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
     '【方向语义】用户说的左/右/前/后/上/下 都是他当前屏幕的方向，你只传 left/right/front/back/up/down，系统按相机换算；只有明说东/南/西/北才传 east/south/west/north。选墙的 side 同理——"左边那面墙开个门"就传 left，别自己换算成 west，用户转过镜头之后会开错墙。"开窗"走 open_window，参数和 open_door 一样多一个 sill（窗台高）；用户说落地窗就传 sill=0.1。',
     '【挪窗——上下和左右不是一回事】窗在墙上只有两个自由度，别混：',
@@ -37,6 +39,21 @@
     '  · "往左/往右""沿着墙挪""挪到墙中间" → move_window(direction=left/right/center)，沿着墙滑；',
     '  · 用户转过镜头之后，"往左"永远是他在屏幕上看到的左——你只传 left，不要自己算成 east/west。',
     '  · 挪不动（压墙角、贴到别的门窗、顶到梁）时系统会返回原因，照实说，并给"往反方向挪 / 抬低一点 / 把窗做矮"这类可选动作，不要硬试。',
+    '【墙里埋着线管——开洞前必须先想到这一层】建筑图不画预埋线管，但现场是实打实埋在墙里的。开窗、开门、打穿都会先自动查一遍：',
+    '  · 结果里如果出现 conduit_hit（撞到的分路号）、rerouted>0（已改线）、moved>0（顺墙挪位），说明这个洞不是"想开就开"的；',
+    '  · 回答时讲清三件事：撞的是哪一路（照明/插座/动力）、怎么处理了（改道多走几米 / 顺墙挪了几米）、备选是什么；',
+    '  · 系统会在场景里把冲突线管标红、改线的新走向画成绿色、墙体半透明，你直接引用"红色的管子""绿色的新线"来讲，不要自己编方位；',
+    '  · 用户问"这面墙里有没有线"先调 query_conduits，别猜。',
+    '【打穿 / 拆墙】"把这间和隔壁打通""这面墙拆了""砸个大洞""做成开放空间"都走 open_passage：',
+    '  · 说"打通"没给宽度 → 默认 1.8 米；说"整面拆掉/全拆" → mode=demolish；',
+    '  · 外墙在这栋楼里同时是承重墙，系统会直接拒绝，照实说"承重墙不能拆"，并建议改内隔墙或只开个门，不要反复试；',
+    '  · 系统保证上方留过梁（不能挖到顶），并会把洞口宽度压到这段墙能给的范围里，返回里有 above_m 就是留了多少；',
+    '  · 回复里要带上"连通到哪一间"和"还要补什么"（过梁/构造柱/消防分区/隔声），这些都在返回的 warns 里。',
+    '【电路分路】每层一部配电箱（AL-层号），每层三条分路：照明 / 插座 / 动力，颜色固定（黄/蓝/红）。',
+    '  · 用户说"把 3 楼照明断电""关掉插座回路"→ toggle_circuit(action=off)，系统会把楼体调半透明、只亮这一路、关联房间铺绿底；',
+    '  · 回答时说清：这一路带几间房、断了以后哪几间会全黑、哪几间还有别的回路不会断——这些都从返回的 dark_rooms / still_powered 里取，别自己推；',
+    '  · "这间房有几路电""这层怎么分的"→ query_circuits，只查不动手；',
+    '  · 分路是工程概念，不要和"阀门/水路"混，水路走 toggle_valve / query_impact。',
     '【默认值】"一点"≈0.3 米，"半米"=0.5；没说距离给 0.4；没说数量给 1；没说什么门按 1.0×2.1 米。这些不用反问。',
     '【模糊需求】用户说"放得合适一点/你看怎么挪好/不太对"这类模糊话时，先想清楚他大概想改善什么（省地方 / 不挡门 / 靠墙整齐 / 别压梁）：调 suggest_positions，系统会自动挑最合适的位置直接放好并把备选返回，你只需用一句话说明"为什么放这儿"和"还能怎么改"。不要反问"你要放哪"，也不要只给建议不动手。',
     '【拓门】"门太窄搬不进去""门加宽到 1.5 米"都走 resize_door。系统会**分别量门洞左右两侧**还能扩多少，再决定"两侧各扩一半 / 只扩余量大的一侧 / 顺墙让一段"——不会硬按两边对半。三个方案都要过开门校核，过不了就门一个字都不改。回答要讲清：两侧各剩多少、最后往哪边扩了多少、拓完设备能不能过、以及设备在最终位置的安全系数（旁边给"看计算书"的入口）。',
@@ -481,6 +498,77 @@
         name: 'undo_last',
         description: '【撤回】撤销上一步对模型的操作（放/挪/换/改/删设备、开门/改门/拆门）。用户说"撤回去/刚才那步不要了/弄错了"时用。',
         parameters: { type: 'object', properties: {} }
+      }
+    },
+
+    /* ================= E. 墙体：拆墙 / 打穿 ================= */
+    {
+      type: 'function',
+      function: {
+        name: 'open_passage',
+        description: '【墙·拆/穿】把两面房间打通：拆掉一段墙或者整面墙，做成没有门扇的大洞口。用户说"把这间和隔壁打通/中间这堵墙拆了/砸个洞/做成开放空间/两间连起来"时用。会自动判承重（外墙一律拒绝）、留过梁、查墙内线管；线管能改道就改道再开，改不了会返回原因并建议换墙。返回洞口尺寸、上方留了多少过梁、连通到哪一间。',
+        parameters: {
+          type: 'object',
+          properties: {
+            room: { type: 'string', description: '房间号，如"306"；省略则沿用当前房间' },
+            to: { type: 'string', description: '要打通到哪一间（有明确隔壁时填，如"307"）' },
+            side: { type: 'string', enum: ['south', 'north', 'east', 'west', 'left', 'right', 'front', 'back'], description: '指定哪面墙；left/right/front/back 按当前镜头换算。省略则自动挑一面内隔墙' },
+            width: { type: 'number', description: '洞口宽（米），默认 1.8；用户说"打通整面"时改用 mode=demolish' },
+            height: { type: 'number', description: '洞口高（米），默认 2.2，最高限制在墙净高减 0.3' },
+            mode: { type: 'string', enum: ['cut', 'demolish'], description: 'cut=打一个洞（默认）；demolish=整段拆掉这面墙（留两端墙垛）' },
+            floor: { type: 'integer', description: '楼层' }
+          },
+          required: ['room']
+        }
+      }
+    },
+
+    /* ================= F. 电路：墙内线管 / 分路 ================= */
+    {
+      type: 'function',
+      function: {
+        name: 'query_circuits',
+        description: '【电·查】查电：某间房由哪几路电供、某层有哪几条分路、每条带多少间房、现在是通还是断。用户说"这间有几路电/3 楼照明是哪一路/配电怎么分的/哪些房间在这一路上"时用。只查不改。',
+        parameters: {
+          type: 'object',
+          properties: {
+            room: { type: 'string', description: '房号；填了就查这间房的分路' },
+            floor: { type: 'integer', description: '楼层；不填房间号时列这层全部分路' },
+            scope: { type: 'string', enum: ['room', 'floor'], description: 'room=只看这间（默认，有房间号时）；floor=列整层' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'toggle_circuit',
+        description: '【电·控】断/合一路电（相当于在远端控制箱上操作那个分路开关），并说清哪几间跟着全黑、哪几间还有别的回路不会断。切完会自动把楼体调成半透明、只亮这一路、把关联房间铺底。用户说"把这路断电/关掉 3 楼照明/合上插座回路/看看断了影响谁"时用。',
+        parameters: {
+          type: 'object',
+          properties: {
+            circuit: { type: 'string', description: '分路编号，如 L3A；省略则按 room+kind 自动找' },
+            room: { type: 'string', description: '房号（按时找这间房所属的分路）' },
+            floor: { type: 'integer', description: '楼层' },
+            kind: { type: 'string', enum: ['light', 'socket', 'power'], description: '分路类型：照明/插座/动力' },
+            action: { type: 'string', enum: ['off', 'on'], description: 'off=断电（默认），on=合闸' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'query_conduits',
+        description: '【电·查墙里的管】查某面墙里埋了哪些线管：走向、标高、属于哪条分路、现在通不通。用户问"这面墙里有没有线/开洞会不会打到管/墙里埋了什么"时用；也可以在执行 open_passage / open_door / open_window 之前先探一眼。只查不改。',
+        parameters: {
+          type: 'object',
+          properties: {
+            room: { type: 'string', description: '房号' },
+            side: { type: 'string', enum: ['south', 'north', 'east', 'west', 'left', 'right', 'front', 'back'], description: '哪面墙；按镜头的话填 left 等' },
+            floor: { type: 'integer', description: '楼层' }
+          }
+        }
       }
     }
   ];

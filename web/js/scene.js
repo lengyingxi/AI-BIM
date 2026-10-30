@@ -645,6 +645,8 @@
     wallMeshById = {}; ductMeshById = {};
     if (D() && D().furnRects) D().furnRects = {};      // 换了模型，旧的家具落位表作废
     M = next; S.M = M;
+    // 换模型（尤其导入 IFC）后设备库可能被换掉，医院那批型号要补回来
+    if (D() && D().mergeLibrary) D().mergeLibrary(M);
     M.floors.forEach(fl => floorGroups.push(buildFloor(fl)));
     S.floors = floorGroups;
     if (roof) {
@@ -656,6 +658,8 @@
     S.focus = 0;
     S.setFocus(0, false);
     S.viewAll();
+    // 换了模型，墙里那些线管、配电箱全得按新几何重铺一遍
+    if (E()) S.rebuildElectric();
   };
 
   /* ---------------- 设备 ---------------- */
@@ -749,6 +753,45 @@
     fg.g.add(mesh);
     d._mesh = mesh;
     return d;
+  };
+
+  /* ---------------- 空间打穿（没有门扇的大洞口） ----------------
+     复用墙上的洞口机制：洞口做到指定高度后，wallBoxes() 自然只留下两侧墙垛和
+     上方过梁，不用真把墙"切成两段"。切段会牵动所有按 wall.id 索引的东西
+     （高亮、隔离、碰撞、开洞校核），得不偿失。 */
+  S.addPassage = function (wall, at, w, h, opt) {
+    h = h == null ? 2.2 : h;
+    const op = {
+      kind: 'passage', at: at, w: w, h: h, sill: 0,
+      name: 'P' + Math.round(w * 1000) + Math.round(h * 100), added: true
+    };
+    wall.openings.push(op);
+    S.rebuildWall(wall);
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1, ux = (bx - ax) / L, uy = (by - ay) / L;
+    const p = {
+      id: 'P-' + wall.id + '-' + Math.round(at * 100), kind: 'passage', floor: wall.floor,
+      wall: wall.id, name: op.name, pos: [ax + ux * at, ay + uy * at, wall.base],
+      w: w, h: h, sill: 0, rooms: wall.rooms.slice(), dir: [ux, uy], t: wall.t, added: true,
+      to: (opt && opt.to) || null, demolish: !!(opt && opt.demolish)
+    };
+    M.passages = M.passages || [];
+    M.passages.push(p);
+    op.ref = p.id;
+    return p;
+  };
+
+  S.removePassage = function (p) {
+    if (!p) return false;
+    const wall = M.walls.find(w => w.id === p.wall);
+    if (!wall) return false;
+    const at = (p.pos[0] - wall.p1[0]) * p.dir[0] + (p.pos[1] - wall.p1[1]) * p.dir[1];
+    const i = wall.openings.findIndex(o => o.kind === 'passage' && Math.abs(o.at - at) < 0.06 && Math.abs(o.w - p.w) < 0.05);
+    if (i < 0) return false;
+    wall.openings.splice(i, 1);
+    S.rebuildWall(wall);
+    M.passages = (M.passages || []).filter(x => x !== p);
+    return true;
   };
 
   /* ---------------- 窗：开 / 拆 / 改 ---------------- */
@@ -1606,6 +1649,330 @@
     else flyTo(p, t, 720);
   };
 
+
+  /* ================= 电气层：墙内线管 / 配电箱 / 分路高亮 =================
+     平常藏起来。要看的时候一定是"墙体半透明 + 线管发亮"这套组合，
+     否则线管埋在墙里根本看不见——这也是用户说"要半透明楼体才看得到电路"的原因。
+     线管按分路（回路）分组建 mesh：15 条分路就是 15 个 mesh，
+     高亮一条、压暗其他都在材质层面做，不改几何。 */
+  const E = () => window.BIM.elec;
+  let eRoot = null, ePanels = null, eHitG = null;
+  let eByCirc = {};                 // circId -> { mat, ghost }
+  let eOn = false;
+
+  S.elecOn = () => eOn;
+  const EC = () => (E() ? E().COLOR : { light: 0xf0b429, socket: 0x3b9ae1, power: 0xd8544f, reroute: 0x17a673, hit: 0xff3b30, off: 0x8a929b });
+
+  function eDispose(g) {
+    if (!g) return;
+    if (g.parent) g.parent.remove(g);
+    g.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material && o.material.dispose && o.userData.ownMat) o.material.dispose();
+    });
+  }
+
+  /* 按分路建一批盒子：横铺的沿墙、竖着的是楼层进线 */
+  function eBuild() {
+    eDispose(eRoot); eRoot = null; eByCirc = {};
+    if (!E() || !E().data) return;
+    const D = E().data;
+    const root = new THREE.Group();
+    root.name = 'elec';
+    const per = {};                 // circId -> items[]
+    (D.conduits || []).forEach(c => {
+      const circ = D.circuits.find(x => x.id === c.circuit);
+      if (!circ) return;
+      const wall = c.wall ? M.walls.find(w => w.id === c.wall) : null;
+      let it;
+      if (c.vert) {
+        // 竖向进线：从本层配电箱往上穿楼板
+        const el = (M.floors.find(f => f.level === c.floor) || {}).elev || 0;
+        it = { size: [c.s, c.z1 - c.z0, c.d], matrix: frame(c.x, c.y, el + (c.z0 + c.z1) / 2, 1, 0) };
+      } else {
+        if (!wall) return;
+        const a = E().axis(wall);
+        const len = c.at1 - c.at0;
+        if (len < 0.02) return;
+        const mx = a.ax + a.ux * (c.at0 + len / 2), my = a.ay + a.uy * (c.at0 + len / 2);
+        it = { size: [len, c.s, Math.min(c.d, wall.t * .8)], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy) };
+      }
+      (per[c.circuit] = per[c.circuit] || []).push(it);
+    });
+    Object.keys(per).forEach(cid => {
+      const circ = D.circuits.find(x => x.id === cid);
+      const col = new THREE.Color(EC()[circ.kind] || EC().light);
+      const mat = new THREE.MeshStandardMaterial({
+        color: col, emissive: col.clone().multiplyScalar(.45), emissiveIntensity: 1,
+        roughness: .42, metalness: .3, transparent: true, opacity: .95
+      });
+      mat.userData.baseOpacity = 1;
+      const mesh = new THREE.Mesh(boxGeo(per[cid]), mat);
+      mesh.userData = { kind: 'conduit', circ: cid, floor: circ.floor };
+      mesh.renderOrder = 2;
+      root.add(mesh);
+      // 穿透显示层：墙不透明时也能看见这条分路走到哪
+      const gm = new THREE.MeshBasicMaterial({
+        color: col, transparent: true, opacity: .0, depthTest: false, depthWrite: false
+      });
+      gm.userData.ownMat = true;
+      const glow = new THREE.Mesh(boxGeo(per[cid].map(it => ({
+        size: [it.size[0] * 1.6, it.size[1] * 1.6, it.size[2] * 1.6], matrix: it.matrix
+      }))), gm);
+      glow.renderOrder = 6;
+      glow.visible = false;
+      root.add(glow);
+      eByCirc[cid] = { mat: mat, glow: glow, mesh: mesh };
+    });
+    root.visible = eOn;
+    scene.add(root);
+    eRoot = root;
+  }
+  S.rebuildElec = eBuild;
+
+  /* 配电箱：真实一点的柜体——箱体、箱门、断路器排、电能表、指示灯、铭牌。
+     注意 frame() 的三根轴：x=沿墙、y=竖直、z=墙法向（进深），
+     所以 size 一律按 [沿墙, 竖直, 进深] 写，别按设备的 [宽,高,深] 习惯来。 */
+  function ePanelMesh(p) {
+    const room = M.rooms.find(r => r.id === p.room);
+    const wall = p.wall ? M.walls.find(w => w.id === p.wall) : null;
+    const ux = (p.dir && p.dir[0]) || 1, uy = (p.dir && p.dir[1]) || 0;
+    let nx = -uy, ny = ux;
+    if (room) {
+      const cx = (room.x0 + room.x1) / 2 - p.x, cy = (room.y0 + room.y1) / 2 - p.y;
+      if (nx * cx + ny * cy < 0) { nx = -nx; ny = -ny; }
+    }
+    const off = (wall ? wall.t / 2 : 0.12) + p.d / 2 + 0.01;
+    const px = p.x + nx * off, py = p.y + ny * off;
+    const el = ((M.floors.find(f => f.level === p.floor) || {}).elev) || 0;
+    const Y = el + p.z;
+    const W = p.w, H = p.h, Dp = p.d;
+    const F = Dp / 2;                                     // 朝房间那一面
+    // 沿墙偏 dw、竖直偏 dz、法向偏 df 的一个点
+    const at = (dw, dz, df) => [px + ux * dw + nx * df, py + uy * dw + ny * df, Y + dz];
+    const it = [];
+    it.push({ size: [W, H, Dp], matrix: frame(px, py, Y, ux, uy), c: [.86, .89, .92] });
+    it.push({ size: [W * .86, H * .88, .016], matrix: frame(...at(0, 0, F + .008), ux, uy), c: [.95, .96, .97] });   // 箱门
+    for (let r = 0; r < 3; r++) {
+      for (let i = 0; i < 4; i++) {
+        it.push({
+          size: [.075, .07, .028],
+          matrix: frame(...at((i - 1.5) * W * .17, (r - 1) * H * .22, F + .026), ux, uy),
+          c: [.3, .34, .38]                                  // 断路器手柄
+        });
+      }
+    }
+    it.push({ size: [.15, .11, .022], matrix: frame(...at(-W * .3, H * .3, F + .02), ux, uy), c: [.08, .12, .16] });   // 电能表
+    it.push({ size: [.026, .026, .022], matrix: frame(...at(W * .3, H * .32, F + .02), ux, uy), c: [.18, .9, .5] });    // 运行灯
+    it.push({ size: [.22, .05, .018], matrix: frame(...at(0, -H * .38, F + .02), ux, uy), c: [.55, .6, .66] });        // 铭牌
+    const geo = boxGeo(it);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff, roughness: .42, metalness: .45, vertexColors: true, envMapIntensity: .9
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData = { kind: 'panel', data: p, floor: p.floor };
+    return mesh;
+  }
+
+  function ePanelBuild() {
+    eDispose(ePanels); ePanels = null;
+    if (!E() || !E().data) return;
+    const g = new THREE.Group();
+    g.name = 'panels';
+    (E().data.panels || []).forEach(p => {
+      try { g.add(ePanelMesh(p)); } catch (e) { }
+    });
+    scene.add(g); ePanels = g;
+  }
+  S.rebuildPanels = ePanelBuild;
+
+  /* 显示/隐藏墙内线管。开的时候自动把墙压成半透明，不然什么都看不见 */
+  S.showConduits = function (on) {
+    eOn = !!on;
+    if (eOn && !eRoot) eBuild();
+    if (eOn && !ePanels) ePanelBuild();
+    if (eRoot) eRoot.visible = eOn;
+    if (!eOn) S.showCircuit(null);
+    if (eOn && !S.xray) S.setXray(true);
+  };
+
+  /* 高亮一条分路：它自己发亮 + 穿透显示，别的分路压到很淡 */
+  S.showCircuit = function (cid) {
+    const D = E() && E().data;
+    if (!D) return;
+    Object.keys(eByCirc).forEach(id => {
+      const it = eByCirc[id];
+      const on = !cid || id === cid;
+      const circ = D.circuits.find(c => c.id === id) || {};
+      const live = cid ? on : (circ.on !== false);
+      it.mat.opacity = cid ? (on ? 1 : .07) : .95;
+      it.mat.transparent = true;
+      it.mat.depthWrite = cid ? on : true;
+      it.mat.emissiveIntensity = cid && on ? 2.1 : 1;
+      it.mat.color.setHex(live ? (EC()[circ.kind] || EC().light) : EC().off);
+      it.mat.emissive.setHex(live ? (EC()[circ.kind] || EC().light) : 0x000000);
+      it.mat.emissive.multiplyScalar(cid && on ? .8 : .45);
+      it.mat.needsUpdate = true;
+      if (it.glow) {
+        it.glow.visible = !!(cid && on);
+        it.glow.material.opacity = cid && on ? .30 : 0;
+      }
+    });
+  };
+
+  /* 断电的分路在图上变灰：不切断也能看出"这几间现在是没电的" */
+  S.syncCircuitPower = function () {
+    const D = E() && E().data;
+    if (!D) return;
+    Object.keys(eByCirc).forEach(id => {
+      const it = eByCirc[id];
+      const circ = D.circuits.find(c => c.id === id) || {};
+      if (circ.on === false) {
+        it.mat.color.setHex(EC().off);
+        it.mat.emissive.setHex(0x000000);
+        it.mesh.userData.off = true;
+      } else {
+        it.mat.color.setHex(EC()[circ.kind] || EC().light);
+        it.mat.emissive.setHex(EC()[circ.kind] || EC().light).multiplyScalar(.45);
+        it.mesh.userData.off = false;
+      }
+      it.mat.needsUpdate = true;
+    });
+  };
+
+  /* 冲突线管：亮红罩一层，并且穿透墙体显示（就是"把冲突的管线位置指出来"） */
+  S.markConduits = function (list, color) {
+    if (eHitG) { eDispose(eHitG); eHitG = null; }
+    if (!list || !list.length) return;
+    const c = new THREE.Color(color || EC().hit);
+    const it = [];
+    list.forEach(k => {
+      const wall = k.wall ? M.walls.find(w => w.id === k.wall) : null;
+      if (k.vert) {
+        const el = ((M.floors.find(f => f.level === k.floor) || {}).elev) || 0;
+        it.push({ size: [k.s * 2.4, k.z1 - k.z0, k.d * 2.4], matrix: frame(k.x, k.y, el + (k.z0 + k.z1) / 2, 1, 0) });
+        return;
+      }
+      if (!wall) return;
+      const a = E().axis(wall);
+      const len = k.at1 - k.at0;
+      const mx = a.ax + a.ux * (k.at0 + len / 2), my = a.ay + a.uy * (k.at0 + len / 2);
+      it.push({ size: [len, k.s * 2.4, wall.t * 1.15], matrix: frame(mx, my, wall.base + k.z, a.ux, a.uy) });
+    });
+    if (!it.length) return;
+    const g = new THREE.Group();
+    const geo = boxGeo(it);
+    const m = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .55, depthTest: false, depthWrite: false });
+    m.userData.ownMat = true;
+    const mesh = new THREE.Mesh(geo, m);
+    mesh.renderOrder = 8;
+    g.add(mesh);
+    const lm = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: .9, depthTest: false });
+    lm.userData.ownMat = true;
+    const ls = new THREE.LineSegments(new THREE.EdgesGeometry(geo), lm);
+    ls.renderOrder = 9;
+    g.add(ls);
+    scene.add(g); eHitG = g;
+  };
+  S.clearConduitMarks = function () {
+    if (eHitG) { eDispose(eHitG); eHitG = null; }
+    S.clearReroute();
+  };
+
+  /* 改线后的新走向：用另一种颜色沿墙面画一条折线，穿透显示。
+     一次可能改好几根管，所以都挂到同一个组里，别互相顶掉。 */
+  let eReRoot = null;
+  S.clearReroute = function () {
+    if (eReRoot) { eDispose(eReRoot); eReRoot = null; }
+  };
+  S.showReroute = function (r, color) {
+    if (!r || !r.pts) return null;
+    const wall = M.walls.find(w => w.id === r.wall);
+    if (!wall) return null;
+    const a = E().axis(wall);
+    const it = [];
+    for (let i = 0; i < r.pts.length - 1; i++) {
+      const p = r.pts[i], q = r.pts[i + 1];
+      const dx = (q.at - p.at), dz = (q.z - p.z);
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-4) continue;
+      const midAt = (p.at + q.at) / 2, midZ = (p.z + q.z) / 2;
+      const mx = a.ax + a.ux * midAt, my = a.ay + a.uy * midAt;
+      const ang = Math.atan2(dz, dx);
+      const m = frame(mx, my, wall.base + midZ, a.ux, a.uy);
+      m.multiply(new THREE.Matrix4().makeRotationZ(ang));
+      it.push({ size: [len, 0.075, wall.t * 1.25], matrix: m });
+    }
+    if (!it.length) return null;
+    const c = new THREE.Color(color || EC().reroute);
+    const geo = boxGeo(it);
+    const mat = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .95, depthTest: false, depthWrite: false });
+    mat.userData.ownMat = true;
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 10;
+    if (!eReRoot) { eReRoot = new THREE.Group(); eReRoot.name = 'reroutes'; scene.add(eReRoot); }
+    eReRoot.add(mesh);
+    return mesh;
+  };
+
+  /* 单面墙临时半透明（开洞前看墙里有什么），可批量 */
+  const ghosted = [];
+  S.ghostWall = function (wall, on) {
+    const mesh = wallMeshById[wall.id];
+    if (!mesh) return;
+    if (on) {
+      if (mesh.userData.solidMat) return;
+      mesh.userData.solidMat = mesh.material;
+      const m = mesh.material.clone();
+      m.transparent = true; m.opacity = .14; m.depthWrite = false;
+      m.side = THREE.DoubleSide;
+      mesh.material = m;
+      ghosted.push(wall.id);
+    } else {
+      if (!mesh.userData.solidMat) return;
+      const m = mesh.material;
+      mesh.material = mesh.userData.solidMat;
+      delete mesh.userData.solidMat;
+      if (m && m.dispose) m.dispose();
+      const i = ghosted.indexOf(wall.id);
+      if (i >= 0) ghosted.splice(i, 1);
+    }
+  };
+  S.ghostWalls = function (walls, on) { (walls || []).forEach(w => S.ghostWall(w, on)); };
+  S.clearGhostWalls = function () {
+    ghosted.slice().forEach(id => {
+      const w = M.walls.find(x => x.id === id);
+      if (w) S.ghostWall(w, false);
+    });
+  };
+
+  /* 分路模式：一进来就把"半透明楼体 + 这条分路 + 关联房间"摆好
+     —— 用户要的效果是：楼壳子变淡，能看明白电从哪儿来、走到哪几间 */
+  S.circuitView = function (circ, rooms) {
+    if (!E() || !E().data) return;
+    S.setFocus(circ ? circ.floor : 0, false);
+    S.showConduits(true);
+    S.setXray(true);
+    S.showCircuit(circ ? circ.id : null);
+    S.syncCircuitPower();
+    if (rooms && rooms.length) S.highlightRooms(rooms, 0x17a673);
+    else disposeHl();
+  };
+  S.circuitViewOff = function () {
+    S.showCircuit(null);
+    S.showConduits(false);
+    S.setXray(false);
+    S.clearConduitMarks();
+    S.clearGhostWalls();
+    disposeHl();
+  };
+
+  /* 电气相关的东西在换模型时全部重建 */
+  S.rebuildElectric = function () {
+    if (!E()) return;
+    if (window.BIM_MODEL) E().rebuild ? E().rebuild() : E().build();
+    eBuild(); ePanelBuild();
+  };
 
   /* ---------------- 调试 / 投影 ---------------- */
   S.camera = () => camera;

@@ -27,6 +27,32 @@
 
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
+  /* ---------------- 墙内预埋线管 ----------------
+     建筑图不画这一层，但现场是实打实埋在墙里的。开洞前必须问一句：
+     这个洞会不会打断某一路电。判定交给 elec 层（那边知道线管的走向、标高、分路），
+     这里只负责把结果翻译成一句人能听懂的话。
+     没装 elec 层（例如单测结构）时退化成"没有线管"，不影响原来的校核。 */
+  function conduitHits(wall, at, w, h, sill) {
+    const E = window.BIM && window.BIM.elec;
+    if (!E || !E.data || !wall) return [];
+    try { return E.hitWall(wall, { at: at, w: w, h: h, sill: sill }) || []; }
+    catch (e) { return []; }
+  }
+  C.conduitHits = conduitHits;
+
+  function conduitText(hits) {
+    const E = window.BIM && window.BIM.elec;
+    const kinds = [];
+    const circs = [];
+    hits.forEach(c => {
+      const k = (E && E.KIND_CN[c.kind]) || c.kind;
+      if (kinds.indexOf(k) < 0) kinds.push(k);
+      if (circs.indexOf(c.circuit) < 0) circs.push(c.circuit);
+    });
+    return '墙里有 ' + hits.length + ' 根' + kinds.join('/') + '线管正好穿过（' +
+      circs.join('、') + ' 回路），开洞会打断它';
+  }
+
   /* 单台设备的等效板中弯矩与影响参数 */
   function meqOne(room, e, x, y, pad) {
     const sl = room.slab;
@@ -580,13 +606,24 @@
       }
     });
 
+    /* 墙里预埋的线管：真实施工里这一凿就断一路电，必须算进来。
+       命中时把线管本身一并带回去，上层才好算"上翻／下翻绕过去"的方案；
+       如果上层打算先改线再开洞，传 conduitBlock:false 就只报结构性问题。 */
+    const chits = conduitHits(wall, at, w, h, 0);
+    if (chits.length && o.conduitBlock !== false) {
+      blocks.push({ t: conduitText(chits), k: 'conduit', conduits: chits });
+    }
+
     if (h > wall.h - 0.35) blocks.push({ t: '门高 ' + fmt(h, 2) + ' m 顶到上面的梁了（墙净高 ' + fmt(wall.h, 2) + ' m）', k: 'height' });
     if (h < 1.8) warns.push('门高只有 ' + fmt(h, 2) + ' m，偏矮，搬运设备会不方便');
     if (wall.kind === 'ext') warns.push('这是外墙，开门还要看结构和防水');
     if (w > 1.4) warns.push('门比较宽，门顶上要加固');
     if (wall.kind === 'part') warns.push('这是内隔墙，门顶上要补一根过梁');
 
-    return { pass: blocks.length === 0, blocks: dedupeBlocks(blocks), warns: dedupeStrs(warns), at, w, h, wall, L };
+    return {
+      pass: blocks.length === 0, blocks: dedupeBlocks(blocks), warns: dedupeStrs(warns),
+      at, w, h, wall, L, conduits: chits
+    };
   };
 
   /* ---------------- 窗洞校核 ----------------
@@ -671,8 +708,127 @@
     else warns.push('这是内隔墙，开的是观察窗，隔墙要加过梁');
     if (sill + h > 1.8 && wall.kind === 'ext') warns.push('窗洞偏高，注意幕墙分格和开启扇位置');
 
-    return { pass: blocks.length === 0, blocks: dedupeBlocks(blocks), warns: dedupeStrs(warns), at, w, h, sill, wall, L };
+    /* 墙内线管冲突（同 C.door）。窗的 sill 参与判定：
+       普通窗 0.9+1.5=2.4 够不着 2.9 m 的照明管，做成到顶的高窗才会碰上 */
+    const chits = conduitHits(wall, at, w, h, sill);
+    if (chits.length && o.conduitBlock !== false) {
+      blocks.push({ t: conduitText(chits), k: 'conduit', conduits: chits });
+    }
+
+    return {
+      pass: blocks.length === 0, blocks: dedupeBlocks(blocks), warns: dedupeStrs(warns),
+      at, w, h, sill, wall, L, conduits: chits
+    };
   };
+
+  /* ---------------- 空间打穿 / 拆墙校核 ----------------
+     跟开门不是一回事：门是"做一樘能关上的门"，打穿是"墙上挖个洞让两边连通"，
+     尺寸大得多，结构上的忌讳也多——承重外墙、框架柱、墙里管线，
+     还有消防分区和隔声。这里只判"能不能挖"，加固怎么补放在 warns 里讲。 */
+  C.passage = function (o) {
+    const M = window.BIM_MODEL;
+    const wall = o.wall, at = o.at, w = o.w, h = o.h == null ? 2.2 : o.h;
+    const sill = 0;                              // 打穿都是落到地面，没有窗台
+    const whole = !!o.demolish;                  // 整段拆：连原有的门窗一起拆掉，不算"重叠"
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / L, uy = (by - ay) / L;
+    const half = w / 2;
+    const blocks = [], warns = [];
+
+    /* ① 结构：外墙在这栋楼里同时是承重墙，拆了受力体系就变了 */
+    if (wall.kind === 'ext') {
+      blocks.push({ t: '这是外墙（兼承重墙），拆了整栋楼的传力路径就变了，不能开', k: 'structure' });
+    }
+    if (w < 0.8) blocks.push({ t: '洞口宽 ' + fmt(w, 2) + ' m 太窄，打穿了也没用（最小 0.8 m）', k: 'size' });
+    if (h > wall.h - 0.30) {
+      blocks.push({
+        t: '洞口高 ' + fmt(h, 2) + ' m，上方只剩 ' + fmt(wall.h - h, 2) + ' m，留不出过梁（墙净高 ' + fmt(wall.h, 2) + ' m）',
+        k: 'height'
+      });
+    }
+    const e0 = at - half, e1 = L - at - half;
+    if (e0 < 0.12) blocks.push({ t: e0 < 0.01 ? '洞口已经切到墙端头' : '离墙端头只有 ' + fmt(e0, 2) + ' 米，留不住墙垛', k: 'angle' });
+    if (e1 < 0.12) blocks.push({ t: e1 < 0.01 ? '洞口已经切到墙另一端头' : '离另一端头只有 ' + fmt(e1, 2) + ' 米，留不住墙垛', k: 'angle' });
+
+    if (o.room && !whole) {
+      const ts = [[o.room.x0, o.room.y0], [o.room.x1, o.room.y0], [o.room.x0, o.room.y1], [o.room.x1, o.room.y1]]
+        .map(([x, y]) => (x - ax) * ux + (y - ay) * uy);
+      const lo2 = Math.min.apply(null, ts), hi2 = Math.max.apply(null, ts);
+      if (at - half < lo2 - 0.05 || at + half > hi2 + 0.05) {
+        blocks.push({ t: '洞口的范围出了这间房，会牵连到隔壁房间', k: 'span' });
+      }
+    }
+
+    /* ② 和已有的门窗重叠（打穿时最容易踩：门就在旁边）
+       整段拆除外——范围之内的门窗本来就一起拆了，这是拆墙的应有之义，
+       拦下来会让"这面墙拆了"永远执行不了。改成在 warns 里点名。 */
+    const selfAt = o.self ? SELF_AT(o.self, wall, ux, uy) : null;
+    const eaten = [];
+    wall.openings.forEach(op => {
+      if (isSelf(op, o.self, selfAt)) return;
+      const gap = Math.abs(op.at - at) - (op.w + w) / 2;
+      const kind = op.kind === 'door' ? '门' : (op.kind === 'window' ? '窗' : '洞口');
+      if (whole) {
+        if (gap < 0.02) eaten.push({ kind: op.kind, name: op.name, w: op.w, at: op.at });
+        return;
+      }
+      if (gap < 0.2) {
+        blocks.push({ t: gap <= 0.01 ? '和原来的' + kind + '重叠了' : '离原来的' + kind + '只有 ' + fmt(gap, 2) + ' 米，太挤', k: 'open' });
+      }
+    });
+    if (eaten.length) {
+      warns.push('这段墙上的 ' + eaten.length + ' 处' + eaten.map(x => (x.kind === 'door' ? '门' : (x.kind === 'window' ? '窗' : '洞口')))
+        .filter((v, i, a) => a.indexOf(v) === i).join('/') + '会一起拆掉，门扇和窗要另行处理');
+    }
+
+    /* ③ 框架柱。整段拆的时候墙两端的柱本来就留着不倒，只有柱子卡在洞口中间
+       才是真问题——所以整拆时把判定范围沿墙各收 N 米，别拿端头柱误伤。 */
+    const inset = whole ? Math.min(0.45, half * 0.35) : 0;
+    const px = Math.abs(uy) * wall.t / 2, py = Math.abs(ux) * wall.t / 2;
+    const xa = ax + ux * (at - half + inset), xb = ax + ux * (at + half - inset);
+    const ya = ay + uy * (at - half + inset), yb = ay + uy * (at + half - inset);
+    const rect = {
+      x0: Math.min(xa, xb) - px + 0.01, x1: Math.max(xa, xb) + px - 0.01,
+      y0: Math.min(ya, yb) - py + 0.01, y1: Math.max(ya, yb) + py - 0.01
+    };
+    M.columns.filter(c => c.floor === wall.floor).forEach(c => {
+      const r2 = { x0: c.x - c.s / 2, x1: c.x + c.s / 2, y0: c.y - c.s / 2, y1: c.y + c.s / 2 };
+      if (rect.x0 < r2.x1 && rect.x1 > r2.x0 && rect.y0 < r2.y1 && rect.y1 > r2.y0) {
+        blocks.push({ t: '洞口范围内有框架柱，柱子不能拆', k: 'col' });
+      }
+    });
+
+    // ④ 风管
+    M.ducts.filter(d => d.floor === wall.floor).forEach(d => {
+      const cross = segCross(d.a, d.b, [ax, ay], [bx, by]);
+      if (cross == null) return;
+      const cx2 = d.a[0] + (d.b[0] - d.a[0]) * cross, cy2 = d.a[1] + (d.b[1] - d.a[1]) * cross;
+      const near = Math.hypot(cx2 - (ax + ux * at), cy2 - (ay + uy * at));
+      if (near < half + d.w && Math.min(d.a[2], d.b[2]) - d.h / 2 < wall.base + h) {
+        blocks.push({ t: '有风管从这里穿过洞口范围', k: 'duct' });
+      }
+    });
+
+    // ⑤ 墙内线管
+    const chits = conduitHits(wall, at, w, h, sill);
+    if (chits.length && o.conduitBlock !== false) {
+      blocks.push({ t: conduitText(chits), k: 'conduit', conduits: chits });
+    }
+
+    // ⑥ 提醒项：这些不是不能做，是要另外补
+    if (wall.kind !== 'ext') warns.push('洞口上方要补过梁（预制或现浇），跨度大时按钢梁算');
+    if (w > 3) warns.push('洞口超过 3 米，两侧要加构造柱，楼板边要复核');
+    warns.push('打穿会连通两个防火分区，消防要重新核（喷淋、报警、疏散距离）');
+    if (h >= 2.2) warns.push('隔声会明显下降，需要时加隔声门斗');
+    if (wall.t < 0.2) warns.push('墙比较薄（' + fmt(wall.t, 2) + ' m），洞口边缘容易崩，要做护角');
+
+    return {
+      pass: blocks.length === 0, blocks: dedupeBlocks(blocks), warns: dedupeStrs(warns),
+      at, w, h, sill, wall, L, conduits: chits
+    };
+  };
+
 
   /* 在墙面这一段落上找一个能开窗的位置。
      先按 0.1 m 粗扫；粗扫漏掉的窄缝（柱边到旧窗之间只剩几十公分）再按 0.02 m 细扫一遍。
@@ -694,7 +850,8 @@
     const scan = step => {
       for (let at = lo + w / 2; at <= hi - w / 2 + 1e-6; at += step) {
         const c = C.window({ wall: wall, at: at, w: w, h: h, sill: sill, room: room, equipments: o.equipments, self: o.self });
-        if (c.pass) {
+        const okHere = c.pass || (o.ignoreConduit && (c.blocks || []).every(b => b.k === 'conduit'));
+        if (okHere) {
           const d = Math.abs(at - want);
           if (!best || d < best.d) best = { at: at, d: d, check: c };
         } else if (!worst || c.blocks.length < worst.blocks.length) {
@@ -724,7 +881,34 @@
     let best = null;
     for (let at = lo + w / 2; at <= hi - w / 2; at += 0.1) {
       const c = C.door({ wall: wall, at: at, w: w, h: h, room: room, equipments: o.equipments, self: o.self });
-      if (!c.pass) continue;
+      /* ignoreConduit：只解决"位置"问题，线管留给上层另外处理（牵线/再挪） */
+      const okHere = c.pass || (o.ignoreConduit && (c.blocks || []).every(b => b.k === 'conduit'));
+      if (!okHere) continue;
+      const d = Math.abs(at - o.at);
+      if (!best || d < best.d) best = { at: at, d: d, check: c };
+    }
+    return best;
+  };
+
+  /* 就近找一个能打穿的位置（打穿的洞口通常比门宽，能挪的余地更小） */
+  C.suggestPassageAt = function (o) {
+    const wall = o.wall, room = o.room, w = o.w, h = o.h;
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / L, uy = (by - ay) / L;
+    let lo = 0.15, hi = L - 0.15;
+    if (room) {
+      const ts = [[room.x0, room.y0], [room.x1, room.y0], [room.x0, room.y1], [room.x1, room.y1]]
+        .map(([x, y]) => (x - ax) * ux + (y - ay) * uy);
+      lo = Math.min.apply(null, ts) + 0.05;
+      hi = Math.max.apply(null, ts) - 0.05;
+    }
+    let best = null;
+    for (let at = lo + w / 2; at <= hi - w / 2 + 1e-6; at += 0.1) {
+      const c = C.passage({ wall: wall, at: at, w: w, h: h, room: room, equipments: o.equipments, self: o.self });
+      /* ignoreConduit：只解决"位置"问题，线管留给上层另外处理（牵线/再挪） */
+      const okHere = c.pass || (o.ignoreConduit && (c.blocks || []).every(b => b.k === 'conduit'));
+      if (!okHere) continue;
       const d = Math.abs(at - o.at);
       if (!best || d < best.d) best = { at: at, d: d, check: c };
     }

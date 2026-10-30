@@ -2204,7 +2204,12 @@
     info: async step => stepInfo(step),
     ask: async step => stepAsk(step),
     impact: async step => stepImpact(step),
-    scene: async step => stepScene(step)
+    scene: async step => stepScene(step),
+    /* 打穿 / 拆墙 / 电路 */
+    passage: async step => stepPassage(step),
+    circuit: async step => stepCircuits(step),
+    circuitset: async step => stepToggleCircuit(step),
+    conduits: async step => stepConduits(step)
   };
 
   async function stepPlace(step, auto) {
@@ -2310,26 +2315,64 @@
     if (!wall) { ai(room.num + ' 这间房找不到对应的墙。'); return false; }
     const L = Math.hypot(wall.p2[0] - wall.p1[0], wall.p2[1] - wall.p1[1]);
     const eqs = ST.placed.filter(e => e.floor === wall.floor);
-    const sug = C.suggestDoorAt({ wall: wall, room: room, at: L / 2, w: w, h: h, equipments: eqs });
-    if (!sug) {
+
+    /* 同开窗：先在墙中间试，撞墙内线管就按 牵线 → 挪位 → 不建议 逐级处理。
+       门尤其常见——插座回路本来就贴着地面从门口引过来。 */
+    const dec = holeDecision(wall, { at: L / 2, w: w, h: h, sill: 0, room: room, equipments: eqs, kind: 'door' });
+
+    if (!dec.ok) {
       focusSoft(room);
-      ai(room.num + ' 这面墙前后都腾不出 ' + w.toFixed(2) + ' 米，换个墙面试试。');
+      S.highlightWall(wall, 0xdd534f);
+      if (dec.hits && dec.hits.length) showHoleConflict(wall, dec.hits, dec.plans);
+      const bs = (dec.blocks && dec.blocks.length) ? dec.blocks : [{ t: dec.why || '这个位置开不了' }];
+      const detail = bs.map(b => '<s>·</s> ' + b.t).join('<br>');
+      ai(room.num + ' ' + N.SIDE_CN[side] + '墙这个位置开不了 ' + w.toFixed(2) + ' 米宽的门：' + bs[0].t +
+        ((dec.hits && dec.hits.length) ? '，墙里的线管也没有改线的余地' : ''),
+        '<div class="res bad"><div class="res-top"><span class="k">不建议开</span><span class="tag">有冲突</span></div>' +
+        '<div class="res-adv">' + detail + '</div></div>');
+      chips([
+        { label: '换个墙面试试', fn: () => send('在' + room.num + '换个墙开个门') },
+        { label: '门开窄一点', fn: () => send('在' + room.num + '开个0.9米的门') },
+        { label: '我自己点位置', fn: () => startDoor({ room: room, side: side, width: w, doorH: h }) }
+      ]);
       return false;
     }
-    const d = S.addDoorOpening(wall, sug.at, w, h);
+
+    const rerouted = dec.needReroute ? applyReroutes(dec) : 0;
+    const d = S.addDoorOpening(wall, dec.at, w, h);
     d.room = room.id;                 // 记住"为哪间房开的"，长墙上才分得清
     focusSoft(room);
-    const sp = doorSpot(wall, sug.at);
-    if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, sug.at, room);
-    S.markDoorSpot(wall, sug.at, w, h, true);
-    ST.lastDoor = { wall: wall, at: sug.at, w: w, d: d, chk: sug.check, room: room };
+    const sp = doorSpot(wall, dec.at);
+    if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
+    S.markDoorSpot(wall, dec.at, w, h, true);
+    if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
+    ST.lastDoor = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
     rememberDoor(room, side, w, h);
     pushUndo('把刚开的 ' + d.name + ' 拆掉', () => { S.removeDoor(d); S.markDoorSpotClear && S.markDoorSpotClear(); ST.lastDoor = null; });
-    ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) + ' 米高的门。',
-      '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
+    const card2 = (dec.needReroute || dec.moved) ? conduitCard(dec.hits, dec.reroutes, dec)
+      : '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
       '<div class="res-grid"><div><i>门宽</i><b>' + w.toFixed(2) + ' m</b></div>' +
-      '<div><i>门高</i><b>' + h.toFixed(2) + ' m</b></div></div></div>');
-    lastData = { door: d.name, room: room.num, side: side, width: w, height: h };
+      '<div><i>门高</i><b>' + h.toFixed(2) + ' m</b></div></div></div>';
+    if (dec.needReroute) {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的门。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
+        '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
+        '。红色是原来的管线位置，绿色是改完的新走向。', card2);
+    } else if (dec.moved) {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的门。' + dec.moveNote + '。', card2);
+    } else {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的门。', card2);
+    }
+    lastData = {
+      door: d.name, room: room.num, side: side, width: w, height: h,
+      at: +dec.at.toFixed(2),
+      moved: dec.moved ? +dec.movedBy.toFixed(2) : 0,
+      rerouted: rerouted,
+      reroute_add_m: rerouted ? +dec.reroutes.reduce((s, p) => s + p.addLen, 0).toFixed(2) : 0,
+      conduit_hit: (dec.hits || []).map(c => c.circuit)
+    };
     A.commit(step, { room: room, side: side });
     return true;
   }
@@ -2367,6 +2410,163 @@
       '<div><i>窗台高</i><b>' + sill.toFixed(2) + ' m</b></div></div>' + warnTxt + '</div>';
   }
 
+  /* =============== 开洞与墙内线管：一套固定的处理顺序 ===============
+     最容易被忽略的一种情形：位置、尺寸、结构全都合适，墙里却埋着一路线管。
+     真实施工这一凿就打断一路电，所以每次开洞前都按这个顺序走，别临场发挥：
+       ① 原位不撞         → 直接开
+       ② 原位只撞线管     → 先"牵线"：上翻/下翻绕过洞口，能绕就绕完再开
+       ③ 绕不过去         → 顺同一面墙找不撞管线的位置，挪过去开
+       ④ 都不行           → 明确不建议开，并说清卡在哪
+     返回：
+       { ok:true,  at, chk, reroutes:[], hits:[], moved:false, note:'' }
+       { ok:false, chk, hits, plans, why }
+  */
+  function holeDecision(wall, o) {
+    const E = window.BIM.elec;
+    const sufMt = v => C.fmt(v, 2) + ' 米';
+    const check = at => o.kind === 'door'
+      ? C.door({ wall: wall, at: at, w: o.w, h: o.h, room: o.room, equipments: o.equipments, self: o.self })
+      : (o.kind === 'passage'
+        ? C.passage({ wall: wall, at: at, w: o.w, h: o.h, room: o.room, equipments: o.equipments, self: o.self, demolish: o.demolish })
+        : C.window({ wall: wall, at: at, w: o.w, h: o.h, sill: o.sill, room: o.room, equipments: o.equipments, self: o.self }));
+
+    /* 顺着这面墙找一个能开的空位。门和窗的"默认位置"往往是墙中点，
+       而一面长墙常常横跨好几间房，中点未必落在本房间这一截上——
+       这是位置问题，不是不能开，得先让一让。
+       ignoreConduit=true 时只解决位置，线管留到下一步再处理。 */
+    const findSpot = ignore => o.kind === 'door'
+      ? C.suggestDoorAt({ wall: wall, room: o.room, at: o.at, w: o.w, h: o.h, equipments: o.equipments, self: o.self, ignoreConduit: ignore })
+      : (o.kind === 'passage'
+        ? C.suggestPassageAt({ wall: wall, room: o.room, at: o.at, w: o.w, h: o.h, equipments: o.equipments, self: o.self, ignoreConduit: ignore })
+        : C.suggestWindowAt({ wall: wall, room: o.room, at: o.at, w: o.w, h: o.h, sill: o.sill, equipments: o.equipments, self: o.self, ignoreConduit: ignore }));
+
+    const HARD = { structure: 1, size: 1, height: 1 };
+    const split = c => ({
+      hard: (c.blocks || []).filter(b => b.k !== 'conduit' && HARD[b.k]),
+      soft: (c.blocks || []).filter(b => b.k !== 'conduit' && !HARD[b.k])
+    });
+
+    let at = o.at, c0 = check(at), moved = 0, note = '', moveNote = '';
+    let part = split(c0);
+
+    /* 位置类问题的说法：要能一句话讲清"为什么原位不行" */
+    const SOFT_WHY = {
+      span: '原位不在这间房这一段墙上', angle: '原位贴着墙端头，留不住墙垛',
+      open: '原位和原有的门窗挤在一起', col: '原位正好压在框架柱上', duct: '原位有风管穿过'
+    };
+
+    /* ── 第一段：先把"位置"摆对 ──────────────────────────────
+       出了本房间范围、贴着墙端头、和旧门窗挤在一起，都属于"换个地方就行"。 */
+    if (!c0.pass && part.soft.length && !part.hard.length && !o.demolish) {
+      const s0 = findSpot(true);
+      if (s0 && s0.at != null) {
+        moved = Math.abs(s0.at - o.at);
+        moveNote = (SOFT_WHY[part.soft[0].k] || part.soft[0].t) +
+          '，顺墙让到 ' + sufMt(s0.at) + '处（挪了 ' + C.fmt(moved, 2) + ' 米）';
+        note = moveNote;
+        at = s0.at;
+        c0 = check(at);
+        part = split(c0);
+      } else {
+        return { ok: false, chk: c0, hits: c0.conduits || [], why: part.soft[0].t, blocks: part.soft.concat(part.hard) };
+      }
+    }
+
+    /* 位置摆好之后还有硬伤（外墙承重、洞口太窄、挖到顶留不出过梁）就到此为止 */
+    if (part.hard.length) {
+      return { ok: false, chk: c0, hits: c0.conduits || [], why: part.hard[0].t, blocks: part.hard.concat(part.soft) };
+    }
+    if (c0.pass) {
+      return { ok: true, at: at, chk: c0, reroutes: [], hits: [], moved: moved > 0, movedBy: moved, note: note, moveNote: moveNote };
+    }
+    if (part.soft.length) {
+      return { ok: false, chk: c0, hits: c0.conduits || [], why: part.soft[0].t, blocks: part.soft };
+    }
+
+    /* ── 第二段：位置没问题，剩下的只可能是墙里的线管 ────────── */
+    const hits = c0.conduits || [];
+    const sill = o.kind === 'window' ? o.sill : 0;
+    const hole = { at0: at - o.w / 2, at1: at + o.w / 2, z0: sill, z1: sill + o.h };
+    const plans = (E && hits.length) ? hits.map(c => E.planReroute(c, hole)) : [];
+    if (plans.length && plans.every(p => p && p.ok)) {
+      const rn = plans.map(p => p.why).join('；');
+      return {
+        ok: true, at: at, chk: c0, reroutes: plans, hits: hits, moved: moved > 0, movedBy: moved,
+        needReroute: true, moveNote: moveNote, rerouteNote: rn,
+        note: (moveNote ? moveNote + '；' : '') + rn
+      };
+    }
+
+    /* ③ 牵不了线 → 顺墙挪个不撞管线的位置（挪多少要如实说）
+       整段拆不能挪：挪了就不是"拆这面墙"了，只能走改线或者别拆。 */
+    if (o.demolish) {
+      return {
+        ok: false, chk: c0, hits: hits, plans: plans,
+        why: '这面墙整段都有线管，整段拆又没法挪位置——只能先把这几路电改到别处（或者换一面墙拆）'
+      };
+    }
+    const sug = findSpot(false);
+    if (sug && sug.at != null) {
+      const d = Math.abs(sug.at - at);
+      const why = plans.filter(p => p && !p.ok).map(p => p.why)[0] || '这段位置线管绕不过去';
+      return {
+        ok: true, at: sug.at, chk: sug.check, reroutes: [], hits: hits, moved: true, movedBy: d,
+        needReroute: false,
+        moveNote: moveNote, rerouteNote: '',
+        note: (moveNote ? moveNote + '；' : '') + why + '，顺墙让到 ' + sufMt(sug.at) + ' 的位置（挪了 ' + C.fmt(d, 2) + ' 米）'
+      };
+    }
+
+    /* ④ 全线都躲不开 → 不建议开 */
+    return {
+      ok: false, chk: c0, hits: hits, plans: plans,
+      why: '这面墙整段都躲不开线管，也没有能改线的余地'
+    };
+  }
+
+  /* 真的把线改掉：写进 elec 的 reroutes，之后这根管在这个洞口就不再算冲突。
+     注意这是"改设计"，所以只在校核确认洞能开（结构没问题）之后才落地。 */
+  function applyReroutes(dec) {
+    const E = window.BIM.elec;
+    if (!E || !dec || !dec.reroutes || !dec.reroutes.length) return 0;
+    let n = 0;
+    dec.reroutes.forEach(p => {
+      if (p && p.ok && p.c) { E.applyReroute(p.c, p.hole, p); n++; }
+    });
+    return n;
+  }
+
+  /* 把"撞上的线管 / 改线走向 / 半透明墙体"一次性摆到屏幕上。
+     用户要的就是这一眼：墙里哪根管子挡着，新的线打算怎么走。 */
+  function showHoleConflict(wall, hits, plans, alsoOpen) {
+    if (!window.BIM.elec) return;
+    S.showConduits(true);
+    S.ghostWall(wall, true);
+    S.clearConduitMarks();
+    S.markConduits((hits || []).concat((alsoOpen && alsoOpen.conduits) || []), 0xff3b30);
+    (plans || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
+    S.syncCircuitPower();
+  }
+
+  /* 冲突卡：说清"撞了哪根、打算怎么办、还能怎么办" */
+  function conduitCard(hits, plans, dec, kindCn) {
+    const rows = (hits || []).map(c =>
+      '<div><i>' + (window.BIM.elec ? window.BIM.elec.KIND_CN[c.kind] : c.kind) + '回路</i><b>' +
+      c.circuit + ' · 距地 ' + C.fmt(c.z, 2) + ' m</b></div>').join('');
+    const plan = (plans || []).filter(p => p && p.ok)
+      .map(p => '<s>·</s> 把' + (window.BIM.elec ? window.BIM.elec.KIND_CN[p.c.kind] : '') +
+        '线管' + (p.dir === 'up' ? '上翻' : '下翻') + '到 ' + C.fmt(p.z, 2) + ' m 处绕过，多走 ' +
+        C.fmt(p.addLen, 2) + ' 米线').join('<br>');
+    const moved = dec && dec.moved
+      ? '<s>·</s> 也可以不牵线，顺墙挪 ' + C.fmt(dec.movedBy, 2) + ' 米避开（绿色是改线方案，红色是冲突管线）'
+      : '';
+    return '<div class="res warn"><div class="res-top"><span class="k">' +
+      (dec && dec.moved ? '挪位后可以开' : '要牵线才能开') + '</span>' +
+      '<span class="tag">墙内有管线</span></div>' +
+      '<div class="res-grid">' + rows + '</div>' +
+      '<div class="res-adv">' + plan + (plan && moved ? '<br>' : '') + moved + '</div></div>';
+  }
+
   async function stepWindow(step, auto) {
     const A = window.BIM.agent;
     const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
@@ -2382,15 +2582,21 @@
     if (!wall) { ai(room.num + ' 这间房找不到对应的墙。'); return false; }
     const L = S.wallLen(wall);
     const eqs = ST.placed.filter(e => e.floor === wall.floor);
-    const sug = C.suggestWindowAt({ wall: wall, room: room, at: L / 2, w: w, h: h, sill: sill, equipments: eqs });
-    if (!sug || sug.at == null) {
+
+    /* 先在"墙中间"这个最自然的位置试。开不了就按 牵线 → 挪位 → 不建议 逐级处理，
+       不要一上来就偷偷换个位置——用户得先知道这里为什么开不了。 */
+    const dec = holeDecision(wall, { at: L / 2, w: w, h: h, sill: sill, room: room, equipments: eqs, kind: 'window' });
+
+    if (!dec.ok) {
       focusSoft(room);
       S.highlightWall(wall, 0xdd534f);
-      const chk = (sug && sug.check) || C.window({ wall: wall, at: L / 2, w: w, h: h, sill: sill, room: room, equipments: eqs });
-      const bs = chk.blocks.length ? chk.blocks : [{ t: '这面墙腾不出 ' + w.toFixed(2) + ' 米宽的位置' }];
-      ai(room.num + ' ' + N.SIDE_CN[side] + '墙整段都腾不出 ' + w.toFixed(2) + '×' + h.toFixed(2) + ' 米的窗：' + bs[0].t,
-        '<div class="res bad"><div class="res-top"><span class="k">开不了</span><span class="tag">有冲突</span></div>' +
-        '<div class="res-adv">' + bs.map(b => '<s>·</s> ' + b.t).join('<br>') + '</div></div>');
+      if (dec.hits && dec.hits.length) showHoleConflict(wall, dec.hits, dec.plans);
+      const bs = (dec.blocks && dec.blocks.length) ? dec.blocks : [{ t: dec.why || '这个位置开不了' }];
+      const detail = bs.map(b => '<s>·</s> ' + b.t).join('<br>');
+      ai(room.num + ' ' + N.SIDE_CN[side] + '墙这个位置开不了 ' + w.toFixed(2) + '×' + h.toFixed(2) +
+        ' 米的窗：' + bs[0].t + ((dec.hits && dec.hits.length) ? '，墙里的线管也绕不过去' : ''),
+        '<div class="res bad"><div class="res-top"><span class="k">不建议开</span><span class="tag">有冲突</span></div>' +
+        '<div class="res-adv">' + detail + '</div></div>');
       chips([
         { label: '换一面墙', fn: () => send('在' + room.num + '的另一面墙开个窗') },
         { label: '开小一点', fn: () => send('在' + room.num + '开个1.0米的窗') },
@@ -2398,20 +2604,509 @@
       ]);
       return false;
     }
-    const d = S.addWindowOpening(wall, sug.at, w, h, sill);
+
+    // 需要牵线的，先落地改线（绿色新走向），再开洞
+    const rerouted = dec.needReroute ? applyReroutes(dec) : 0;
+    const d = S.addWindowOpening(wall, dec.at, w, h, sill);
     d.room = room.id;
     focusSoft(room);
-    const sp = doorSpot(wall, sug.at);
-    if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, sug.at, room);
-    S.markDoorSpot(wall, sug.at, w, h, true);
-    ST.lastWin = { wall: wall, at: sug.at, w: w, d: d, chk: sug.check, room: room };
+    const sp = doorSpot(wall, dec.at);
+    if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
+    S.markDoorSpot(wall, dec.at, w, h, true);
+    if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
+    ST.lastWin = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
     rememberWindow(room, side, w, h, sill);
     pushUndo('把刚开的 ' + d.name + ' 封掉', () => { S.removeWindow(d); S.markDoorSpotClear && S.markDoorSpotClear(); ST.lastWin = null; });
-    ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
-      ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + (sug.check.warns.length ? sug.check.warns[0] + '。' : ''),
-      winCard(w, h, sill, sug.check));
-    lastData = { window: d.name, room: room.num, side: side, width: w, height: h, sill: sill };
+    const card = (dec.needReroute || dec.moved) ? conduitCard(dec.hits, dec.reroutes, dec) : winCard(w, h, sill, dec.chk);
+    if (dec.needReroute) {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
+        '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
+        '。红色是原来的管线位置，绿色是改完的新走向。', card);
+    } else if (dec.moved) {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + dec.moveNote + '。', card);
+    } else {
+      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
+        ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + (dec.chk.warns.length ? dec.chk.warns[0] + '。' : ''),
+        card);
+    }
+    lastData = {
+      window: d.name, room: room.num, side: side, width: w, height: h, sill: sill,
+      at: +dec.at.toFixed(2),
+      moved: dec.moved ? +dec.movedBy.toFixed(2) : 0,
+      rerouted: rerouted,
+      reroute_add_m: rerouted ? +dec.reroutes.reduce((s, p) => s + p.addLen, 0).toFixed(2) : 0,
+      conduit_hit: (dec.hits || []).map(c => c.circuit)
+    };
     A.commit(step, { room: room, side: side });
+    return true;
+  }
+
+  /* ================= 空间打穿 / 拆墙 =================
+     用户说的"把这间和隔壁打通""这面墙拆了""砸个大洞"都走这里。
+     跟开门最关键的区别：门是"能关上的"，打穿是"两边连通"，所以：
+       · 承重外墙一律不动（拆了整栋楼传力路径就变）
+       · 上方一定留过梁，不能挖到顶
+       · 墙里的线管要改道，改不动就不建议开
+     "拆墙"和"打穿"共用一套校核，只是洞口宽度不同（整段 vs 指定宽度）。 */
+  function pickPassageSide(room, step) {
+    const sides = room.sides || {};
+    const cands = ['south', 'north', 'east', 'west'].filter(k => sides[k]);
+    if (step.side && sides[step.side]) return step.side;
+    // 有明确的隔壁房号 → 选两面共用的那面墙
+    if (step.to) {
+      const other = window.BIM.agent.roomByNum(step.to, step.floor);
+      if (other) {
+        const hit = cands.find(k => sides[k] === (other.sides || {})[k]);
+        if (hit) return hit;
+        const shared = cands.find(k => {
+          const w = M.walls.find(x => x.id === sides[k]);
+          return w && (w.rooms || []).indexOf(other.id) >= 0;
+        });
+        if (shared) return shared;
+      }
+    }
+    // 没指定 → 优先内隔墙（外墙不能拆），且这面墙的另一侧真有房间
+    const inner = cands.filter(k => {
+      const w = M.walls.find(x => x.id === sides[k]);
+      if (!w || w.kind === 'ext') return false;
+      const others = (w.rooms || []).filter(id => id !== room.id);
+      return others.length > 0;
+    });
+    return inner[0] || cands.find(k => {
+      const w = M.walls.find(x => x.id === sides[k]);
+      return w && w.kind !== 'ext';
+    }) || cands[0] || null;
+  }
+
+  /* 隔壁是哪一间（回复里要说清"连通到哪"） */
+  function neighbourOf(room, wall) {
+    const ids = (wall.rooms || []).filter(id => id !== room.id);
+    const rs = ids.map(id => M.rooms.find(r => r.id === id)).filter(Boolean);
+    return rs.find(r => r.zone !== 'corr') || rs[0] || null;
+  }
+
+  /* 洞口开完，墙里的线管要跟着重铺：洞口处线管被切断或改走套管，
+     否则墙上明明开了洞，线管还横在那儿穿过去。 */
+  function refreshElec(hits, plans) {
+    if (!window.BIM.elec) return;
+    try {
+      window.BIM.elec.rebuild();
+      S.rebuildElec();
+      S.rebuildPanels();
+      S.showConduits(true);
+      if (hits && hits.length) S.markConduits(hits, 0xff3b30);
+      (plans || []).forEach(p => { if (p && p.ok) S.showReroute(p, 0x17a673); });
+      S.syncCircuitPower();
+    } catch (e) { console.warn('elec refresh', e && e.message); }
+  }
+
+  async function stepPassage(step) {
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    if (!room) {
+      ai('要把哪一间打通？说个房间号，比如「3 楼 306」，或者告诉我打通到哪一间。');
+      return false;
+    }
+    const pick = pickPassageSide(room, {
+      side: step.side || (step.sideRel ? viewSide(step.sideRel) : null),
+      to: step.to, floor: step.floor
+    });
+    if (!pick) { ai(room.num + ' 这间房找不到可以做洞口的墙。'); return false; }
+    const whole = step.mode === 'demolish';
+
+    /* 拆墙时"这面墙"往往不特指——先试用户/视角指的那一面，过不去就顺着这间房的
+       其它内隔墙再试，哪面能拆就说哪面。一上来就报"有风管"对用户没帮助，
+       他只想知道"到底哪面能拆"。打穿必须特指一处，所以只试一个方向。 */
+    const candSides = (() => {
+      if (!whole) return [pick];
+      const sides = room.sides || {};
+      const all = ['south', 'north', 'east', 'west'].filter(k => sides[k]);
+      const inner = all.filter(k => {
+        const x = M.walls.find(v => v.id === sides[k]);
+        return x && x.kind !== 'ext' && (x.rooms || []).filter(id => id !== room.id).length > 0;
+      });
+      return [pick].concat(inner, all).filter((v, i, a) => v && a.indexOf(v) === i);
+    })();
+
+    /* 一面墙的洞口几何：拆墙=整段留 0.3 米墙垛；打穿=指定宽度，默认 1.8 米。
+       宽度不能超过这段墙能给的量，否则校核会一直报"出房间"。 */
+    function passageGeom(wl) {
+      const sp = roomSpanOnWall(wl, room);
+      const spanLen = Math.max(0.8, sp.hi - sp.lo);
+      const hMax = Math.max(1.2, wl.h - 0.30);
+      const hh = Math.min(whole ? Math.min(2.4, hMax) : (step.height || 2.2), hMax);
+      let ww = whole ? Math.max(1.0, spanLen - 0.30) : (step.width || 1.8);
+      ww = Math.min(ww, Math.max(0.8, spanLen - 0.26));
+      let aa = whole ? (sp.lo + sp.hi) / 2 : (step.at != null ? step.at : (sp.lo + sp.hi) / 2);
+      const loA = sp.lo + ww / 2 + 0.1, hiA = sp.hi - ww / 2 - 0.1;
+      if (hiA > loA) aa = Math.min(Math.max(aa, loA), hiA);
+      return { w: ww, h: hh, at: aa };
+    }
+
+    const tried = [];
+    let best = null;
+    for (let i = 0; i < candSides.length; i++) {
+      const sd = candSides[i];
+      const wl = M.walls.find(x => x.id === (room.sides || {})[sd]);
+      if (!wl) continue;
+      const g = passageGeom(wl);
+      const r2 = neighbourOf(room, wl);
+      if (wl.kind === 'ext') {
+        tried.push({ side: sd, wall: wl, room2: r2, geo: g, ext: true, blocks: [{ t: '外墙兼承重墙，拆了整栋楼的传力路径就变了' }] });
+        continue;
+      }
+      const d = holeDecision(wl, {
+        at: g.at, w: g.w, h: g.h, sill: 0, room: room,
+        equipments: ST.placed.filter(e => e.floor === wl.floor),
+        kind: 'passage', demolish: whole
+      });
+      const rec = {
+        side: sd, wall: wl, room2: r2, geo: g, dec: d,
+        blocks: (d.blocks && d.blocks.length) ? d.blocks : (d.ok ? [] : [{ t: d.why || '这个位置打不通' }])
+      };
+      tried.push(rec);
+      if (d.ok) { best = rec; break; }
+    }
+
+    if (!best) {
+      /* 一面都不行：把用户指的那一面的原因说清楚，并且如实交代"其它几面我也试了" */
+      const f = tried[0] || null;
+      focusSoft(room);
+      if (f && f.wall) S.highlightWall(f.wall, 0xdd534f);
+      if (f && f.dec && f.dec.hits && f.dec.hits.length) showHoleConflict(f.wall, f.dec.hits, f.dec.plans);
+      const bs = (f && f.blocks && f.blocks.length) ? f.blocks : [{ t: '这个位置打不通' }];
+      const others = tried.slice(1).filter(x => !x.ext);
+      const allExt = tried.every(x => x.ext);
+      if (allExt) {
+        ai(room.num + ' 这间房四面都是外墙，拆不得——外墙兼承重，拆了整栋楼的传力路径就变了。要连通只能另找内隔墙。',
+          '<div class="res bad"><div class="res-top"><span class="k">不建议开</span><span class="tag">承重结构</span></div>' +
+          '<div class="res-adv"><s>·</s> 外墙/承重墙不允许开洞，需要结构加固与设计单位确认<br>' +
+          '<s>·</s> 这间房没有可以打通的内隔墙</div></div>');
+        chips([
+          { label: '只开个门', fn: () => send('在' + room.num + '开个门') },
+          { label: '换一间房', fn: () => send('换个房间打通') }
+        ]);
+        return false;
+      }
+      const why = bs.map(b => b.t).filter((v, i, a) => a.indexOf(v) === i);
+      ai(room.num + ' ' + N.SIDE_CN[(f && f.side) || pick] + '墙' + (whole ? '拆不了' : '这个位置打不通') + '：' + why[0] +
+        (others.length ? '。这间房另外 ' + others.length + ' 面内隔墙我也试过了，同样过不去' : '') +
+        (why.length > 1 ? '（另外：' + why.slice(1, 3).join('；') + '）' : ''),
+        '<div class="res bad"><div class="res-top"><span class="k">不建议开</span><span class="tag">有冲突</span></div>' +
+        '<div class="res-adv">' + why.map(t => '<s>·</s> ' + t).join('<br>') +
+        (others.length ? '<br><s>·</s> 另外 ' + others.length + ' 面内隔墙也都试过了' : '') + '</div></div>');
+      chips([
+        { label: '窄一点试试', fn: () => send('在' + room.num + '打个1.2米的洞') },
+        { label: '矮一点试试', fn: () => send('在' + room.num + '打个2.0米高的洞') },
+        { label: '只开个门', fn: () => send('在' + room.num + '开个门') }
+      ]);
+      return false;
+    }
+
+    const side = best.side;
+    const wall = best.wall;
+    const room2 = best.room2;
+    const dec = best.dec;
+    const w = best.geo.w;
+    const h = best.geo.h;
+    const pickedFrom = best.side !== pick;
+
+    const rerouted = dec.needReroute ? applyReroutes(dec) : 0;
+    /* 整段拆的时候，落在洞口范围内的门窗本来就没了——先把它们摘掉再开洞，
+       否则门扇、窗扇会悬在洞口里，看着像没拆干净。摘之前把参数记下来，撤销时好装回去。 */
+    let eaten = [];
+    if (whole) {
+      const lo = dec.at - w / 2 + 0.02, hi = dec.at + w / 2 - 0.02;
+      const grab = (list, atFn, kind) => list
+        .filter(d => d.wall === wall.id && d.floor === wall.floor)
+        .filter(d => { const a = atFn(d, wall); return a != null && a > lo && a < hi; })
+        .map(d => ({ kind: kind, obj: d, at: atFn(d, wall), w: d.w, h: d.h, sill: d.sill || 0, room: d.room, name: d.name, added: d.added }));
+      eaten = grab(M.doors || [], S.doorAt, 'door').concat(grab(M.windows || [], S.windowAt, 'window'));
+      eaten.forEach(e => { e.kind === 'door' ? S.removeDoor(e.obj) : S.removeWindow(e.obj); });
+    }
+    const p = S.addPassage(wall, dec.at, w, h, { to: room2 ? room2.id : null, demolish: whole });
+    focusSoft(room);
+    const sp = doorSpot(wall, dec.at);
+    if (!S.inView(wall.floor, sp.x - 2, sp.y - 2, sp.x + 2, sp.y + 2)) S.focusDoor(wall, dec.at, room);
+    if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
+    pushUndo('把刚打穿的洞补回去', () => {
+      S.removePassage(p);
+      S.markDoorSpotClear && S.markDoorSpotClear();
+      /* 拆墙时一起摘掉的门窗，撤销时装回去 */
+      eaten.forEach(e => {
+        const nd = e.kind === 'door'
+          ? S.addDoorOpening(wall, e.at, e.w, e.h)
+          : S.addWindowOpening(wall, e.at, e.w, e.h, e.sill);
+        if (nd) { if (e.room) nd.room = e.room; if (e.name) nd.name = e.name; if (e.added) nd.added = true; }
+      });
+      if (eaten.length) S.rebuildWall(wall);
+    });
+    refreshElec(dec.hits, dec.reroutes);
+
+    /* 回复里要把"连通到哪、留了多少过梁、线管怎么处理、还要补什么"一次说清 */
+    const above = wall.h - h;
+    const toTxt = room2 ? ('，和 ' + room2.num + ' 连成一片了') : '，另一侧是走廊';
+    const title = whole ? '整段拆掉了' : '打穿了';
+    const eatenTxt = eaten.length
+      ? '墙上原有的 ' + eaten.length + ' 处' + eaten.map(e => e.kind === 'door' ? '门' : '窗')
+        .filter((v, i, a) => a.indexOf(v) === i).join('/') + '一起拆掉了'
+      : '';
+    const movedWallTxt = pickedFrom
+      ? '你说的那面（' + N.SIDE_CN[pick] + '墙）过不去，我改成了' + N.SIDE_CN[side] + '墙'
+      : '';
+    const card =
+      '<div class="res ' + (dec.needReroute || dec.moved ? 'warn' : 'ok') + '">' +
+      '<div class="res-top"><span class="k">可以开</span><span class="tag">' +
+      (dec.needReroute ? '已改线' : (dec.moved ? '已挪位' : '无碰撞')) + '</span></div>' +
+      '<div class="res-grid"><div><i>洞口宽</i><b>' + w.toFixed(2) + ' m</b></div>' +
+      '<div><i>洞口高</i><b>' + h.toFixed(2) + ' m</b></div>' +
+      '<div><i>上方过梁</i><b>' + above.toFixed(2) + ' m</b></div></div>' +
+      ((dec.needReroute || dec.moved)
+        ? '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+        (dec.hits || []).map(c => '<s>·</s> ' + (window.BIM.elec ? window.BIM.elec.KIND_CN[c.kind] : '') +
+          '线管 ' + c.circuit + ' 已' + (dec.needReroute ? '改道' : '避让')).join('<br>') +
+        (dec.needReroute ? '<br><s>·</s> 绿色是改完的新走向，多走 ' +
+          dec.reroutes.reduce((s, x) => s + (x.ok ? x.addLen : 0), 0).toFixed(2) + ' 米线' : '') + '</div>'
+        : '') +
+      '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+      (movedWallTxt ? '<s>·</s> ' + movedWallTxt + '<br>' : '') +
+      dec.chk.warns.slice(0, 3).map(x => '<s>·</s> ' + x).join('<br>') +
+      (eatenTxt ? '<br><s>·</s> ' + eatenTxt : '') + '</div></div>';
+
+    ai(room.num + ' ' + N.SIDE_CN[side] + '墙' + title + '：洞口 ' + w.toFixed(2) + '×' + h.toFixed(2) +
+      ' 米' + toTxt + '。上面留了 ' + above.toFixed(2) + ' 米过梁' +
+      (eatenTxt ? '，' + eatenTxt : '') +
+      (dec.moved ? '，' + dec.moveNote : '') +
+      (dec.needReroute ? '，墙里的 ' + dec.hits.length + ' 根线管已经改道（' + dec.rerouteNote + '）' : '') +
+      '。' + (movedWallTxt ? movedWallTxt + '。' : '') + (dec.chk.warns[0] || ''), card);
+
+    lastData = {
+      passage: p.name, room: room.num, side: side, width: +w.toFixed(2), height: +h.toFixed(2),
+      above_m: +above.toFixed(2), to: room2 ? room2.num : null, demolish: whole,
+      moved: dec.moved ? +dec.movedBy.toFixed(2) : 0,
+      rerouted: rerouted,
+      conduit_hit: (dec.hits || []).map(c => c.circuit),
+      removed_openings: eaten.length,
+      side_changed: pickedFrom ? { from: pick, to: side } : null,
+      warns: dec.chk.warns
+    };
+    A.commit(step, { room: room, side: side });
+    return true;
+  }
+
+  /* ================= 电路：查分路 / 切分路 =================
+     用户说"3 楼照明是哪路电""把这路断电看看影响谁""这间房有几路电"都走这里。
+     切分路要同时做三件事：分路变色、关联房间高亮、楼体半透明——
+     不然光把线管变灰，看不出"这几间跟着黑了"。 */
+  function circuitSummary(circ) {
+    const E = window.BIM.elec;
+    const rooms = E.circuitRooms(circ.id);
+    return {
+      id: circ.id, name: circ.name, kind: E.KIND_CN[circ.kind], on: circ.on !== false,
+      panel: circ.panel, phase: circ.phase, rated: circ.rated,
+      rooms: rooms.map(r => r.num), room_names: rooms.map(r => r.name),
+      conduits: circ.conduits.length
+    };
+  }
+
+  async function stepCircuits(step) {
+    const E = window.BIM.elec;
+    if (!E) { ai('电路这一层没加载起来。'); return false; }
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
+
+    /* 指名某一间 → 说这间由哪几路电供；否则列这层的分路 */
+    if (room && step.scope !== 'floor') {
+      const cs = E.roomsCircuits(room);
+      if (!cs.length) {
+        ai(room.num + ' 这间没查到分路（可能是走廊或设备夹层）。');
+        return false;
+      }
+      S.circuitView(null, [room]);
+      const pw = E.roomPower(room);
+      const dead = cs.filter(c => c.on === false);
+      /* 每路在这间房里管什么，一起说清楚——不然"有几路电"答完也没用 */
+      const perRoom = c => E.KIND_CN[c.kind] + (c.on === false ? '（已断开，这部分现在不能用）' : '');
+      ai(room.num + ' 由 ' + cs.length + ' 路电供：' +
+        cs.map(c => c.name + '（' + c.id + '，' + (c.on === false ? '已断开' : '正常') + '）').join('、') +
+        '。' + cs.map(perRoom).join('、') + '。' +
+        (dead.length ? '现在断着 ' + dead.length + ' 路，这间房的' +
+          dead.map(c => E.KIND_CN[c.kind]).join('/') + '是停的。'
+          : '三路都通，照明、插座、动力都正常。') +
+        '要断哪一路，说"把 ' + room.num + ' 的照明断电"。',
+        '<div class="res ok"><div class="res-top"><span class="k">' + room.num + '</span><span class="tag">' + cs.length + ' 路</span></div>' +
+        '<div class="res-grid">' + cs.map(c => '<div><i>' + E.KIND_CN[c.kind] + ' ' + c.id + '</i><b>' +
+          (c.on === false ? '断开' : '通电') + '</b></div>').join('') + '</div>' +
+        '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+        '<s>·</s> 每路管一类用电：照明是灯、插座是墙面取电、动力是空调和大设备，断一路只停那一类' +
+        (dead.length ? '<br><s>·</s> 当前停用：' + dead.map(c => E.KIND_CN[c.kind]).join('、') : '') +
+        '</div></div>');
+      lastData = { room: room.num, circuits: cs.map(circuitSummary), lost: pw.lost, still: pw.still };
+      return true;
+    }
+
+    const list = E.list(floor);
+    if (!list.length) { ai(floor + ' 楼没有分路数据。'); return false; }
+    S.circuitView(null, []);
+    S.setFocus(floor, false);
+    ai(floor + ' 楼共 ' + list.length + ' 路电：' + list.map(c =>
+      c.id + ' ' + c.kind_cn + (c.on ? '' : '（已断）')).join('、') + '。要断哪一路，说"把 3 楼照明断电"。',
+      '<div class="res ok"><div class="res-top"><span class="k">' + floor + 'F 配电</span><span class="tag">' + list.length + ' 路</span></div>' +
+      '<div class="res-grid">' + list.map(c => '<div><i>' + c.id + ' ' + c.kind_cn + '</i><b>' +
+        c.room_nums.length + ' 间</b></div>').join('') + '</div></div>');
+    lastData = { floor: floor, circuits: list };
+    return true;
+  }
+
+  async function stepToggleCircuit(step) {
+    const E = window.BIM.elec;
+    if (!E) { ai('电路这一层没加载起来。'); return false; }
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
+    const wantOff = step.power === 'off' || step.action === 'close' || step.action === 'off';
+    /* 找路：给了 id 就用 id；否则按"这间房 + 类型（照明/插座/动力）"匹配 */
+    let circ = null;
+    if (step.circuit) circ = E.circuit(step.circuit) || E.circuit(String(step.circuit).toUpperCase());
+    if (!circ) {
+      const kind = step.kind || (/照明|灯/.test(step.text || '') ? 'light'
+        : (/插座/.test(step.text || '') ? 'socket' : (/动力|设备|空调/.test(step.text || '') ? 'power' : null)));
+      const pool = E.list(floor).filter(c => !kind || c.kind === kind);
+      if (room) {
+        const mine = pool.filter(c => (c.room_nums || []).indexOf(room.num) >= 0);
+        circ = E.circuit((mine[0] || pool[0] || {}).id) || null;
+      } else {
+        circ = E.circuit((pool[0] || {}).id) || null;
+      }
+    }
+    if (!circ) {
+      ai((room ? room.num + ' 这间' : floor + ' 楼') + ' 找不到对应的分路。要不要先看看有哪些分路？');
+      chips([
+        { label: '列这层分路', fn: () => send(floor + '楼有哪些分路') },
+        { label: '断照明试试', fn: () => send('把' + floor + '楼的照明断电') }
+      ]);
+      return false;
+    }
+
+    const before = circ.on !== false;
+    E.toggle(circ.id, wantOff ? false : (step.power === 'on' || step.action === 'open' ? true : !before));
+    const nowOn = circ.on !== false;
+    const rooms = E.circuitRooms(circ.id);
+
+    /* 半透明楼体 + 只亮这一路 + 关联房间铺底 —— 这就是"看清电走到哪几间" */
+    S.circuitView(circ, rooms);
+
+    /* 影响面按"功能"算：一层只有一条照明、一条插座、一条动力，
+       断了一条不等于这间房没电，而是这间房少了这一类功能。
+       所以措辞只能按"这一类功能没了 / 其它几类还在"来讲，不能既说"会变黑"又说"不会黑"。 */
+    const imp = E.impact(circ.id) || { rooms: [], count: 0, dark_rooms: [], bare_rooms: [], partial_rooms: [] };
+    const K = circ.kind;
+    const LOSS = {
+      light: { gone: '灯全灭，这些房间会直接变黑', keep: '插座和动力还在，只是没灯' },
+      socket: { gone: '墙上的插座全部没电，插电的设备会停', keep: '照明还在，房间不会黑' },
+      power: { gone: '空调和大功率设备停', keep: '照明和插座还在' }
+    }[K] || { gone: '这一路功能停用', keep: '其它分路不受影响' };
+    const dark = nowOn ? [] : imp.dark_rooms;
+    const bare = nowOn ? [] : imp.bare_rooms;
+
+    const short = arr => arr.slice(0, 4).join('、') + (arr.length > 4 ? ' 等 ' + arr.length + ' 间' : '');
+    const rows = rooms.slice(0, 12).map(r => {
+      const pw = E.roomPower(r);
+      const st = nowOn ? '正常' : (pw.lost.length ? pw.lost.join('+') + '停' : '正常');
+      const tail = nowOn ? '' : (pw.still.length ? '剩 ' + pw.still.join('/') : '全停');
+      return '<div><i>' + r.num + '</i><b>' + st + '</b><s style="font-weight:400;color:#8a929b">' + tail + '</s></div>';
+    }).join('');
+    const card =
+      '<div class="res ' + (nowOn ? 'ok' : (dark.length ? 'warn' : 'ok')) + '">' +
+      '<div class="res-top"><span class="k">' + circ.id + ' ' + (nowOn ? '已合闸' : '已断电') + '</span>' +
+      '<span class="tag">' + E.KIND_CN[K] + ' · ' + circ.phase + '</span></div>' +
+      '<div class="res-grid">' + rows + '</div>' +
+      '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+      '<s>·</s> ' + circ.name + '（' + circ.id + '）带 ' + imp.count + ' 间房' +
+      (nowOn ? '，现已全部恢复'
+        : '，断了之后这 ' + imp.count + ' 间房的' + (E.KIND_CN[K] || '') + '同时停用——' + LOSS.gone) +
+      (nowOn ? '' : '<br><s>·</s> ' + LOSS.keep) +
+      (bare.length ? '<br><s>·</s> 其中 ' + bare.length + ' 间本来就只有这一路，等于彻底没电' : '') +
+      '<br><s>·</s> 照明/插座/动力按颜色区分，绿色底是关联房间，其余楼体已半透明</div></div>';
+
+    ai(circ.name + '（' + circ.id + '）' + (nowOn ? ' 合上了：' : ' 断了：') +
+      '这条分路带 ' + imp.count + ' 间房（' + short(implicitRoomNums(rooms)) + '）' +
+      (nowOn ? '，现在全部恢复。'
+        : '，' + LOSS.gone + '；' + LOSS.keep + '。') +
+      '楼体已半透明，顺着颜色能看到这路线走到哪。', card);
+
+    lastData = {
+      circuit: circ.id, name: circ.name, kind: E.KIND_CN[circ.kind], on: nowOn,
+      panel: circ.panel, phase: circ.phase, rated: circ.rated,
+      rooms: implicitRoomNums(rooms),
+      dark_rooms: dark,
+      bare_rooms: bare,
+      partial_rooms: imp.partial_rooms,
+      function_lost: nowOn ? null : (E.KIND_CN[circ.kind] || ''),
+      still_powered: rooms.filter(r => E.roomPower(r).on.length > 0).map(r => r.num)
+    };
+    return true;
+  }
+
+  function implicitRoomNums(rooms) { return (rooms || []).map(r => r.num); }
+
+  /* 查一面墙里到底埋了什么。开洞前先看一眼，比开了再撞上强 */
+  async function stepConduits(step) {
+    const E = window.BIM.elec;
+    if (!E) { ai('电路这一层没加载起来。'); return false; }
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    if (!room) { ai('要查哪一间房的墙？说个房间号。'); return false; }
+    const side = pickPassageSide(room, {
+      side: step.side || (step.sideRel ? viewSide(step.sideRel) : null),
+      to: step.to, floor: step.floor
+    }) || 'south';
+    const wall = M.walls.find(w => w.id === (room.sides || {})[side]);
+    if (!wall) { ai(room.num + ' 这间房找不到对应的墙。'); return false; }
+
+    const list = (E.conduitsOf({ floor: wall.floor }) || []).filter(c => c.wall === wall.id);
+    S.circuitView(null, [room]);
+    S.ghostWall(wall, true);
+    S.showConduits(true);
+    if (list.length) S.markConduits(list, 0xff3b30);
+
+    if (!list.length) {
+      ai(room.num + ' ' + N.SIDE_CN[side] + '墙里没查到预埋线管，开洞不会碰到电。',
+        '<div class="res ok"><div class="res-top"><span class="k">无预埋</span><span class="tag">可以开</span></div>' +
+        '<div class="res-adv"><s>·</s> 墙内没有照明/插座/动力线管经过</div></div>');
+      lastData = { room: room.num, side: side, conduits: [] };
+      return true;
+    }
+
+    const byCirc = {};
+    list.forEach(c => {
+      const k = c.circuit;
+      (byCirc[k] = byCirc[k] || []).push(c);
+    });
+    const rows = Object.keys(byCirc).map(id => {
+      const cs = byCirc[id];
+      const circ = E.circuit(id) || {};
+      const kinds = [];
+      cs.forEach(c => { const k = E.KIND_CN[c.kind]; if (kinds.indexOf(k) < 0) kinds.push(k); });
+      return '<div><i>' + id + ' ' + (E.KIND_CN[circ.kind] || '') + '</i><b>' +
+        cs.length + ' 段 · ' + kinds.join('/') + '</b></div>';
+    }).join('');
+    const zs = list.map(c => c.z).sort((a, b) => a - b);
+    ai(room.num + ' ' + N.SIDE_CN[side] + '墙里埋着 ' + list.length + ' 段线管，分属 ' +
+      Object.keys(byCirc).length + ' 条分路：' + Object.keys(byCirc).map(id => id).join('、') +
+      '，高度大致在 ' + C.fmt(zs[0], 2) + '~' + C.fmt(zs[zs.length - 1], 2) + ' 米之间。' +
+      '在这个高度范围内开洞就会撞上，我已经标红了。',
+      '<div class="res warn"><div class="res-top"><span class="k">墙内有线管</span><span class="tag">' +
+      list.length + ' 段</span></div><div class="res-grid">' + rows + '</div>' +
+      '<div class="res-adv" style="border-top:1px solid #eef1f5"><s>·</s> 红色为线管位置，墙体已半透明' +
+      '<br><s>·</s> 要在这里开洞的话，系统会先算能不能改线，改不动才建议换个位置</div></div>');
+    lastData = {
+      room: room.num, side: side,
+      conduits: list.map(c => ({ id: c.id, circuit: c.circuit, kind: E.KIND_CN[c.kind], at0: +c.at0.toFixed(2), at1: +c.at1.toFixed(2), z: c.z }))
+    };
     return true;
   }
 
@@ -2818,6 +3513,12 @@
     const want = step && step.target;
     if (want) {
       const list = ST.placed || [];
+      const cur = A.mem.lastPlaced || ST.sel;
+      /* 现场可能已经摆着好几台同名设备（演示里很常见）。
+         用户说"把这台挪一下"，指的一定是眼下这间、刚放上去的这台，
+         不能因为地上别处还有一台更早放的就被抢走。 */
+      const hitCur = cur && (cur.name === want || (cur.name || '').indexOf(want) >= 0 || want.indexOf(cur.name) >= 0);
+      if (hitCur) return cur;
       let hit = list.find(e => e.name === want) || list.find(e => (e.name || '').indexOf(want) >= 0)
         || list.find(e => want.indexOf(e.name) >= 0);
       if (!hit) {
@@ -4283,6 +4984,12 @@
   /* ---------------- 启动 ---------------- */
   function boot() {
     S.init($('cv'));
+    // 医院那批重型设备并进型号库，放置/校核/净矩全部复用现有链路
+    if (window.BIM.detail && window.BIM.detail.mergeLibrary) window.BIM.detail.mergeLibrary(M);
+    // 墙里那些线管要先算出来：开窗/开门/拆墙的校核都要问它，晚一步就会漏判
+    if (window.BIM.elec) {
+      try { window.BIM.elec.build(); } catch (e) { console.warn('elec build failed', e && e.message); }
+    }
     S.onPick = onPick;
     TTS.init();
     buildFloors();
@@ -4516,6 +5223,20 @@
       }),
       query_door: a => runTool({ act: 'doorinfo', text: '', door: a.door, room: a.room }),
       list_doors: a => runTool({ act: 'doors', text: '', room: a.room, floor: a.floor }),
+
+      /* ---- 墙：打穿 / 拆墙 ---- */
+      open_passage: a => runTool({
+        act: 'passage', text: '', room: a.room, floor: a.floor, to: a.to, side: a.side,
+        width: a.width, height: a.height, mode: a.mode === 'demolish' ? 'demolish' : 'cut'
+      }),
+
+      /* ---- 电路 ---- */
+      query_circuits: a => runTool({ act: 'circuit', text: '', room: a.room, floor: a.floor, scope: a.scope }),
+      toggle_circuit: a => runTool({
+        act: 'circuitset', text: '', circuit: a.circuit, room: a.room, floor: a.floor,
+        kind: a.kind, action: a.action === 'on' ? 'on' : 'off'
+      }),
+      query_conduits: a => runTool({ act: 'conduits', text: '', room: a.room, floor: a.floor, side: a.side }),
 
       /* ---- 视图 / 拓扑 ---- */
       focus_view: a => runTool({
