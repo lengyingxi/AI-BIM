@@ -238,13 +238,39 @@ def asr_cn(t):
     return t if any(c.isascii() and c.isalpha() for c in t) else t.replace(' ', '')
 
 
+def _pcm_to_float(data):
+    """int16 PCM 字节 → [-1,1] 的浮点波形。
+
+    有 numpy 就走 numpy（快）；没有就用标准库 array 兜底。
+    这一条是必需的：sherpa-onnx 2.x 不再把 numpy 装成依赖，
+    缺了它 accept_waveform 拿不到数据，识别会**静默返回空字符串**——
+    接口不报错、耗时 0ms、页面上就是"一直听但什么都不出来"，极难查。
+    """
+    if not data:
+        return None
+    try:
+        import numpy as np
+        a = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        return a if a.size else None
+    except Exception:
+        pass
+    import array
+    a = array.array('h')
+    try:
+        a.frombytes(data)
+    except Exception:
+        return None
+    if sys.byteorder == 'big':
+        a.byteswap()
+    return [v / 32768.0 for v in a] or None
+
+
 def _sherpa_feed(s, data):
     """流式喂 PCM(int16 mono 16k)，返回这半句目前的最佳文字（本身是累计的）"""
-    import numpy as np
     rec = ASR['rec']
     st = s['st']
-    a = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-    if a.size == 0:
+    a = _pcm_to_float(data)
+    if a is None:
         return s['text'], ''
     st.accept_waveform(16000, a)
     while rec.is_ready(st):
