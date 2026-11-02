@@ -3006,15 +3006,16 @@
     const pid = list[0].panel || ('AL-' + floor);
     const corrN = list.reduce((a, c) => a + ((c.layers || {}).corridor || 0), 0);
     ai(floor + ' 楼共 ' + list.length + ' 路电：' + list.map(c =>
-      c.id + ' ' + c.kind_cn + (c.on ? '' : '（已断）')).join('、') +
+      '第' + (c.no || 1) + '回路（' + c.kind_cn + '）' + (c.on ? '' : '已断')).join('、') +
       '。走向是：电气竖井里的主干立管下来，进本层配电箱 ' + pid +
       '，再沿走廊桥架横铺一圈（' + corrN + ' 段干线），最后从走廊分进各房间。' +
-      '要断哪一路，说"把 ' + floor + ' 楼照明断电"。',
+      '要断哪一路，说"把 ' + floor + ' 楼第 1 回路断电"。',
       '<div class="res ok"><div class="res-top"><span class="k">' + floor + 'F 配电</span><span class="tag">' + list.length + ' 路</span></div>' +
-      '<div class="res-grid">' + list.map(c => '<div><i>' + c.id + ' ' + c.kind_cn + '</i><b>' +
-        c.room_nums.length + ' 间</b></div>').join('') + '</div>' +
+      '<div class="res-grid">' + list.map(c => '<div><i>第' + (c.no || 1) + '回路 ' + c.kind_cn + '</i><b>' +
+        (c.on ? c.room_nums.length + ' 间' : '已断开') + '</b></div>').join('') + '</div>' +
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-      '<s>·</s> 主干立管（竖井）→ ' + pid + ' → 走廊干线 → 房间支线' +
+      '<s>·</s> ' + pid + ' 上从左数第 1/2/3 个手柄，就是这三路' +
+      '<br><s>·</s> 主干立管（竖井）→ ' + pid + ' → 走廊干线 → 房间支线' +
       '<br><s>·</s> 干线在吊顶里分层走桥架，比房间支线粗；开关房门碰不到它</div></div>');
     lastData = { floor: floor, circuits: list };
     return true;
@@ -3027,12 +3028,22 @@
     const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
     const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
     const wantOff = step.power === 'off' || step.action === 'close' || step.action === 'off';
-    /* 找路：给了 id 就用 id；否则按"这间房 + 类型（照明/插座/动力）"匹配 */
+    const txt = step.text || '';
+
+    /* 找路：给了 id 用 id；说了"第几回路"按编号找；否则按房间 + 类型匹配。
+       现场是按编号叫的（"2 楼第一个回路"），不是按 L2A 叫的。 */
     let circ = null;
     if (step.circuit) circ = E.circuit(step.circuit) || E.circuit(String(step.circuit).toUpperCase());
     if (!circ) {
-      const kind = step.kind || (/照明|灯/.test(step.text || '') ? 'light'
-        : (/插座/.test(step.text || '') ? 'socket' : (/动力|设备|空调/.test(step.text || '') ? 'power' : null)));
+      const no = step.circuitNo || (() => {
+        const m = txt.match(/第\s*([一二三四五六1-6])\s*回/) || txt.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/);
+        return m ? (N.CN_NUM ? N.CN_NUM[m[1]] : ({ 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }[m[1]] || +m[1])) : null;
+      })();
+      if (no) circ = E.circuitByNo(floor, no);
+    }
+    if (!circ) {
+      const kind = step.kind || (/照明|灯/.test(txt) ? 'light'
+        : (/插座/.test(txt) ? 'socket' : (/动力|设备|空调/.test(txt) ? 'power' : null)));
       const pool = E.list(floor).filter(c => !kind || c.kind === kind);
       if (room) {
         const mine = pool.filter(c => (c.room_nums || []).indexOf(room.num) >= 0);
@@ -3045,18 +3056,24 @@
       ai((room ? room.num + ' 这间' : floor + ' 楼') + ' 找不到对应的分路。要不要先看看有哪些分路？');
       chips([
         { label: '列这层分路', fn: () => send(floor + '楼有哪些分路') },
-        { label: '断照明试试', fn: () => send('把' + floor + '楼的照明断电') }
+        { label: '断第1回路', fn: () => send('把' + floor + '楼第1回路断电') }
       ]);
       return false;
     }
 
     const before = circ.on !== false;
-    E.toggle(circ.id, wantOff ? false : (step.power === 'on' || step.action === 'open' ? true : !before));
-    const nowOn = circ.on !== false;
+    const nowOn = wantOff ? false : (step.power === 'on' || step.action === 'open' ? true : !before);
+    E.toggle(circ.id, nowOn);
     const rooms = E.circuitRooms(circ.id);
 
-    /* 半透明楼体 + 只亮这一路 + 关联房间铺底 —— 这就是"看清电走到哪几间" */
-    S.circuitView(circ, rooms);
+    /* ── ① 先聚焦到这一层的配电箱，② 再把箱子重画一遍让那一路的手柄落下来 ──
+       用户要的是"先看到箱子、看到开关被拉下来"，再谈影响了哪几间房。
+       顺序不能反：refreshPanels 必须在 toggle 之后，几何是按当前状态烘的。 */
+    const panel = S.focusPanel(circ.floor);
+    S.refreshPanels(circ.floor);
+    /* 图纸上这一路也一起标出来（半透明楼体 + 只有这一路亮着） */
+    S.showConduits(true);
+    S.syncCircuitPower();
 
     /* 影响面按"功能"算：一层只有一条照明、一条插座、一条动力，
        断了一条不等于这间房没电，而是这间房少了这一类功能。
@@ -3078,29 +3095,45 @@
       const tail = nowOn ? '' : (pw.still.length ? '剩 ' + pw.still.join('/') : '全停');
       return '<div><i>' + r.num + '</i><b>' + st + '</b><s style="font-weight:400;color:#8a929b">' + tail + '</s></div>';
     }).join('');
+
+    /* 断路器位置说明：手柄从左到右就是第 1/2/3 回路，在箱子上看得见 */
+    const swRow = (E.list(circ.floor) || []).map((c, i) =>
+      '<div><i>第' + (i + 1) + '路 ' + c.kind_cn + '</i><b>' + (c.on ? '合闸' : '已断开') + '</b></div>').join('');
+
     const card =
       '<div class="res ' + (nowOn ? 'ok' : (dark.length ? 'warn' : 'ok')) + '">' +
       '<div class="res-top"><span class="k">' + circ.id + ' ' + (nowOn ? '已合闸' : '已断电') + '</span>' +
-      '<span class="tag">' + E.KIND_CN[K] + ' · ' + circ.phase + '</span></div>' +
+      '<span class="tag">' + (circ.label || circ.name) + ' · ' + circ.phase + '</span></div>' +
       '<div class="res-grid">' + rows + '</div>' +
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-      '<s>·</s> ' + circ.name + '（' + circ.id + '）带 ' + imp.count + ' 间房' +
-      (nowOn ? '，现已全部恢复'
-        : '，断了之后这 ' + imp.count + ' 间房的' + (E.KIND_CN[K] || '') + '同时停用——' + LOSS.gone) +
+      '<s>·</s> 配电箱 ' + circ.panel + ' 上第 ' + (circ.no || 1) + ' 个分路手柄（总开关右边那个）已' +
+      (nowOn ? '合上' : '落下（红色）') + '，指示灯同步' + (nowOn ? '变绿' : '变红') +
+      (nowOn ? '' : '；这一路带 ' + imp.count + ' 间房的' + (E.KIND_CN[K] || '') + '，' + LOSS.gone) +
       (nowOn ? '' : '<br><s>·</s> ' + LOSS.keep) +
       (bare.length ? '<br><s>·</s> 其中 ' + bare.length + ' 间本来就只有这一路，等于彻底没电' : '') +
-      '<br><s>·</s> 亮着的是这条分路：竖井里的主干立管 → 配电箱 ' + circ.panel +
-      ' → 走廊吊顶里的干线 → 墙上分进各房间的支线' +
-      '<br><s>·</s> 照明/插座/动力按颜色区分，绿色底是关联房间，其余楼体已半透明</div></div>';
+      '<br><s>·</s> 整条路径：竖井主干立管 → 层进线 → ' + circ.panel +
+      ' → 走廊吊顶干线 → 墙内下引 → 各房间支线' +
+      '<br><s>·</s> 点下面的「查看回路影响」可以只看这一条路走到哪几间房</div>' +
+      '<div class="res-grid" style="border-top:1px solid #eef1f5">' + swRow + '</div></div>';
 
     ai(circ.name + '（' + circ.id + '）' + (nowOn ? ' 合上了：' : ' 断了：') +
       '这条分路带 ' + imp.count + ' 间房（' + short(implicitRoomNums(rooms)) + '）' +
       (nowOn ? '，现在全部恢复。'
         : '，' + LOSS.gone + '；' + LOSS.keep + '。') +
-      '楼体已半透明，顺着颜色能看到这路线走到哪。', card);
+      '镜头已经站到 ' + (panel ? panel.name : circ.panel) + ' 前面，箱子上第 ' + (circ.no || 1) +
+      ' 个手柄已经落到断开位。', card);
+
+    chips([
+      { label: '查看回路影响', fn: () => showCircuitImpact(circ.id) },
+      nowOn
+        ? { label: '断掉这一路', fn: () => send('把' + circ.floor + '楼第' + (circ.no || 1) + '回路断电') }
+        : { label: '恢复这一路', fn: () => send('把' + circ.floor + '楼第' + (circ.no || 1) + '回路送电') },
+      { label: '看这层所有分路', fn: () => send(circ.floor + '楼有哪些分路') }
+    ]);
 
     lastData = {
-      circuit: circ.id, name: circ.name, kind: E.KIND_CN[circ.kind], on: nowOn,
+      circuit: circ.id, name: circ.name, label: circ.label, no: circ.no,
+      kind: E.KIND_CN[circ.kind], on: nowOn,
       panel: circ.panel, phase: circ.phase, rated: circ.rated,
       rooms: implicitRoomNums(rooms),
       dark_rooms: dark,
@@ -3110,6 +3143,60 @@
       still_powered: rooms.filter(r => E.roomPower(r).on.length > 0).map(r => r.num)
     };
     return true;
+  }
+
+  /* 「查看回路影响」气泡的动作：把主干线 + 这一路的支路 + 受影响房间单独亮出来。
+     和"断电"分开两步 —— 先看清箱子上的开关，再看这一路到底喂了哪些房间。 */
+  function showCircuitImpact(circId) {
+    const E = window.BIM.elec;
+    if (!E) return;
+    const circ = E.circuit(circId);
+    if (!circ) { ai('找不到这条分路，可能模型刚重建过。'); return; }
+    const rooms = E.circuitRooms(circ.id);
+    const list = S.circuitRoute(circ, rooms) || [];
+    const cnt = k => list.filter(c => c.layer === k).length;
+    const on = circ.on !== false;
+    const nums = rooms.map(r => r.num);
+
+    /* 每一段路由都点名：干线几段、下引几处、支线几段，别只说"带 11 间房"。
+       计数为 0 的层级不列 —— 照明支线 2.90 紧贴干线 3.00，本来就不需要下引，
+       列一行"墙内下引 0 处"只会让人以为漏了。 */
+    const rows = [
+      ['主干立管', cnt('trunk'), '段'],
+      ['层进线', cnt('feed'), '段'],
+      ['配电箱', 1, '台'],
+      ['走廊干线', cnt('corridor'), '段'],
+      ['墙内下引', cnt('drop'), '处'],
+      ['房间支线', cnt('room'), '段'],
+      ['影响房间', rooms.length, '间']
+    ].filter(r => r[1] > 0)
+      .map(r => '<div><i>' + r[0] + '</i><b>' + r[1] + ' ' + r[2] + '</b></div>').join('');
+
+    const where = circ.kind === 'light'
+      ? '照明支线走吊顶（2.90 m），紧贴走廊干线（3.00 m），不需要单独下引'
+      : '通过墙内下引从走廊桥架接到房间支线';
+
+    const card =
+      '<div class="res ' + (on ? 'ok' : 'warn') + '">' +
+      '<div class="res-top"><span class="k">' + (circ.label || circ.id) + ' 完整路由</span>' +
+      '<span class="tag">' + (on ? '带电' : '已断电') + '</span></div>' +
+      '<div class="res-grid">' + rows + '</div>' +
+      '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+      '<s>·</s> 影响的房间：' + nums.slice(0, 12).join('、') + (nums.length > 12 ? ' 等 ' : '') +
+      '<br><s>·</s> ' + where +
+      '<br><s>·</s> 图上只留下这一条路（主干 + 本回路），其它回路已收起；绿色地面就是受影响的房间' +
+      '</div></div>';
+
+    ai((circ.label || circ.name) + ' 的完整路由已单独显示：竖井主干立管 → 层进线 → ' +
+      circ.panel + ' → 走廊干线 → ' + (cnt('drop') ? '墙内下引 → ' : '') + '各房间支线，' +
+      '一共照亮 ' + rooms.length + ' 间房' + (on ? '。' : '（这一路现在是断电状态）。'),
+      card);
+
+    lastData = {
+      circuit: circ.id, no: circ.no, label: circ.label, on: on,
+      route: { trunk: cnt('trunk'), feed: cnt('feed'), corridor: cnt('corridor'), drop: cnt('drop'), room: cnt('room') },
+      rooms: nums
+    };
   }
 
   function implicitRoomNums(rooms) { return (rooms || []).map(r => r.num); }
@@ -5335,7 +5422,7 @@
       query_circuits: a => runTool({ act: 'circuit', text: '', room: a.room, floor: a.floor, scope: a.scope }),
       toggle_circuit: a => runTool({
         act: 'circuitset', text: '', circuit: a.circuit, room: a.room, floor: a.floor,
-        kind: a.kind, action: a.action === 'on' ? 'on' : 'off'
+        circuitNo: a.circuit_no, kind: a.kind, action: a.action === 'on' ? 'on' : 'off'
       }),
       query_conduits: a => runTool({ act: 'conduits', text: '', room: a.room, floor: a.floor, side: a.side }),
 

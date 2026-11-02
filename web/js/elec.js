@@ -127,6 +127,44 @@
   }
   E.splitByOpenings = splitByOpenings;
 
+  /* 扫一面墙：把可用区间切成"保留段"和"缺口段"。
+     缺口段要拿来做绕行——真实施工碰上门窗洞不会把线剪断，
+     而是上翻（或下翻）绕过去再落回来。原来只切不断，所以线看着一截一截的。
+
+     返回 { segs: [[at0,at1]...], gaps: [{at0,at1,top,sill}] }
+       top  = 洞口顶标高（绕行要爬到它上面）
+       sill = 洞口底标高（下翻时用） */
+  function scanWall(wall, a, b, z, s) {
+    const L = axis(wall).L;
+    let lo = Math.max(0, a), hi = Math.min(L, b);
+    if (hi - lo < 1e-6) return { segs: [], gaps: [] };
+    const zc = z - (s || 0) / 2 - 0.02, zH = z + (s || 0) / 2 + 0.02;
+    const ops = (wall.openings || []).slice()
+      .filter(o => {
+        const sill = o.sill || 0;
+        return !(sill + (o.h || 2.1) <= zc || sill >= zH);   // 高度不重叠 → 不算挡路
+      })
+      .sort((p, q) => p.at - q.at);
+    const segs = [], gaps = [];
+    let cur = lo;
+    for (const o of ops) {
+      const o0 = o.at - o.w / 2 - GUARD, o1 = o.at + o.w / 2 + GUARD;
+      if (o1 <= cur) continue;
+      if (o0 > cur) {
+        segs.push([cur, Math.min(o0, hi)]);
+        /* 只有整段洞口都在本次铺管范围内，才有地方做绕行 */
+        if (o0 >= lo && o1 <= hi) {
+          gaps.push({ at0: o0, at1: o1, top: (o.sill || 0) + (o.h || 2.1), sill: o.sill || 0 });
+        }
+      }
+      cur = Math.max(cur, o1);
+      if (cur >= hi) break;
+    }
+    if (cur < hi) segs.push([cur, hi]);
+    return { segs: segs.filter(x => x[1] - x[0] >= 0.3), gaps: gaps };
+  }
+  E.scanWall = scanWall;
+
   /* 一面墙上有哪些房间，各自占哪一段。
      做法：房间四角投到墙轴上取并集，再看房间是否真的贴在这面墙上
      （四角到墙线的垂直距离最小值 < 0.35 m）——长墙串多间房时全靠这个分。 */
@@ -183,7 +221,7 @@
   /* 模型换过（导入 IFC）之后必须重建：几何全变了，旧线管一根都不能留 */
   E.build = function () {
     const m = M();
-    const D = { panels: [], circuits: [], conduits: [], risers: [], reroutes: {}, state: {}, trunk: null };
+    const D = { panels: [], circuits: [], conduits: [], risers: [], joints: [], reroutes: {}, state: {}, trunk: null };
     if (!m || !m.walls) { E.data = D; return D; }
 
     const allRooms = m.rooms || [], allWalls = m.walls || [];
@@ -223,11 +261,14 @@
     D.trunk = { x: tx, y: ty, s: 0.16, d: 0.16 };
 
     /* ---- 通用铺管：沿一面墙铺一段**连续**线管 ----
-       这是全文件唯一拼 at 区间的地方。以前每处自己算 cover/中点，才会一段一段。 */
+       这是全文件唯一拼 at 区间的地方。以前每处自己算 cover/中点，才会一段一段。
+       遇到门窗洞会切成两段，再在洞口两端各补一段"绕行"把两段接起来——
+       所以不管中间隔了多少洞口，这条管在墙里是通的。 */
     function runWall(wall, a, b, kind, circ, z, sec, layer, room) {
       if (!wall || !circ) return;
       if (z + sec.s / 2 > (wall.h || 3) - 0.03) return;      // 墙比这还矮就别铺了
-      splitByOpenings(wall, a, b, z, sec.s).forEach(([s0, s1]) => {
+      const sc = scanWall(wall, a, b, z, sec.s);
+      sc.segs.forEach(([s0, s1]) => {
         if (s1 - s0 < 0.25) return;
         const tag = layer === 'corridor' ? 'C' : 'R';
         const id = 'CD-' + wall.id + '-' + kind + '-' + tag + '-' +
@@ -242,6 +283,53 @@
         D.conduits.push(c);
         circ.conduits.push(id);
         if (room && circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+      });
+      /* 缺口处绕过去：三段折线（竖-横-竖），落在洞口上方或下方。
+         绕行段标 detour=true（查询和统计要靠它区分"这是绕过洞口的一小段"），
+         颜色仍用本回路色 —— 它本来就是这根管子的一部分，不是"规划中的改线"；
+         真正的改线方案（开洞前给的备选走向）才用绿色。 */
+      sc.gaps.forEach(g => detourAt(wall, g, z, sec, circ, layer, room));
+    }
+
+    /* 洞口绕行：上翻或下翻跨过洞口，再落回原标高。
+       哪边翻得过去走哪边；两边都不行（洞做到顶又贴地）就留缺口，不硬绕。 */
+    function detourAt(wall, g, z, sec, circ, layer, room) {
+      if (!circ) return;
+      const half = (sec.s || 0) / 2;
+      const up = g.top + 0.12 + half + 0.03;
+      const dn = g.sill - 0.12 - half - 0.03;
+      const hMax = (wall.h || 3) - 0.10;
+      let zr = null;
+      if (up <= hMax) zr = up;
+      else if (dn >= 0.08) zr = dn;
+      if (zr == null) return;                       // 上下都翻不过去，只能留缺口
+      if (Math.abs(zr - z) < 0.02) return;          // 洞口本身就比管高，不用绕
+      const a = axis(wall);
+      const tag = layer === 'corridor' ? 'C' : 'R';
+      const base = 'DT-' + wall.id + '-' + circ.kind + '-' + tag + '-' +
+        Math.round(g.at0 * 100) + '-' + Math.round(g.at1 * 100);
+      const lay = () => ({
+        floor: wall.floor, wall: wall.id, kind: circ.kind, circuit: circ.id,
+        layer: layer, detour: true, s: sec.s, d: sec.d,
+        room: room ? room.id : null, roomNum: room ? room.num : null, added: false
+      });
+      const push = (id, obj) => {
+        if (seen[id]) return;
+        seen[id] = 1;
+        obj.id = id;
+        D.conduits.push(obj);
+        circ.conduits.push(id);
+        if (room && circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+      };
+      /* 横段：跨过洞口 */
+      push(base + '-h', Object.assign(lay(), { at0: g.at0, at1: g.at1, z: zr }));
+      /* 两端竖段：把原标高和绕行标高接起来 */
+      [g.at0, g.at1].forEach((at, i) => {
+        const x = a.ax + a.ux * at, y = a.ay + a.uy * at;
+        push(base + '-v' + i, Object.assign(lay(), {
+          vert: true, x: x, y: y, at0: at, at1: at,
+          z0: Math.min(z, zr), z1: Math.max(z, zr), z: (z + zr) / 2
+        }));
       });
     }
 
@@ -270,16 +358,25 @@
       const wAll = allWalls.filter(w => w.floor === L);
 
       const pid = 'AL-' + L;
-      const mkCirc = (suffix, kind, name, rated) => addC({
-        id: 'L' + L + suffix, panel: pid, floor: L, kind: kind,
-        name: L + 'F ' + name, color: E.COLOR[kind],
-        rooms: [], conduits: [], rated: rated,
-        phase: suffix === 'A' ? 'L1' : (suffix === 'B' ? 'L2' : 'L3'),
-        on: true
-      });
-      const cA = mkCirc('A', 'light', '照明回路', 32);
-      const cB = mkCirc('B', 'socket', '插座回路', 32);
-      const cC = mkCirc('C', 'power', '动力回路', 63);
+      /* 分路编号：用户嘴里说的是"2 楼第一回路"，不是"L2A 照明回路"。
+         每层三部箱子下面挂三路，编号在本层内从 1 起，类型只是它的属性。
+         no 给解析用，label 给回复用，name 给卡片标题用。 */
+      let seq = 0;
+      const mkCirc = (suffix, kind, name, rated) => {
+        seq++;
+        const no = seq;
+        return addC({
+          id: 'L' + L + suffix, panel: pid, floor: L, kind: kind, no: no,
+          label: L + 'F 第' + no + '回路',
+          name: L + 'F 第' + no + '回路（' + name + '）', color: E.COLOR[kind],
+          rooms: [], conduits: [], rated: rated,
+          phase: suffix === 'A' ? 'L1' : (suffix === 'B' ? 'L2' : 'L3'),
+          on: true
+        });
+      };
+      const cA = mkCirc('A', 'light', '照明', 32);
+      const cB = mkCirc('B', 'socket', '插座', 32);
+      const cC = mkCirc('C', 'power', '动力', 63);
       liveCircs.push({ L: L, cA: cA, cB: cB, cC: cC });
 
       /* ---- 配电箱：贴电气间的一面墙上，箱子中心标高 1.5 m ----
@@ -350,14 +447,19 @@
         ['south', 'north', 'east', 'west'].forEach(k => {
           const wall = wAll.find(x => x.id === sides[k]);
           if (!wall) return;
-          const sp = roomSpans(wall).find(s => s.room.id === room.id);
+          const spans = roomSpans(wall);
+          const sp = spans.find(s => s.room.id === room.id);
           if (!sp) return;
-          const a = sp.lo + 0.15, b = sp.hi - 0.15;
-          /* 这面墙的另一侧是不是走廊 */
-          const isCorr = (wall.rooms || []).some(id => {
-            const r = allRooms.find(x => x.id === id);
-            return r && r.zone === 'corr';
-          });
+          /* 铺到墙角（只留 2 cm 让位），不缩 15 cm —— 缩了以后相邻两面墙的管段
+             在墙角差出半米，图上就是"四面墙各画一段、角上断开"。贴到角上，
+             下面 ⑦ 的接头逻辑才能在墙角生成弯头，房间一圈才是通到底的。 */
+          const a = sp.lo + 0.02, b = sp.hi - 0.02;
+          /* 这间房的这一段是不是贴着走廊。
+             以前判的是"这面墙上有没有走廊房间"，长墙把走廊和房间串在一起时
+             （比如西外墙同时挨着 101 和走廊 100），整面墙的插座全被跳过，
+             墙角落里就断出一截。改成看**本房间那一段**跟走廊区段有没有重叠。 */
+          const isCorr = spans.some(s => s.room.zone === 'corr'
+            && s.hi > sp.lo + 0.05 && s.lo < sp.hi - 0.05);
           if (b - a >= 0.4) {
             /* 照明走吊顶，哪面墙都得穿，满铺 */
             runWall(wall, a, b, 'light', cA, BRANCH_Z.light, SEC.light, 'room', room);
@@ -374,12 +476,16 @@
           if (!corrWall && isCorr) { corrWall = wall; corrSpan = sp; }
         });
 
-        /* 从走廊干线引下来：在走廊墙靠房间端部立一根短管，
+        /* 从走廊干线引下来：在走廊墙靠房间墙角处立一根短管，
            把 2.80 m 的桥架接到 0.32 m 的插座支线 —— 这就是"分到房间"的那一下。
+           为什么贴着墙角下：插座支线不铺走廊那面墙，只铺另外三面，
+           它的端头正好停在房间墙角。下引管如果立在墙中间（原来退 0.45 m），
+           管子到 0.32 m 就悬在半空，下面没有管可接 —— 图上就是一根断头管。
+           贴到墙角，下引管的底端和支线端头重合，接头逻辑就把它接上了。
            照明支线 2.90 和干线 3.00 本来就挨着，不用单独下引。 */
         if (corrWall && corrSpan) {
           const a = axis(corrWall);
-          const atp = corrSpan.lo + Math.min(0.45, (corrSpan.hi - corrSpan.lo) / 2);
+          const atp = corrSpan.lo + 0.06;
           const mx = a.ax + a.ux * atp, my = a.ay + a.uy * atp;
           dropDown(corrWall, mx, my, L, BRANCH_Z.socket, MAIN_Z.socket, SEC.socket, cB, room);
           if (pw) dropDown(corrWall, mx, my, L, BRANCH_Z.power, MAIN_Z.power, SEC.power, cC, room);
@@ -432,6 +538,93 @@
       D.conduits.push(c);
       circ.conduits.push(id);
       if (circ.rooms.indexOf(p.room) < 0) circ.rooms.push(p.room);
+    });
+
+    /* ---- ⑦ 接头 / 弯头 ----
+       真实线管不会"一根到这儿停住、下一根从那头开始"，中间一定有直通接头、
+       弯头或者接线盒。原来只画管段，拐弯的地方就是两个方头硬怼在一起，
+       看上去等于没接上 —— 用户说的"线段中间需要有弯头链接"就是这个。
+       做法：把同一条分路的所有管段端点按位置聚类，
+         · 两个以上端点重合（±0.10 m） → 弯头 / 直通接头
+         · 端点落在另一根管段中段      → 三通（走廊干线分进房间就是这种）
+       一个簇只放一个接头盒子，比管截面大两成，看着就是个管件。 */
+    const JTOL = 0.14;      // 端点算不算"接上了"的距离容差（墙角落差一般 < 0.1）
+    function endsOf(c) {
+      if (c.free && c.p1 && c.p2) {
+        return [{ x: c.p1[0], y: c.p1[1], z: c.p1[2] },
+                { x: c.p2[0], y: c.p2[1], z: c.p2[2] }];
+      }
+      if (c.vert) {
+        return [{ x: c.x, y: c.y, z: c.z0 }, { x: c.x, y: c.y, z: c.z1 }];
+      }
+      const w = allWalls.find(q => q.id === c.wall);
+      if (!w) return [];
+      const a = axis(w);
+      return [c.at0, c.at1].map(at => ({
+        x: a.ax + a.ux * at, y: a.ay + a.uy * at, z: c.z
+      }));
+    }
+    function boxOf(c, e) {
+      const hs = (c.s || 0.05) / 2 + 0.02;
+      return {
+        x0: Math.min(e[0].x, e[1].x) - hs, x1: Math.max(e[0].x, e[1].x) + hs,
+        y0: Math.min(e[0].y, e[1].y) - hs, y1: Math.max(e[0].y, e[1].y) + hs,
+        z0: Math.min(e[0].z, e[1].z) - hs, z1: Math.max(e[0].z, e[1].z) + hs
+      };
+    }
+
+    const jointPerCirc = {};
+    D.conduits.forEach(c => (jointPerCirc[c.circuit] = jointPerCirc[c.circuit] || []).push(c));
+    Object.keys(jointPerCirc).forEach(cid => {
+      const list = jointPerCirc[cid], circ = byId[cid];
+      if (!circ || list.length < 2) return;
+      const ends = list.map(c => endsOf(c));
+      const boxes = list.map((c, i) => (ends[i].length === 2 ? boxOf(c, ends[i]) : null));
+      const pts = [];
+      list.forEach((c, i) => ends[i].forEach(p => pts.push({ p: p, c: c, i: i })));
+
+      /* 三通：端点压在别的管段身上（且不在它的端头） */
+      pts.forEach(o => {
+        for (let k = 0; k < list.length; k++) {
+          if (k === o.i) continue;
+          const b = boxes[k];
+          if (!b) continue;
+          const p = o.p;
+          if (p.x < b.x0 || p.x > b.x1 || p.y < b.y0 || p.y > b.y1 || p.z < b.z0 || p.z > b.z1) continue;
+          const onEnd = ends[k].some(e =>
+            Math.abs(e.x - p.x) < JTOL * 1.6 && Math.abs(e.y - p.y) < JTOL * 1.6 && Math.abs(e.z - p.z) < JTOL * 1.6);
+          if (onEnd) continue;
+          o.tee = true;
+          break;
+        }
+      });
+
+      /* 端点聚类：格子粗一点，同簇的取平均位置当接头中心 */
+      const groups = [];
+      pts.forEach(o => {
+        const p = o.p;
+        let g = null;
+        for (let k = 0; k < groups.length; k++) {
+          const q = groups[k];
+          if (Math.abs(q.x - p.x) < JTOL && Math.abs(q.y - p.y) < JTOL && Math.abs(q.z - p.z) < JTOL) { g = q; break; }
+        }
+        if (!g) { g = { x: 0, y: 0, z: 0, n: 0, s: 0, d: 0, tee: false }; groups.push(g); }
+        g.n++;
+        g.x += (p.x - g.x) / g.n; g.y += (p.y - g.y) / g.n; g.z += (p.z - g.z) / g.n;
+        g.s = Math.max(g.s, o.c.s || 0.05);
+        g.d = Math.max(g.d, o.c.d || 0.05);
+        if (o.tee) g.tee = true;
+      });
+
+      groups.forEach((g, gi) => {
+        if (g.n < 2 && !g.tee) return;           // 单根管子的自由端不放接头
+        const r = Math.min(0.26, Math.max(0.10, g.s * 2.3));
+        D.joints.push({
+          id: 'JT-' + cid + '-' + gi, floor: circ.floor, circuit: cid, kind: circ.kind,
+          x: g.x, y: g.y, z: g.z, r: r, d: Math.min(r, g.d || r),
+          type: g.tee ? 'tee' : 'elbow', n: g.n
+        });
+      });
     });
 
     /* 分路状态：重建时把原来的通断状态带过来。
@@ -515,14 +708,19 @@
           ' m，线管上下都翻不过去（上翻要占 ' + fmt(hole.z1 + 0.15) + ' m，下翻要占 ' + fmt(0.15) + ' m）'
       };
     }
-    /* 绕行折线：原高度 → 竖段 → 洞顶/底跨过去 → 竖段落回原高度 */
+    /* 绕行折线：从这根管子的**真实起点**走过去，绕完再回到**真实终点**。
+       以前只画洞口两侧那一小段，0.36 m 宽贴在墙里，屏幕上几乎看不见，
+       用户反馈"改线看不到路线"。现在整根画出来，一眼就知道电改走哪儿了。 */
     const seg = 0.18;     // 洞两侧各让出的水平距离
-    const pts = [
-      { at: hole.at0 - seg, z: c.z },
-      { at: hole.at0 - seg, z: z },
-      { at: hole.at1 + seg, z: z },
-      { at: hole.at1 + seg, z: c.z }
-    ];
+    const L = axis(wall).L;
+    const e0 = Math.max(0, c.at0), e1 = Math.min(L, c.at1);
+    const pts = [];
+    if (e0 < hole.at0 - seg - 0.02) pts.push({ at: e0, z: c.z });
+    pts.push({ at: hole.at0 - seg, z: c.z });
+    pts.push({ at: hole.at0 - seg, z: z });
+    pts.push({ at: hole.at1 + seg, z: z });
+    pts.push({ at: hole.at1 + seg, z: c.z });
+    if (e1 > hole.at1 + seg + 0.02) pts.push({ at: e1, z: c.z });
     const addLen = Math.abs(z - c.z) * 2 + seg * 2;
     return {
       ok: true, c: c, hole: hole, dir: dir, z: z, pts: pts,
@@ -662,7 +860,7 @@
           return a;
         }, {});
         return {
-          id: c.id, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
+          id: c.id, no: c.no, label: c.label, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
           panel: c.panel, phase: c.phase, rated: c.rated, on: c.on !== false,
           rooms: c.rooms.length, conduits: c.conduits.length, layers: layers,
           room_nums: E.circuitRooms(c.id).map(r => r.num)
@@ -670,11 +868,24 @@
       });
   };
 
+  /* 按"本层第几回路"找分路：用户说"2 楼第一回路"走这里 */
+  E.circuitByNo = function (floor, no) {
+    const list = (ready().circuits || []).filter(c => c.floor === floor);
+    return list.find(c => c.no === no) || null;
+  };
+
+  /* 某条分路的接头/弯头（渲染和查询都用） */
+  E.jointsOf = function (cid) {
+    const all = ready().joints || [];
+    return cid ? all.filter(j => j.circuit === cid) : all;
+  };
+
   E.stats = function () {
     const D = ready();
     return {
       panels: D.panels.length, circuits: D.circuits.length,
-      conduits: D.conduits.length, reroutes: Object.keys(D.reroutes || {}).length,
+      conduits: D.conduits.length, joints: (D.joints || []).length,
+      reroutes: Object.keys(D.reroutes || {}).length,
       by_kind: ['light', 'socket', 'power', 'riser'].reduce((a, k) => {
         a[k] = D.conduits.filter(c => c.kind === k).length; return a;
       }, {}),

@@ -389,7 +389,10 @@
     controls.enableDamping = true;
     controls.dampingFactor = .08;
     controls.maxPolarAngle = Math.PI * .495;
-    controls.minDistance = 6;
+    /* 最近能推到 1 m。原来是 6 m —— 那是"只敢从外面看整栋楼"的设定，
+       结果想凑近看配电箱上的断路器手柄根本推不进去，镜头被硬顶在 6 m 外，
+       箱子在屏幕上只有巴掌大，"哪个开关被拉下来了"完全看不清。 */
+    controls.minDistance = 1.0;
     controls.maxDistance = 150;
     controls.target.set(16.5, 9.2, -7.8);
 
@@ -1712,17 +1715,49 @@
     return { size: [len, c.s * g, dep], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy) };
   }
 
-  /* 按分路分批：一条分路一个 mesh，高亮/隔离都在材质层做，不改几何 */
-  function eBatch(list) {
+  /* 接头 / 弯头：数据层（elec ⑦）已经算好每个接头的位置和尺寸，
+     这里只负责把它画成一个方头。放在同一批 mesh 里，跟着分路一起显隐高亮。
+     颜色用顶点色压暗一档：管身和管件同色的话，接头在图上就是个"凸一点"，认不出来；
+     深一档之后一眼能看出"这里有个管件把两段接上了"。 */
+  const JT_SHADE = 0.62;
+  function eJointItem(j) {
+    if (!j) return null;
+    const el = ((M.floors.find(f => f.level === j.floor) || {}).elev) || 0;
+    const r = j.r || 0.12;
+    return {
+      size: [r, r, Math.min(r, j.d || r)],
+      matrix: frame(j.x, j.y, el + j.z, 1, 0),
+      c: [JT_SHADE, JT_SHADE, JT_SHADE]
+    };
+  }
+
+  /* 按分路分批：一条分路一个 mesh，高亮/隔离都在材质层做，不改几何。
+     withJoints=true 时把接头一起并进这条分路（只有"全楼看管"时才要，
+     隔离碰撞管线时不该把这一路所有接头都翻出来）。
+     grow>1 把截面整体画粗 —— 看"整条路线走到哪几间房"时楼层拉得很远，
+     原尺寸的管子在屏幕上就 1 个像素，看不清。 */
+  function eBatch(list, withJoints, grow) {
     const D = E() && E().data;
     const per = {};
     if (!D) return per;
+    const opt = grow ? { grow: grow } : null;
     (list || []).forEach(c => {
       if (!D.circuits.some(x => x.id === c.circuit)) return;
-      const it = eItemOf(c);
+      const it = eItemOf(c, opt);
       if (!it) return;
+      /* 开了接头就必须给每个方块都带上顶点色：boxGeo 只要有一个方块带 c
+         就会给整批建 color 属性，没给的按 [1,1,1] 补齐 —— 与其依赖这个兜底，
+         不如这里显式写上，省得哪天材质开了 vertexColors 却没属性、整批变黑。 */
+      if (withJoints) it.c = [1, 1, 1];
       (per[c.circuit] = per[c.circuit] || []).push(it);
     });
+    if (withJoints) {
+      (D.joints || []).forEach(j => {
+        if (!per[j.circuit]) return;          // 这条分路不在本次范围内就别画
+        const it = eJointItem(j);
+        if (it) per[j.circuit].push(it);
+      });
+    }
     return per;
   }
 
@@ -1734,13 +1769,14 @@
     const D = E().data;
     const root = new THREE.Group();
     root.name = 'elec';
-    const per = eBatch(D.conduits || []);
+    const per = eBatch(D.conduits || [], true);
     Object.keys(per).forEach(cid => {
       const circ = D.circuits.find(x => x.id === cid);
       const col = new THREE.Color(EC()[circ.kind] || EC().light);
       const mat = new THREE.MeshStandardMaterial({
         color: col, emissive: col.clone().multiplyScalar(.45), emissiveIntensity: 1,
-        roughness: .42, metalness: .3, transparent: true, opacity: .95
+        roughness: .42, metalness: .3, transparent: true, opacity: .95,
+        vertexColors: true          // 接头块靠顶点色压暗，管身仍是回路本色
       });
       mat.userData.baseOpacity = 1;
       const mesh = new THREE.Mesh(boxGeo(per[cid]), mat);
@@ -1811,18 +1847,40 @@
     });
     it.push({ size: [W, H, Dp], matrix: frame(px, py, Y, ux, uy), c: [.86, .89, .92] });
     it.push({ size: [W * .86, H * .88, .016], matrix: frame(...at(0, 0, F + .008), ux, uy), c: [.95, .96, .97] });   // 箱门
-    for (let r = 0; r < 3; r++) {
-      for (let i = 0; i < 4; i++) {
-        it.push({
-          size: [.075, .07, .028],
-          matrix: frame(...at((i - 1.5) * W * .17, (r - 1) * H * .22, F + .026), ux, uy),
-          c: [.3, .34, .38]                                  // 断路器手柄
-        });
-      }
-    }
-    it.push({ size: [.15, .11, .022], matrix: frame(...at(-W * .3, H * .3, F + .02), ux, uy), c: [.08, .12, .16] });   // 电能表
-    it.push({ size: [.026, .026, .022], matrix: frame(...at(W * .3, H * .32, F + .02), ux, uy), c: [.18, .9, .5] });    // 运行灯
-    it.push({ size: [.22, .05, .018], matrix: frame(...at(0, -H * .38, F + .02), ux, uy), c: [.55, .6, .66] });        // 铭牌
+
+    /* ---- 断路器排：一个总开关 + 本层三路分路 ----
+       手柄位置本身就表达通断：合闸时手柄在上、指示灯绿；断开时手柄落到下面、
+       手柄和指示灯都变红。说"关掉 2 楼第一回路"，用户要能在箱子上一眼看到
+       就是从左数第一个手柄被拉下来了 —— 光在回复里写字不够。 */
+    const ED = (E() && E().data) || { circuits: [] };
+    const circs = (p.circuits || []).map(id => (ED.circuits || []).find(c => c.id === id)).filter(Boolean);
+    const anyOn = circs.length ? circs.some(c => c.on !== false) : true;
+    const H_ON = [.28, .32, .36], H_OFF = [.76, .20, .16], H_NA = [.46, .49, .53];
+    const L_G = [.16, .92, .45], L_R = [.98, .26, .18], L_NA = [.32, .33, .35];
+
+    /* 导轨 */
+    it.push({ size: [W * .80, .012, .012], matrix: frame(...at(0, -.055, F + .018), ux, uy), c: [.62, .66, .70] });
+
+    /* 总开关 */
+    const mw = -W * .34;
+    it.push({ size: [.090, .210, .030], matrix: frame(...at(mw, .030, F + .022), ux, uy), c: [.90, .92, .94] });
+    it.push({ size: [.055, .060, .036], matrix: frame(...at(mw, anyOn ? .090 : -.030, F + .034), ux, uy), c: anyOn ? H_ON : H_OFF });
+    it.push({ size: [.026, .026, .022], matrix: frame(...at(mw, .175, F + .020), ux, uy), c: anyOn ? L_G : L_R });
+
+    /* 三路分路，从左到右 = 第 1/2/3 回路 */
+    [-.055, .075, .205].forEach((dw, i) => {
+      const c = circs[i];
+      const has = !!c;
+      const on = has ? c.on !== false : true;
+      it.push({ size: [.075, .190, .028], matrix: frame(...at(dw, .030, F + .020), ux, uy), c: has ? [.93, .94, .96] : [.87, .89, .91] });
+      it.push({ size: [.050, .055, .036], matrix: frame(...at(dw, on ? .090 : -.030, F + .032), ux, uy), c: has ? (on ? H_ON : H_OFF) : H_NA });
+      it.push({ size: [.024, .024, .022], matrix: frame(...at(dw, .175, F + .020), ux, uy), c: has ? (on ? L_G : L_R) : L_NA });
+    });
+
+    /* 底排：电能表 / 铭牌 / 电源指示灯 */
+    it.push({ size: [.16, .11, .022], matrix: frame(...at(-W * .26, -H * .26, F + .020), ux, uy), c: [.08, .12, .16] });   // 电能表
+    it.push({ size: [.026, .026, .022], matrix: frame(...at(W * .30, -H * .24, F + .020), ux, uy), c: [.18, .9, .5] });    // 电源灯
+    it.push({ size: [.22, .05, .018], matrix: frame(...at(0, -H * .38, F + .020), ux, uy), c: [.55, .6, .66] });          // 铭牌
     const geo = boxGeo(it);
     const mat = new THREE.MeshStandardMaterial({
       color: 0xffffff, roughness: .42, metalness: .45, vertexColors: true, envMapIntensity: .9
@@ -1848,6 +1906,63 @@
   }
   S.rebuildPanels = ePanelBuild;
 
+  /* 重画配电箱：断路器的通断状态改了以后必须重新生成几何
+     —— 手柄位置是烘进顶点里的，只改材质是动不了的。 */
+  S.refreshPanels = function (floor) {
+    if (!E() || !E().data) return;
+    if (!ePanels) { ePanelBuild(); return; }
+    (E().data.panels || []).forEach(p => {
+      if (floor != null && p.floor !== floor) return;
+      const old = ePanels.children.find(m => m.userData && m.userData.data && m.userData.data.id === p.id);
+      if (old) {
+        ePanels.remove(old);
+        if (old.geometry) old.geometry.dispose();
+        if (old.material) old.material.dispose();
+      }
+      try { ePanels.add(ePanelMesh(p)); } catch (e) { }
+    });
+    ePanels.visible = eOn;
+  };
+
+  /* 把镜头放到这一层配电箱跟前站定。
+     "关掉 2 楼第一回路"的第一步就是这一下：先让人看见箱子、看见那排开关，
+     再说哪一路被拉下来了，比直接给一段文字清楚得多。 */
+  S.focusPanel = function (floor) {
+    const D = E() && E().data;
+    if (!D) return null;
+    const p = (D.panels || []).find(x => x.floor === floor) || (D.panels || [])[0];
+    if (!p) return null;
+    S.showConduits(true);
+    S.setXray(false);                       // 箱子是实体，这里不要透视，看清手柄
+    S.setFocus(p.floor, false);
+    const el = ((M.floors.find(f => f.level === p.floor) || {}).elev) || 0;
+    const n = (Array.isArray(p.n) && p.n.length === 2) ? p.n : [1, 0];
+    const d = 1.8;                          // 站得近一点，箱子上那三个手柄要看得清
+    const t = new THREE.Vector3(p.x, el + p.z + 0.05, -p.y);
+    const c = new THREE.Vector3(p.x + n[0] * d, el + p.z + 0.42, -(p.y + n[1] * d));
+    flyTo(c, t, 780);
+    return p;
+  };
+
+  /* 只看这一路的完整路由：主干立管 → 层进线 → 配电箱 → 本回路的干线和支线。
+     其它回路整条不画。用户点「查看回路影响」要的就是这一屏：
+     电从楼上竖井下来，进箱子，沿走廊跑一圈，再分进哪几间房。 */
+  S.circuitRoute = function (circ, rooms) {
+    const D = E() && E().data;
+    if (!D || !circ) return null;
+    S.showConduits(true);
+    S.setXray(true);
+    S.clearConduitMarks();
+    const list = (D.conduits || []).filter(c =>
+      c.circuit === circ.id || c.layer === 'trunk' || c.layer === 'feed');
+    /* 画粗一档：这一屏是把整层框进来，原尺寸的管子在屏幕上只有一两个像素，
+       不放大根本看不出"这条电是从竖井下来、沿走廊跑、再分进哪几间房" */
+    S.isolateConduits(list, { grow: 3.0 });
+    if (rooms && rooms.length) S.highlightRooms(rooms, 0x17a673); else disposeHl();
+    S.setFocus(circ.floor, true);
+    return list;
+  };
+
   /* 显示/隐藏墙内线管。开的时候自动把墙压成半透明，不然什么都看不见 */
   S.showConduits = function (on) {
     eOn = !!on;
@@ -1862,13 +1977,13 @@
   /* 只显示这几根线管：其它分路整体隐藏，命中的管子按本体颜色单独画出来。
      碰撞检查、查某面墙里埋了什么，都用它 ——
      现场就是这样：墙里挡路的就那几根，别的管线全都跑来抢视线没有意义。 */
-  S.isolateConduits = function (list) {
+  S.isolateConduits = function (list, opt) {
     if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
     const D = E() && E().data;
     if (!D) return;
     if (eRoot) eRoot.visible = false;              // 先把整批藏起来
     if (!list || !list.length) return;
-    const per = eBatch(list);
+    const per = eBatch(list, false, opt && opt.grow);
     const g = new THREE.Group();
     g.name = 'elec-iso';
     Object.keys(per).forEach(cid => {
@@ -1971,18 +2086,30 @@
     S.clearIsolate();
   };
 
-  /* 改线后的新走向：用另一种颜色沿墙面画一条折线，穿透显示。
-     一次可能改好几根管，所以都挂到同一个组里，别互相顶掉。 */
+  /* 改线后的新走向：沿墙面画一条折线，穿透显示。
+     一次可能改好几根管，所以都挂到同一个组里，别互相顶掉。
+
+     ★ 这里修过一个"改线根本看不见"的 bug：elec.planReroute 返回的 wall 字段是
+       墙体**对象**，而这里原来写的是 M.walls.find(w => w.id === r.wall) ——
+       拿字符串去比对象，永远查不到，函数直接 return null，绿色改线一次都没画出来过。
+       现在两种都给：先按对象用，再按 id 查。 */
   let eReRoot = null;
   S.clearReroute = function () {
     if (eReRoot) { eDispose(eReRoot); eReRoot = null; }
   };
   S.showReroute = function (r, color) {
-    if (!r || !r.pts) return null;
-    const wall = M.walls.find(w => w.id === r.wall);
-    if (!wall) return null;
+    if (!r) return null;
+    let wall = null;
+    if (r.wall && typeof r.wall === 'object' && r.wall.id) wall = r.wall;
+    else if (r.wall) wall = M.walls.find(w => w.id === r.wall) || null;
+    if (!wall && r.c) wall = M.walls.find(w => w.id === r.c.wall) || null;
+    if (!wall || !r.pts || !r.pts.length) return null;
+
     const a = E().axis(wall);
+    const TH = 0.10;                    // 画得比真管子粗，才在一片墙里看得见
     const it = [];
+    const ptAt = p => ({ x: a.ax + a.ux * p.at, y: a.ay + a.uy * p.at, z: wall.base + p.z });
+
     for (let i = 0; i < r.pts.length - 1; i++) {
       const p = r.pts[i], q = r.pts[i + 1];
       const dx = (q.at - p.at), dz = (q.z - p.z);
@@ -1993,18 +2120,32 @@
       const ang = Math.atan2(dz, dx);
       const m = frame(mx, my, wall.base + midZ, a.ux, a.uy);
       m.multiply(new THREE.Matrix4().makeRotationZ(ang));
-      it.push({ size: [len, 0.075, wall.t * 1.25], matrix: m });
+      it.push({ size: [len, TH, wall.t * 1.6], matrix: m });
     }
+    /* 每个转折点放一个弯头块：改线路径是"上翻—横穿—落回"，两个直角，
+       没有弯头块看着就是在墙里凭空折了一下 */
+    r.pts.forEach(p => {
+      const w = ptAt(p);
+      it.push({ size: [TH * 1.7, TH * 1.7, wall.t * 1.7], matrix: frame(w.x, w.y, w.z, 1, 0) });
+    });
     if (!it.length) return null;
+
     const c = new THREE.Color(color || EC().reroute);
     const geo = boxGeo(it);
-    const mat = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .95, depthTest: false, depthWrite: false });
+    const mat = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .96, depthTest: false, depthWrite: false });
     mat.userData.ownMat = true;
     const mesh = new THREE.Mesh(geo, mat);
     mesh.renderOrder = 10;
+    /* 白描边：纯色块在明亮的墙面上会糊掉，勾一圈线才看得出"这是一条规划好的路线" */
+    const lm = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: .85, depthTest: false });
+    lm.userData.ownMat = true;
+    const ls = new THREE.LineSegments(new THREE.EdgesGeometry(geo), lm);
+    ls.renderOrder = 11;
     if (!eReRoot) { eReRoot = new THREE.Group(); eReRoot.name = 'reroutes'; scene.add(eReRoot); }
-    eReRoot.add(mesh);
-    return mesh;
+    const g = new THREE.Group();
+    g.add(mesh); g.add(ls);
+    eReRoot.add(g);
+    return g;
   };
 
   /* 单面墙临时半透明（开洞前看墙里有什么），可批量 */
@@ -2117,6 +2258,11 @@
 
   S.reg = reg;
   S.root = () => scene;
+  /* 镜头现状：自动化校验"镜头到底站到哪了"用（以前只能靠截图目测） */
+  S.camPos = () => ({
+    p: camera.position.toArray(), t: controls.target.toArray(),
+    dist: camera.position.distanceTo(controls.target)
+  });
   S.getRoom = id => M.rooms.find(r => r.id === id);
   S.M = M;
   S.floorOf = lv => floorGroups.find(f => f.level === lv);

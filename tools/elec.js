@@ -269,6 +269,159 @@ const H = t => { console.log('\n' + t); };
   const shot1 = 'outputs/elec-conflict.png';
   await p.screenshot({ path: shot1 });
 
+  /* ---------- 9. 绕行与弯头 ---------- */
+  H('【9】管线绕行与弯头接头');
+  const d9 = await p.evaluate(() => {
+    const E = BIM.elec, M = BIM_MODEL;
+    const D = E.ready();
+    const joints = D.joints || [];
+    const det = D.conduits.filter(c => c.detour);
+    /* 每个管段的端点，看有多少端点没被任何接头盖住 —— 就是"断头管" */
+    const endsOf = c => {
+      if (c.free && c.p1 && c.p2) return [{ x: c.p1[0], y: c.p1[1], z: c.p1[2] }, { x: c.p2[0], y: c.p2[1], z: c.p2[2] }];
+      if (c.vert) return [{ x: c.x, y: c.y, z: c.z0 }, { x: c.x, y: c.y, z: c.z1 }];
+      const w = M.walls.find(q => q.id === c.wall); if (!w) return [];
+      const a = E.axis(w);
+      return [c.at0, c.at1].map(at => ({ x: a.ax + a.ux * at, y: a.ay + a.uy * at, z: c.z }));
+    };
+    const TOL = 0.15;
+    const covered = (circ, p) => joints.some(j => j.circuit === circ &&
+      Math.abs(j.x - p.x) < TOL && Math.abs(j.y - p.y) < TOL && Math.abs(j.z - p.z) < TOL);
+    let total = 0, bare = 0;
+    D.conduits.forEach(c => endsOf(c).forEach(p => { total++; if (!covered(c.circuit, p)) bare++; }));
+    /* 绕行段两端必须接上：竖段底/顶 + 横段两端 */
+    let detEnds = 0, detBare = 0;
+    det.forEach(c => endsOf(c).forEach(p => { detEnds++; if (!covered(c.circuit, p)) detBare++; }));
+    const types = joints.reduce((a, j) => (a[j.type] = (a[j.type] || 0) + 1, a), {});
+    return {
+      conduits: D.conduits.length, joints: joints.length, types: types,
+      detour: det.length, detRooms: det.map(c => c.roomNum).filter(Boolean).slice(0, 4),
+      detBare: detBare, detEnds: detEnds,
+      barePct: Math.round(bare / total * 100), bare: bare, total: total,
+      stat: E.stats().joints
+    };
+  });
+  P('生成了弯头/接头', d9.joints > 100, d9.joints + ' 个（弯头 ' + (d9.types.elbow || 0) + ' / 三通 ' + (d9.types.tee || 0) + '）');
+  P('接头进了统计（渲染和查询同一份数据）', d9.stat === d9.joints, 'stats.joints=' + d9.stat);
+  P('门窗洞处的管段做了绕行', d9.detour >= 3, d9.detour + ' 段绕行，房间 ' + d9.detRooms.join('/'));
+  P('绕行段两端都接上了（不是断头管）', d9.detBare === 0, d9.detBare + ' / ' + d9.detEnds + ' 个端点悬空');
+  P('全楼断头端点 < 12%', d9.barePct < 12, d9.bare + ' / ' + d9.total + ' = ' + d9.barePct + '%');
+
+  /* 接头几何真的进了场景：把 joints 清空重建，顶点数应该明显变少 */
+  const d9b = await p.evaluate(() => {
+    const S = BIM.scene, E = BIM.elec;
+    const count = () => {
+      const root = S.root().getObjectByName('elec');
+      let v = 0;
+      if (root) root.traverse(o => { if (o.isMesh && o.userData && o.userData.kind === 'conduit') v += o.geometry.attributes.position.count; });
+      return v;
+    };
+    S.showConduits(true);
+    S.rebuildElec();
+    const withJ = count();
+    const saved = E.ready().joints;
+    E.ready().joints = [];
+    S.rebuildElec();
+    const noJ = count();
+    E.ready().joints = saved;
+    S.rebuildElec();
+    return { withJ: withJ, noJ: noJ, diff: withJ - noJ };
+  });
+  P('接头真的画进了线管网格', d9b.diff > 0, '顶点 ' + d9b.noJ + ' → ' + d9b.withJ + '（+ ' + d9b.diff + '）');
+
+  /* ---------- 10. 改线走向可视化 ---------- */
+  H('【10】门窗改线的实际走向');
+  const d10 = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene, M = BIM_MODEL;
+    const c0 = E.conduitsOf({ floor: 1, kind: 'socket', layer: 'room' })[0];
+    const wall = M.walls.find(w => w.id === c0.wall);
+    const hole = { at0: c0.at0 + .4, at1: c0.at0 + 1.4, z0: 0, z1: 2.1 };
+    const plan = E.planReroute(c0, hole);
+    S.showConduits(true);
+    S.ghostWall(wall, true);
+    S.clearConduitMarks();
+    S.isolateConduits([c0]);
+    S.markConduits([c0], 0xff3b30);
+    const mesh = S.showReroute(plan, 0x17a673);
+    const grp = S.root().getObjectByName('reroutes');
+    const nMesh = grp ? grp.children.length : 0;
+    return {
+      ok: plan.ok, pts: plan.pts.length, drew: !!mesh, groups: nMesh,
+      /* 起点和终点要落在管子本身上：原来只画洞口那 0.36 m，屏幕上根本看不见 */
+      fromEnd: Math.abs(plan.pts[0].at - c0.at0) < 0.02,
+      toEnd: Math.abs(plan.pts[plan.pts.length - 1].at - c0.at1) < 0.02,
+      addLen: plan.addLen
+    };
+  });
+  P('改线方案可算', d10.ok === true);
+  P('改线路线真的被画出来（不是返回空）', d10.drew === true, '场景里 reroutes 组 ' + d10.groups + ' 个对象');
+  P('路线从这根管子的起点走到终点', d10.fromEnd && d10.toEnd, d10.pts + ' 个折点，多走 ' + d10.addLen + ' m');
+
+  /* ---------- 11. 断电呈现：配电箱 + 断路器 + 回路影响 ---------- */
+  H('【11】断电呈现');
+  const d11 = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene;
+    S.showConduits(false);
+    S.setXray(false);
+    await BIM.app.send('把2楼第1回路断电');
+    /* 镜头飞过去是 780 ms 的缓动，headless 里 rAF 会慢一点，多留些时间 */
+    await new Promise(r => setTimeout(r, 3000));
+    const c = E.circuit('L2A');
+    const cam = S.camPos();
+    const panel = E.ready().panels.find(p => p.floor === 2);
+    const pel = (BIM_MODEL.floors.find(f => f.level === 2) || {}).elev || 0;
+    const pd = Math.hypot(cam.p[0] - panel.x, cam.p[2] - (-panel.y));
+    return {
+      on: c.on, label: c.label, no: c.no, panel: c.panel,
+      focus: S.focus, camDist: cam.dist, panDist: pd,
+      chips: [].slice.call(document.querySelectorAll('.chips button')).map(b => b.textContent)
+    };
+  });
+  P('按"第 1 回路"能找到 L2A', d11.label === '2F 第1回路' && d11.on === false, d11.label + ' on=' + d11.on);
+  P('聚焦到 2 楼', d11.focus === 2, 'focus=' + d11.focus);
+  P('镜头推到配电箱跟前（< 3 m）', d11.camDist < 3, '镜头距目标 ' + d11.camDist.toFixed(2) + ' m');
+  P('回复里给了「查看回路影响」气泡', d11.chips.some(x => /查看回路影响/.test(x)), d11.chips.join(' / '));
+
+  /* 断路器状态必须烘进几何：off 与 on 的顶点数不能一样，否则手柄动不了 */
+  const d11b = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene;
+    const p = E.ready().panels.find(x => x.floor === 2);
+    const grab = () => {
+      const g = S.root().getObjectByName('panels');
+      const m = g && g.children.find(x => x.userData && x.userData.data && x.userData.data.id === p.id);
+      if (!m) return null;
+      const pos = m.geometry.attributes.position;
+      /* 只取前 200 个顶点做指纹，够判断几何有没有变 */
+      let s = 0;
+      for (let i = 0; i < Math.min(pos.count, 300); i++) s += pos.getX(i) + pos.getY(i) * 3 + pos.getZ(i) * 7;
+      return { v: pos.count, sig: Math.round(s * 1000) };
+    };
+    S.showConduits(true);
+    S.refreshPanels(2);
+    E.toggle('L2A', false); S.refreshPanels(2);
+    const off = grab();
+    E.toggle('L2A', true); S.refreshPanels(2);
+    const on = grab();
+    return { off: off, on: on };
+  });
+  P('断路器断开/合闸的画法不一样（手柄会动）',
+    !!(d11b.off && d11b.on) && d11b.off.sig !== d11b.on.sig,
+    d11b.off && d11b.on ? '顶点签名 off=' + d11b.off.sig + ' on=' + d11b.on.sig : '取不到箱体');
+
+  const d11c = await p.evaluate(async () => {
+    const t = [].slice.call(document.querySelectorAll('.chips button')).filter(x => /查看回路影响/.test(x.textContent))[0];
+    if (!t) return { clicked: false };
+    t.click();
+    await new Promise(r => setTimeout(r, 1600));
+    const S = BIM.scene, E = BIM.elec;
+    const iso = S.root().getObjectByName('elec-iso');
+    let meshes = 0;
+    if (iso) iso.traverse(o => { if (o.isMesh) meshes++; });
+    return { clicked: true, isolated: S.hasIsolate(), meshes: meshes, focus: S.focus };
+  });
+  P('点「查看回路影响」后只看这一条路', d11c.clicked && d11c.isolated === true, '隔离组 ' + d11c.meshes + ' 个 mesh');
+  P('影响视图回到本层全貌（能看全受影响的房间）', d11c.focus === 2);
+
   /* ---------- 8. MCP 工具暴露 ---------- */
   H('【8】MCP 工具与说明');
   const d8 = await p.evaluate(() => {

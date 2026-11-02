@@ -8,6 +8,7 @@
 
   const clampN = (v, a, b) => Math.max(a, Math.min(b, v));
   const CN = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10, 首: 1 };
+  N.CN_NUM = CN;      // 外面（app.js 执行层）解析"第 N 回路"也要用同一张表
 
   const ALIAS = {
     '空压机': '空气压缩机', '压缩机': '空气压缩机', '气泵': '空气压缩机', '空压': '空气压缩机',
@@ -516,6 +517,15 @@
       out.kind = /照明|灯/.test(t) ? 'light' : (/插座/.test(t) ? 'socket' : (/动力|空调|设备/.test(t) ? 'power' : null));
       const mc = t.match(/L\s*([1-5])\s*([ABC])/i);
       if (mc) out.circuit = 'L' + mc[1] + mc[2].toUpperCase();
+      /* "2 楼第一回路" / "第 2 回路" / "回路三" —— 现场是按编号叫的，不按 L2A 叫。
+         注意别把"3 号回路"里的房号当楼层，楼层已经由 findFloor 单独取过了。 */
+      const mn = t.match(/第\s*([一二三四五六1-6])\s*回/)
+        || t.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/)
+        || t.match(/([一二三四五六])\s*回(?:路|)/);
+      if (mn) {
+        const v = CN[mn[1]] || +mn[1];
+        if (v >= 1 && v <= 6) out.circuitNo = v;
+      }
       applySide(out, findSide(t));
     }
     if (out.intent === 'circuitset' || out.intent === 'conduits') applySide(out, findSide(t));
