@@ -443,9 +443,11 @@
        否则"把这面墙砸个洞"会被当成"开一扇门"。 */
     const hasPassage = /打通|拆墙|拆掉|拆除|拆了|拆这面|砸|破开|连通|连起来|连成一片|开放空间|合并成|合成一间/.test(t)
       || (/洞/.test(t) && /打通|通到|连通|隔壁|两间/.test(t));
-    /* 电：分路 / 回路 / 断电。注意要排在阀门前面——
-       "关掉照明"里的"关掉"会被阀门那条正则抓走，但用户说的是电不是水。 */
-    const hasCircuit = /电路|分路|回路|配电|强电|断电|停电|合闸|拉闸|送电|照明回路|插座回路|动力回路|哪路电|几路电|几路线/.test(t);
+    /* 电：分路 / 回路 / 断电 / 总开关。注意要排在阀门前面——
+       "关掉照明"里的"关掉"会被阀门那条正则抓走，但用户说的是电不是水。
+       总开关 / 总闸 / 总断路器也是电 —— 少了这几个词，"把 2 楼总闸拉下来"
+       会掉进别的意图，或者只停掉一条分路。 */
+    const hasCircuit = /电路|分路|回路|配电|强电|断电|停电|合闸|拉闸|送电|照明回路|插座回路|动力回路|哪路电|几路电|几路线|总开关|总闸|总断路|总电源|进线开关|进线断路|主开关|配电箱/.test(t);
     const hasConduit = /线管|暗管|预埋管|穿线管/.test(t)
       || /(墙里|墙内|墙中|墙里面).{0,8}(管|线|电缆|槽)/.test(t);
 
@@ -511,18 +513,32 @@
          只有明确带祈使语气（把/给/对/帮…，或直接以动词开头）才算操作。 */
       const askOnly = /会不会|有没有|怎么样|怎样|什么影响|影响(范围|哪些|多大|多少)|是否|有哪些|多少|几路|几回|几个分路/.test(t)
         && !/^(把|给|对|帮|请|麻烦)/.test(t.trim());
-      const wantOn = !askOnly && /合闸|送电|恢复供电|通电|开启|打开/.test(t);
-      const wantOff = !askOnly && /断电|关掉|关闭|断开|停掉|拉闸|切掉|掐断|切断/.test(t);
+      const wantOn = !askOnly && /合闸|送电|恢复供电|通电|开启|打开|合上|上电|来电/.test(t);
+      const wantOff = !askOnly && /断电|关掉|关闭|断开|停掉|拉闸|切掉|掐断|切断|拉下|跳闸/.test(t);
       if (wantOn || wantOff) { out.intent = 'circuitset'; out.action = wantOn ? 'on' : 'off'; }
       out.kind = /照明|灯/.test(t) ? 'light' : (/插座/.test(t) ? 'socket' : (/动力|空调|设备/.test(t) ? 'power' : null));
+      /* 总开关（进线断路器）管整层三路，和"断某一分路"是两层控制。
+         认出来之后必须把 kind / circuitNo 清掉 —— 留着它们，下游会
+         把"2 楼总闸拉下来"当成"2 楼照明断电"，结果只停一类电。 */
+      const mMain = /总开关|总闸|总断路|总电源|进线开关|进线断路|主开关/.test(t)
+        || /(整层|全层|这一层|这层|一层).{0,6}(全停|全断|停掉|断电|停电|都没电|没电|全灭|拉下)/.test(t)
+        || /(整层|全层).{0,4}(断电|停电|停)/.test(t);
+      if (mMain) {
+        out.mainSwitch = true;
+        out.scope = 'floor';
+        out.kind = null;
+        out.circuitNo = null;
+        out.circuit = null;
+        if (wantOn || wantOff) { out.intent = 'circuitset'; out.action = wantOn ? 'on' : 'off'; }
+      }
       const mc = t.match(/L\s*([1-5])\s*([ABC])/i);
-      if (mc) out.circuit = 'L' + mc[1] + mc[2].toUpperCase();
+      if (!mMain && mc) out.circuit = 'L' + mc[1] + mc[2].toUpperCase();
       /* "2 楼第一回路" / "第 2 回路" / "回路三" —— 现场是按编号叫的，不按 L2A 叫。
          注意别把"3 号回路"里的房号当楼层，楼层已经由 findFloor 单独取过了。 */
       const mn = t.match(/第\s*([一二三四五六1-6])\s*回/)
         || t.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/)
         || t.match(/([一二三四五六])\s*回(?:路|)/);
-      if (mn) {
+      if (!mMain && mn) {
         const v = CN[mn[1]] || +mn[1];
         if (v >= 1 && v <= 6) out.circuitNo = v;
       }

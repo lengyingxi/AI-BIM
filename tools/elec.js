@@ -379,7 +379,7 @@ const H = t => { console.log('\n' + t); };
   });
   P('按"第 1 回路"能找到 L2A', d11.label === '2F 第1回路' && d11.on === false, d11.label + ' on=' + d11.on);
   P('聚焦到 2 楼', d11.focus === 2, 'focus=' + d11.focus);
-  P('镜头推到配电箱跟前（< 3 m）', d11.camDist < 3, '镜头距目标 ' + d11.camDist.toFixed(2) + ' m');
+  P('镜头推到配电箱跟前（< 4 m，能看清手柄又看得见整台柜子）', d11.camDist < 4, '镜头距目标 ' + d11.camDist.toFixed(2) + ' m');
   P('回复里给了「查看回路影响」气泡', d11.chips.some(x => /查看回路影响/.test(x)), d11.chips.join(' / '));
 
   /* 断路器状态必须烘进几何：off 与 on 的顶点数不能一样，否则手柄动不了 */
@@ -422,20 +422,236 @@ const H = t => { console.log('\n' + t); };
   P('点「查看回路影响」后只看这一条路', d11c.clicked && d11c.isolated === true, '隔离组 ' + d11c.meshes + ' 个 mesh');
   P('影响视图回到本层全貌（能看全受影响的房间）', d11c.focus === 2);
 
+  /* ---------- 12. 总开关 vs 分路：两层控制 ---------- */
+  H('【12】总开关与分路：控制范围要分开');
+  const d12 = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene;
+    S.clearIsolate(); S.showConduits(false);
+    const p = E.panelOf(2);
+    const out = { hasPanel: !!p, mainInit: !!p && p.mainOn !== false };
+    /* 先复位：三路都合、总开关合 */
+    E.togglePanel(2, true);
+    E.list(2).forEach(c => E.toggle(c.id, true));
+    out.allLive = E.list(2).every(c => c.on === true);
+    /* 总开关一断 */
+    E.togglePanel(2, false);
+    const l = E.list(2);
+    out.live = l.map(c => c.on);
+    out.switchOn = l.map(c => c.switch_on);
+    out.mainOn = E.mainOn(2);
+    out.panelLiveCount = E.panelOf(2).liveCount;
+    out.panelAnyLive = E.panelOf(2).anyLive;
+    const imp = E.panelImpact(2) || { count: -1, room_nums: [], kinds: [] };
+    out.impCount = imp.count;
+    out.impKinds = imp.kinds.join('/');
+    out.totalRooms = BIM_MODEL.rooms.filter(r => r.floor === 2 && r.zone !== 'corr').length;
+    return out;
+  });
+  P('每层都有一台配电箱、且带总开关字段', d12.hasPanel && d12.mainInit === true);
+  P('总开关一断：三路全部失电', d12.live.every(v => v === false), 'live=' + d12.live.join(','));
+  P('总开关一断：三个分路手柄仍停在合位（没人去拨它们）',
+    d12.switchOn.every(v => v === true), 'switch_on=' + d12.switchOn.join(','));
+  P('配电箱统计跟着变成"一路都不带电"',
+    d12.panelLiveCount === 0 && d12.panelAnyLive === false, 'liveCount=' + d12.panelLiveCount);
+  P('总开关的控制面 = 整层全部房间',
+    d12.impCount === d12.totalRooms && d12.impCount > 0,
+    '受控 ' + d12.impCount + ' / 本层 ' + d12.totalRooms + ' 间，含 ' + d12.impKinds);
+
+  /* 反过来：总开关合着，只断一路 —— 另两路不受影响 */
+  const d12b = await p.evaluate(() => {
+    const E = BIM.elec;
+    E.togglePanel(2, true);
+    E.list(2).forEach(c => E.toggle(c.id, true));
+    E.toggle('L2A', false);
+    const l = E.list(2);
+    const ids = l.map(c => c.id);
+    const imp = E.impact('L2A') || { count: 0, rooms: [] };
+    return {
+      main: E.mainOn(2), ids: ids, live: l.map(c => c.on), switchOn: l.map(c => c.switch_on),
+      affected: imp.count,
+      /* 分路只停"一类功能" —— impact 里每间房丢的都是同一类 */
+      funcs: Array.from(new Set((imp.rooms || []).map(r => r.func))),
+      total: BIM_MODEL.rooms.filter(r => r.floor === 2 && r.zone !== 'corr').length
+    };
+  });
+  const iA = d12b.ids.indexOf('L2A');
+  P('总开关合着、只断 L2A：另两路仍然带电',
+    iA >= 0 && d12b.live[iA] === false && d12b.live.filter(v => v === true).length === d12b.live.length - 1,
+    d12b.ids.join(',') + ' live=' + d12b.live.join(','));
+  P('L2A 自己的手柄确实落下了',
+    iA >= 0 && d12b.switchOn[iA] === false, 'switch_on=' + d12b.switchOn.join(','));
+  P('分路只停一类功能（总开关是三类一起停）',
+    d12b.affected > 0 && d12b.funcs.length === 1,
+    '影响 ' + d12b.affected + ' 间，丢的功能=' + d12b.funcs.join(','));
+
+  /* 画面上必须能区分三种态：全合 / 某分路被拉下 / 总开关拉下（分路手柄不动）。
+     指纹要带索引权重 —— 只求和的话，"总开关手柄与分路手柄互换位置"会互相抵消，
+     两种完全不同的画面算出同一个签名。 */
+  const d12c = await p.evaluate(() => {
+    const E = BIM.elec, S = BIM.scene;
+    const pd = E.panelOf(2);
+    const W = () => {
+      const g = S.root().getObjectByName('panels');
+      const m = g && g.children.find(x => x.userData && x.userData.data && x.userData.data.id === pd.id);
+      if (!m) return null;
+      const pos = m.geometry.attributes.position;
+      let s = 0;
+      const n = Math.min(pos.count, 400);
+      for (let i = 0; i < n; i++) {
+        s += (pos.getX(i) + pos.getY(i) * 3 + pos.getZ(i) * 7) * ((i % 17) + 1);
+      }
+      return Math.round(s * 1000);
+    };
+    S.showConduits(true);
+    E.togglePanel(2, true); E.list(2).forEach(c => E.toggle(c.id, true));
+    S.refreshPanels(2); const allOn = W();
+    E.toggle('L2A', false); S.refreshPanels(2); const brOff = W();
+    E.toggle('L2A', true); E.togglePanel(2, false); S.refreshPanels(2); const mainOff = W();
+    return { allOn: allOn, brOff: brOff, mainOff: mainOff };
+  });
+  P('三种状态的箱体画法互不相同（全合 / 分路断 / 总开关断）',
+    d12c.allOn != null && d12c.brOff != null && d12c.mainOff != null &&
+    d12c.allOn !== d12c.brOff && d12c.brOff !== d12c.mainOff && d12c.allOn !== d12c.mainOff,
+    '全合=' + d12c.allOn + ' 分路断=' + d12c.brOff + ' 总开关断=' + d12c.mainOff);
+
+  /* 主干立管只显示当前楼层那一段 */
+  const d12d = await p.evaluate(() => {
+    const E = BIM.elec, S = BIM.scene;
+    E.togglePanel(2, true); E.list(2).forEach(c => E.toggle(c.id, true));
+    const c = E.circuit('L2A');
+    const list = S.circuitRoute(c, E.circuitRooms('L2A')) || [];
+    const trunks = list.filter(x => x.layer === 'trunk');
+    const feeds = list.filter(x => x.layer === 'feed');
+    return {
+      total: list.length, trunks: trunks.length, feeds: feeds.length,
+      trunkFloors: Array.from(new Set(trunks.map(x => x.floor))),
+      feedFloors: Array.from(new Set(feeds.map(x => x.floor))),
+      circFloor: c.floor,
+      allTrunkInModel: E.ready().conduits.filter(x => x.layer === 'trunk').length
+    };
+  });
+  P('查回路时主干立管只取本层那一段',
+    d12d.trunks > 0 && d12d.trunkFloors.length === 1 && d12d.trunkFloors[0] === d12d.circFloor,
+    '主干 ' + d12d.trunks + ' 段，只含 ' + d12d.trunkFloors.join(',') + 'F（全楼共 ' + d12d.allTrunkInModel + ' 段）');
+  P('层进线也只在 / 本层', d12d.feedFloors.every(f => f === d12d.circFloor), '进线楼层=' + d12d.feedFloors.join(','));
+
+  /* 配电箱是墙上设备，平时就得看得见 */
+  const d12e = await p.evaluate(async () => {
+    const S = BIM.scene;
+    S.showConduits(false);
+    S.setXray(false);
+    S.setFocus(2, false);
+    await new Promise(r => setTimeout(r, 300));
+    const g = S.root().getObjectByName('panels');
+    const vis = g ? g.children.filter(m => m.visible).map(m => m.userData && m.userData.floor) : [];
+    return { gv: g ? g.visible : null, vis: vis, conduits: S.conduitsOn !== false };
+  });
+  P('不开电气视图也能看见配电箱',
+    d12e.gv === true && d12e.vis.length > 0, 'group.visible=' + d12e.gv + ' 可见楼层=' + JSON.stringify(d12e.vis));
+
+  const d12f = await p.evaluate(async () => {
+    const S = BIM.scene;
+    S.setFocus(3, false);
+    await new Promise(r => setTimeout(r, 300));
+    const g = S.root().getObjectByName('panels');
+    const vis3 = g.children.filter(m => m.visible).map(m => m.userData && m.userData.floor);
+    S.setFocus(2, false);
+    return { vis3: vis3 };
+  });
+  P('切到 3 楼只剩 3 楼那只箱子（不留在空中）',
+    d12f.vis3.length === 1 && d12f.vis3[0] === 3, JSON.stringify(d12f.vis3));
+
+  /* 自然语言要能区分总开关和分路 */
+  const d12g = await p.evaluate(() => {
+    const N = window.BIM.nlp;
+    const f = t => N.parse(t);
+    const a = f('把2楼总闸拉下来');
+    const b = f('关掉2楼第1回路');
+    const c = f('2楼总开关现在是合着的吗');
+    return {
+      a: { intent: a.intent, main: a.mainSwitch === true, kind: a.kind, no: a.circuitNo, act: a.action },
+      b: { intent: b.intent, main: b.mainSwitch === true, no: b.circuitNo, act: b.action },
+      c: { intent: c.intent, main: c.mainSwitch === true, act: c.action || null }
+    };
+  });
+  P('"把2楼总闸拉下来" → 识别成总开关 + 断电',
+    d12g.a.intent === 'circuitset' && d12g.a.main === true && d12g.a.act === 'off',
+    JSON.stringify(d12g.a));
+  P('总开关不会被误当成某一路分路', d12g.a.no == null && d12g.a.kind == null, JSON.stringify(d12g.a));
+  P('"关掉2楼第1回路" 仍是分路、不是总开关',
+    d12g.b.intent === 'circuitset' && d12g.b.main === false && d12g.b.no === 1,
+    JSON.stringify(d12g.b));
+  P('"总开关现在合着吗" → 只查不改',
+    d12g.c.main === true && !d12g.c.act, JSON.stringify(d12g.c));
+
+  /* 真的走一遍对话：总开关断 → 整层失电 → 再合上 */
+  const d12h = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene;
+    E.togglePanel(2, true);
+    E.list(2).forEach(c => E.toggle(c.id, true));
+    await BIM.app.send('把2楼总开关拉下来');
+    await new Promise(r => setTimeout(r, 2600));
+    const l = E.list(2);
+    /* chips 气泡是追加在 chat 里的兄弟节点，所以 .msg.ai:last-child 选不到最后一条回复 */
+    const all = document.querySelectorAll('.msg.ai');
+    const txt = (all[all.length - 1] || {}).textContent || '';
+    return {
+      main: E.mainOn(2),
+      live: l.map(c => c.on),
+      switchOn: l.map(c => c.switch_on),
+      mentionMain: /总开关|总闸/.test(txt),
+      mentionScope: /整层|三路/.test(txt),
+      focus: S.focus,
+      last: BIM.app.lastData || null
+    };
+  });
+  P('对话"把2楼总开关拉下来"真的把总开关断了', d12h.main === false, 'mainOn=' + d12h.main);
+  P('三路一起失电，但手柄都没动',
+    d12h.live.every(v => v === false) && d12h.switchOn.every(v => v === true),
+    'live=' + d12h.live.join(',') + ' switch=' + d12h.switchOn.join(','));
+  P('回复里点明是总开关、且讲清"整层三路"这个范围',
+    d12h.mentionMain && d12h.mentionScope);
+  P('总开关操作后回到 2 楼', d12h.focus === 2, 'focus=' + d12h.focus);
+
+  const d12i = await p.evaluate(async () => {
+    const E = BIM.elec;
+    await BIM.app.send('把2楼总开关送电');
+    await new Promise(r => setTimeout(r, 2600));
+    return { main: E.mainOn(2), live: E.list(2).map(c => c.on) };
+  });
+  P('再合上总开关：三路一起恢复',
+    d12i.main === true && d12i.live.every(v => v === true), 'live=' + d12i.live.join(','));
+
+
   /* ---------- 8. MCP 工具暴露 ---------- */
   H('【8】MCP 工具与说明');
   const d8 = await p.evaluate(() => {
     const names = BIM.mcp.names;
     const g = BIM.mcp.guide || '';
+    const tc = (BIM.mcp.tools || []).find(t => t.function && t.function.name === 'toggle_circuit') || {};
+    const qc = (BIM.mcp.tools || []).find(t => t.function && t.function.name === 'query_circuits') || {};
+    const propsOf = t => Object.keys(((t.function || {}).parameters || {}).properties || {});
     return {
       total: names.length,
       has: ['open_passage', 'query_circuits', 'toggle_circuit', 'query_conduits'].filter(n => names.indexOf(n) >= 0),
-      guide: ['打通', '分路', '线管'].map(k => g.indexOf(k) >= 0)
+      guide: ['打通', '分路', '线管'].map(k => g.indexOf(k) >= 0),
+      /* 总开关这件事必须写进给大模型的说明，否则它只会按分路理解 */
+      mainGuide: /总开关/.test(g) && /main_switch/.test(g),
+      trunkGuide: /本层那一段|别的楼层的主干/.test(g),
+      panelGuide: /平时看楼层就一直在|不用先打开电气视图/.test(g),
+      mainProp: propsOf(tc).indexOf('main_switch') >= 0,
+      mainPropQ: propsOf(qc).indexOf('main_switch') >= 0,
+      desc: ((tc.function || {}).description || '')
     };
   });
   P('四个新工具都已注册', d8.has.length === 4, d8.has.join(','));
   P('工具总数 >= 32', d8.total >= 32, String(d8.total));
   P('给大模型的说明里提到打通/分路/线管', d8.guide.every(Boolean));
+  P('toggle_circuit 暴露了 main_switch（总开关）参数', d8.mainProp);
+  P('query_circuits 也能查总开关', d8.mainPropQ);
+  P('说明里讲清"总开关管整层、分路管自己"', d8.mainGuide && /整层三路|一断三路/.test(d8.desc));
+  P('说明里讲清"主干立管只画本层"', d8.trunkGuide);
+  P('说明里讲清"配电箱平时就在"', d8.panelGuide);
 
   const shot2 = 'outputs/elec-view.png';
   await p.evaluate(() => {

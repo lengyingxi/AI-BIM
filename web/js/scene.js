@@ -502,6 +502,9 @@
     if (roof) roof.visible = level === 0;
     if (D() && D().apply) D().apply();       // 吊顶/家具跟着聚焦一起显隐
     if (S.xray) S.setXray(true);
+    /* 配电箱按楼层跟着走：切到 2F 就只留 2F 那只箱子。
+       少了这一步，从 2F 切到 3F 时 2F 的箱子还挂在半空中。 */
+    syncPanels();
     labelLive = [];
     floorGroups.forEach(f => {
       const on = level !== 0 && f.level === level;
@@ -1851,30 +1854,52 @@
     /* ---- 断路器排：一个总开关 + 本层三路分路 ----
        手柄位置本身就表达通断：合闸时手柄在上、指示灯绿；断开时手柄落到下面、
        手柄和指示灯都变红。说"关掉 2 楼第一回路"，用户要能在箱子上一眼看到
-       就是从左数第一个手柄被拉下来了 —— 光在回复里写字不够。 */
+       就是从左数第一个手柄被拉下来了 —— 光在回复里写字不够。
+
+       ★ 总开关和三个分路是两层控制，读的字段也不同：
+         总开关 = panel.mainOn，一拉整层三路全停；
+         分路   = circuit.on，只管自己那一路。
+       总开关断开时，三个分路手柄照样停在合位（现场就是这样，没人会去拨它们），
+       只是灯灭 —— 所以要多一档"手柄合着但没电"的暗色，
+       否则屏幕上看起来像三路都被拔了闸，跟真实操作对不上。 */
     const ED = (E() && E().data) || { circuits: [] };
     const circs = (p.circuits || []).map(id => (ED.circuits || []).find(c => c.id === id)).filter(Boolean);
-    const anyOn = circs.length ? circs.some(c => c.on !== false) : true;
-    const H_ON = [.28, .32, .36], H_OFF = [.76, .20, .16], H_NA = [.46, .49, .53];
-    const L_G = [.16, .92, .45], L_R = [.98, .26, .18], L_NA = [.32, .33, .35];
+    const mainOn = p.mainOn !== false;
+    /* 颜色要够沉：箱门是接近纯白的，手柄再浅就糊成一片，三态分不出来 */
+    const H_ON = [.19, .23, .28], H_OFF = [.82, .16, .12], H_NA = [.46, .49, .53], H_DEAD = [.62, .44, .22];
+    const L_G = [.10, .90, .40], L_R = [.98, .22, .14], L_NA = [.30, .31, .33], L_DEAD = [.95, .66, .10];
 
     /* 导轨 */
     it.push({ size: [W * .80, .012, .012], matrix: frame(...at(0, -.055, F + .018), ux, uy), c: [.62, .66, .70] });
 
-    /* 总开关 */
+    /* 两组的边框：左边"管整层"一只，右边"各管一路"三只。
+       光靠位置和一条细挡板区分不够，远看还是一排开关；
+       各圈一个凹槽（先画外框、再画壳体，壳体盖住中间只剩边），分组一眼就出来。 */
+    const G_FRAME = [.44, .48, .52];
+    it.push({ size: [.150, .262, .020], matrix: frame(...at(-W * .34, .030, F + .012), ux, uy), c: G_FRAME });
+    it.push({ size: [.336, .262, .020], matrix: frame(...at(.075, .030, F + .012), ux, uy), c: G_FRAME });
+
+    /* 总开关：位置固定在最左边，手柄只认 mainOn */
     const mw = -W * .34;
-    it.push({ size: [.090, .210, .030], matrix: frame(...at(mw, .030, F + .022), ux, uy), c: [.90, .92, .94] });
-    it.push({ size: [.055, .060, .036], matrix: frame(...at(mw, anyOn ? .090 : -.030, F + .034), ux, uy), c: anyOn ? H_ON : H_OFF });
-    it.push({ size: [.026, .026, .022], matrix: frame(...at(mw, .175, F + .020), ux, uy), c: anyOn ? L_G : L_R });
+    it.push({ size: [.105, .225, .030], matrix: frame(...at(mw, .030, F + .022), ux, uy), c: [.86, .89, .92] });
+    it.push({ size: [.062, .066, .038], matrix: frame(...at(mw, mainOn ? .090 : -.030, F + .036), ux, uy), c: mainOn ? H_ON : H_OFF });
+    it.push({ size: [.030, .030, .024], matrix: frame(...at(mw, .178, F + .022), ux, uy), c: mainOn ? L_G : L_R });
+
+    /* 分组挡板：左边这只"管全层"，右边三只"各管一路"，中间隔开一条。
+       位置取两个边框之间的空档，别压在框沿上，否则两块连成一片反而更糊。 */
+    it.push({ size: [.016, .240, .028], matrix: frame(...at(-W * .183, .030, F + .020), ux, uy), c: [.26, .29, .33] });
 
     /* 三路分路，从左到右 = 第 1/2/3 回路 */
     [-.055, .075, .205].forEach((dw, i) => {
       const c = circs[i];
       const has = !!c;
-      const on = has ? c.on !== false : true;
-      it.push({ size: [.075, .190, .028], matrix: frame(...at(dw, .030, F + .020), ux, uy), c: has ? [.93, .94, .96] : [.87, .89, .91] });
-      it.push({ size: [.050, .055, .036], matrix: frame(...at(dw, on ? .090 : -.030, F + .032), ux, uy), c: has ? (on ? H_ON : H_OFF) : H_NA });
-      it.push({ size: [.024, .024, .022], matrix: frame(...at(dw, .175, F + .020), ux, uy), c: has ? (on ? L_G : L_R) : L_NA });
+      const on = has ? c.on !== false : true;              // 手柄位置：只看分路自己
+      const live = has ? (mainOn && on) : false;           // 实际带电：还要过总开关
+      const hc = !has ? H_NA : (live ? H_ON : (on ? H_DEAD : H_OFF));
+      const lc = !has ? L_NA : (live ? L_G : (on ? L_DEAD : L_R));
+      it.push({ size: [.078, .200, .028], matrix: frame(...at(dw, .030, F + .020), ux, uy), c: has ? [.90, .92, .94] : [.85, .87, .90] });
+      it.push({ size: [.054, .060, .038], matrix: frame(...at(dw, on ? .090 : -.030, F + .034), ux, uy), c: hc });
+      it.push({ size: [.028, .028, .024], matrix: frame(...at(dw, .178, F + .020), ux, uy), c: lc });
     });
 
     /* 底排：电能表 / 铭牌 / 电源指示灯 */
@@ -1898,13 +1923,27 @@
     (E().data.panels || []).forEach(p => {
       try { g.add(ePanelMesh(p)); } catch (e) { }
     });
-    /* 配电箱属于电气专业，跟线管一起显隐。
-       以前它是一直挂着的，不开电气视图也能在房间里看到几个箱子，
-       看着就像"设备放歪了"。 */
-    g.visible = eOn;
+    /* 配电箱是真实装在墙上的设备，不是"电气视图的附属物"：
+       平时看楼层就该看得见（用户原话："这个控制器日常其他功能在查看楼层的时候不要隐藏"）。
+       只跟随楼层聚焦显隐，不跟电气层开关走。 */
+    g.visible = true;
     scene.add(g); ePanels = g;
+    syncPanels();
   }
   S.rebuildPanels = ePanelBuild;
+
+  /* 配电箱跟着楼层聚焦走：全楼视图（focus=0）全显示，看某一层只显示那一层的。
+     它挂在 scene 上、不进 floorGroups，所以要自己按层过滤，否则隔着楼板也能看见别的层的箱子。 */
+  function syncPanels() {
+    if (!ePanels) return;
+    const lv = S.focus || 0;
+    ePanels.children.forEach(m => {
+      const f = m.userData && m.userData.floor;
+      m.visible = lv === 0 || f === lv;
+    });
+    ePanels.visible = true;
+  }
+  S.syncPanels = syncPanels;
 
   /* 重画配电箱：断路器的通断状态改了以后必须重新生成几何
      —— 手柄位置是烘进顶点里的，只改材质是动不了的。 */
@@ -1921,7 +1960,7 @@
       }
       try { ePanels.add(ePanelMesh(p)); } catch (e) { }
     });
-    ePanels.visible = eOn;
+    syncPanels();
   };
 
   /* 把镜头放到这一层配电箱跟前站定。
@@ -1937,9 +1976,12 @@
     S.setFocus(p.floor, false);
     const el = ((M.floors.find(f => f.level === p.floor) || {}).elev) || 0;
     const n = (Array.isArray(p.n) && p.n.length === 2) ? p.n : [1, 0];
-    const d = 1.8;                          // 站得近一点，箱子上那三个手柄要看得清
+    /* 1.8 m 太贴脸：整屏只剩箱门，看不出这是装在墙上的一台柜子。
+       2.9 m 能把箱体轮廓、挂板和它所在的那面墙一起框进来，
+       手柄仍然看得清（0.9 m 高的箱子约占画面 1/3）。 */
+    const d = 2.9;
     const t = new THREE.Vector3(p.x, el + p.z + 0.05, -p.y);
-    const c = new THREE.Vector3(p.x + n[0] * d, el + p.z + 0.42, -(p.y + n[1] * d));
+    const c = new THREE.Vector3(p.x + n[0] * d, el + p.z + 0.55, -(p.y + n[1] * d));
     flyTo(c, t, 780);
     return p;
   };
@@ -1953,8 +1995,13 @@
     S.showConduits(true);
     S.setXray(true);
     S.clearConduitMarks();
+    /* 主干立管只取"本层那一段"。整栋楼的主干是 TR-1F…TR-5F 五段首尾相接的，
+       原来把 layer==='trunk' 全放进来，屏幕上就是一根从一层通到五层的长杆，
+       焦点又被压在 2F，看起来像"电从天上掉下来"，看不出这一段到底接的是谁。
+       用户的原话是"问相关问题的时候主干管也只展示当前楼层的"。 */
     const list = (D.conduits || []).filter(c =>
-      c.circuit === circ.id || c.layer === 'trunk' || c.layer === 'feed');
+      c.circuit === circ.id ||
+      ((c.layer === 'trunk' || c.layer === 'feed') && c.floor === circ.floor));
     /* 画粗一档：这一屏是把整层框进来，原尺寸的管子在屏幕上只有一两个像素，
        不放大根本看不出"这条电是从竖井下来、沿走廊跑、再分进哪几间房" */
     S.isolateConduits(list, { grow: 3.0 });
@@ -1969,7 +2016,9 @@
     if (eOn && !eRoot) eBuild();
     if (eOn && !ePanels) ePanelBuild();
     if (eRoot) eRoot.visible = eOn;
-    if (ePanels) ePanels.visible = eOn;
+    /* 配电箱不跟电气层开关走 —— 它是真装在墙上的设备，关掉"看管线"也得留着。
+       这里只按当前楼层重算显隐。 */
+    syncPanels();
     if (!eOn) { S.clearIsolate(); S.showCircuit(null); }
     if (eOn && !S.xray) S.setXray(true);
   };

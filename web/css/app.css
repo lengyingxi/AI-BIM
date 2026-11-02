@@ -77,6 +77,11 @@ button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit
 .res-grid div{flex:1;background:#fff;padding:7px 9px}
 .res-grid i{display:block;font-style:normal;font-size:9.5px;color:var(--ink3);margin-bottom:2px}
 .res-grid b{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+/* 整层断电、整层影响这类场景要一次列 10 间以上房，flex 平铺会挤成一团、
+   数字和"三路全停"压在一起看不清 —— 这种网格按 5 列换行排。 */
+.res-grid.wrap{flex-wrap:wrap}
+.res-grid.wrap div{flex:0 0 calc(20% - 1px);min-width:58px}
+.res-grid.wrap i,.res-grid.wrap b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .res-adv{padding:8px 12px;font-size:11.5px;line-height:1.55;color:var(--ink2);background:#fbfcfd}
 .res-adv s{text-decoration:none;color:var(--acc-3)}
 

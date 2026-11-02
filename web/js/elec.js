@@ -401,6 +401,9 @@
         id: pid, floor: L, room: shaft.id, roomNum: shaft.num,
         name: L + 'F 配电箱 ' + pid, wall: pick ? pick.w.id : null, at: pick ? pick.at : 0,
         z: 1.5, w: 0.7, h: 0.9, d: 0.18,
+        /* 总开关（进线断路器）：一断，本层三条分路全部失电。
+           分路断路器（circuits 里那三个）只管自己那一路。 */
+        mainOn: true,
         circuits: [cA.id, cB.id, cC.id]
       };
       if (pick) {
@@ -628,16 +631,39 @@
     });
 
     /* 分路状态：重建时把原来的通断状态带过来。
-       用户掐掉一路电以后再开个窗，电不能自己又合上。 */
-    const prev = (E.data && E.data.state) || {};
-    D.circuits.forEach(c => {
-      const on = prev[c.id] != null ? prev[c.id] : true;
-      c.on = on;
-      D.state[c.id] = on;
-    });
+       用户掐掉一路电以后再开个窗，电不能自己又合上。
+       注意这里要带的是**断路器手柄位置**（c.on），不是"有没有电"：
+       总开关断掉时三路都是没电的，但手柄仍停在合位 —— 这两件事分开存，
+       否则总开关一断、重建一次，三个分路的手柄就会被悄悄按下去。 */
+    const prevC = {};
+    ((E.data && E.data.circuits) || []).forEach(c => { prevC[c.id] = c.on; });
+    const prevP = {};
+    ((E.data && E.data.panels) || []).forEach(p => { prevP[p.id] = p.mainOn; });
+    D.circuits.forEach(c => { c.on = prevC[c.id] !== false; });
+    D.panels.forEach(p => { p.mainOn = prevP[p.id] !== false; });
+    applyLive(D);
     E.data = D;
     return D;
   };
+
+  /* 由"开关位置"算出"这一路现在到底有没有电"：
+       分路带电 = 本层总开关合着 且 这一路断路器合着
+     总开关（进线断路器）断掉时，下游三路全部失电，但三个分路手柄仍停在合位 ——
+     这就是"总开关管全部、分路只管自己"在数据上的表达。 */
+  function applyLive(D) {
+    D.state = D.state || {};
+    (D.circuits || []).forEach(c => {
+      const p = (D.panels || []).find(x => x.id === c.panel);
+      c.live = (p ? p.mainOn !== false : true) && c.on !== false;
+      D.state[c.id] = c.live;
+    });
+    (D.panels || []).forEach(p => {
+      const mine = (D.circuits || []).filter(c => c.panel === p.id);
+      p.liveCount = mine.filter(c => c.live).length;
+      p.anyLive = p.liveCount > 0;
+    });
+    return D;
+  }
 
   function ready() {
     if (!E.data) E.build();
@@ -752,18 +778,65 @@
 
   E.reroutes = () => Object.keys(ready().reroutes || {}).map(k => ready().reroutes[k]);
 
-  /* ---------------- 分路控制 ---------------- */
+  /* ---------------- 分路控制 ----------------
+     两层控制，范围必须分清（用户的原话："总开关和3个分路断路器需要控制范围区分开来"）：
+       · 分路断路器 E.toggle(circ)  —— 只管自己那一路；总开关合着的时候才有意义
+       · 总开关     E.togglePanel(层) —— 一断，本层三路全部失电，但三个分路手柄不动
+     所以"有没有电"永远是 live = mainOn && on，别拿 on 当带电用。 */
   E.toggle = function (id, on) {
     const D = ready();
     const c = E.circuit(id);
     if (!c) return null;
     c.on = on !== false;
-    D.state[c.id] = c.on;
+    applyLive(D);
     return c;
   };
   E.isOn = function (id) {
+    const c = E.circuit(id);
+    return !!c && c.live !== false;
+  };
+  /* 通路（断路器位置）和带电是两回事，查询时都要能拿到 */
+  E.switchOn = function (id) {
+    const c = E.circuit(id);
+    return !!c && c.on !== false;
+  };
+
+  E.panelOf = function (floor) {
+    return (ready().panels || []).find(p => p.floor === floor) || null;
+  };
+  /* 这一层的总开关（进线断路器）合着没有 */
+  E.mainOn = function (floor) {
+    const p = E.panelOf(floor);
+    return p ? p.mainOn !== false : true;
+  };
+  E.togglePanel = function (floor, on) {
     const D = ready();
-    return D.state[id] !== false;
+    const p = E.panelOf(floor);
+    if (!p) return null;
+    p.mainOn = on !== false;
+    applyLive(D);
+    return p;
+  };
+  E.syncLive = function () { return applyLive(ready()); };
+
+  /* 总开关一断 = 整层所有分路同时停，影响面是本层全部房间。
+     和分路不同：分路只停一类功能，总开关是三类全停。 */
+  E.panelImpact = function (floor) {
+    const D = ready();
+    const p = E.panelOf(floor);
+    if (!p) return null;
+    const mine = (D.circuits || []).filter(c => c.panel === p.id);
+    const rooms = (M().rooms || []).filter(r => r.floor === floor && r.zone !== 'corr');
+    const powered = rooms.filter(r => E.roomsCircuits(r).length > 0);
+    return {
+      panel: p, floor: floor, mainOn: p.mainOn !== false,
+      circuits: mine, circuit_count: mine.length,
+      kinds: mine.map(c => E.KIND_CN[c.kind] || c.kind),
+      rooms: powered, room_nums: powered.map(r => r.num),
+      count: powered.length,
+      /* 一整层全黑：总开关一断，照明也没了 */
+      dark_rooms: powered.map(r => r.num)
+    };
   };
 
   /* 这条分路管哪些房间（带房号与用途，回复里要用） */
@@ -784,16 +857,22 @@
      而是"这间房失去了这一类功能"。所以这里按功能分开算，别拿 on.length 一概而论。 */
   E.roomPower = function (room) {
     const cs = E.roomsCircuits(room);
-    const on = cs.filter(c => c.on !== false);
-    const off = cs.filter(c => c.on === false);
+    /* 一律按 live（有没有电）分，不按 c.on（手柄位置）：
+       总开关一断，三个手柄都还合着，但这间房同样一点电都没有。 */
+    const on = cs.filter(c => c.live !== false);
+    const off = cs.filter(c => c.live === false);
     const kindsAll = cs.map(c => c.kind);
     const kindsOff = off.map(c => c.kind);
     const lost = kindsOff.map(k => E.KIND_CN[k] || k);
+    const mains = {};
+    cs.forEach(c => { mains[c.panel] = E.mainOn(c.floor); });
+    const noMain = Object.keys(mains).filter(k => !mains[k]);
     return {
       circuits: cs, on: on, off: off,
-      all_off: cs.length > 0 && on.length === 0,   // 一间房连一条通的都没有（含竖井未进）
+      main_off: noMain,                             // 总开关断着的配电箱（这时三路一起停）
+      all_off: cs.length > 0 && on.length === 0,    // 一间房连一条通的都没有（含竖井未进）
       any_off: off.length > 0,
-      lost: lost,                                   // ['照明'] / ['插座','动力']
+      lost: lost,                                   // ['照明'] / ['插座','动力'] / 全三类
       still: on.map(c => E.KIND_CN[c.kind] || c.kind),
       has_light: kindsAll.indexOf('light') >= 0,
       dark: kindsOff.indexOf('light') >= 0,         // 照明断了 = 这间黑了
@@ -821,7 +900,10 @@
     });
     return {
       circuit: c, kind: kind, kind_cn: cn,
-      panel: c.panel, phase: c.phase, rated: c.rated, on: c.on !== false,
+      panel: c.panel, phase: c.phase, rated: c.rated,
+      on: c.live !== false,                 // 带电（已算上总开关）
+      switch_on: c.on !== false,            // 断路器手柄位置
+      main_on: E.mainOn(c.floor),
       rooms: rows, count: rows.length,
       room_nums: rooms.map(r => r.num),
       /* 这条分路一断，整间房彻底变黑的（照明回路才有） */
@@ -861,7 +943,10 @@
         }, {});
         return {
           id: c.id, no: c.no, label: c.label, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
-          panel: c.panel, phase: c.phase, rated: c.rated, on: c.on !== false,
+          panel: c.panel, phase: c.phase, rated: c.rated,
+          on: c.live !== false,                  // 现在有没有电（含总开关）
+          switch_on: c.on !== false,             // 分路断路器手柄
+          main_on: E.mainOn(c.floor),            // 本层总开关
           rooms: c.rooms.length, conduits: c.conduits.length, layers: layers,
           room_nums: E.circuitRooms(c.id).map(r => r.num)
         };
