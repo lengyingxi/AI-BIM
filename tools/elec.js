@@ -33,19 +33,69 @@ const H = t => { console.log('\n' + t); };
     const st = E.stats();
     const byFloor = {};
     (E.data ? E.data.panels : []).forEach(p => { byFloor[p.floor] = (byFloor[p.floor] || 0) + 1; });
+    /* 主干立管：必须全楼同一平面位置，且各层段首尾相接，才算"一条通到底" */
+    const rs = (E.data.risers || []).slice().sort((a, b) => a.floor - b.floor);
+    const aligned = rs.length > 0 && rs.every(r =>
+      Math.abs(r.x - rs[0].x) < 1e-6 && Math.abs(r.y - rs[0].y) < 1e-6);
+    const chained = rs.every((r, i) => {
+      if (i === 0) return Math.abs(r.z0) < 1e-6;
+      const prev = rs[i - 1];
+      const pf = M.floors.find(f => f.level === prev.floor) || {};
+      return Math.abs(r.z0) < 1e-6 && Math.abs(prev.z1 - (pf.height || 0)) < 1e-6;
+    });
     return {
       st: st, panels: E.data.panels.length, circuits: E.data.circuits.length,
       floors: M.floors.length, rooms: M.rooms.length,
       floorPanel: byFloor,
       kinds: E.data.circuits.map(c => c.kind).filter((v, i, a) => a.indexOf(v) === i),
-      perFloorCircuits: Object.keys(byFloor).map(f => E.list(+f).length)
+      perFloorCircuits: Object.keys(byFloor).map(f => E.list(+f).length),
+      riserAligned: aligned && chained,
+      trunkText: rs.length ? ('x=' + rs[0].x.toFixed(2) + ' y=' + rs[0].y.toFixed(2) + '，' + rs.length + ' 段首尾相接') : '无立管'
     };
   });
   P('每层一部配电箱', d1.panels === d1.floors, d1.panels + ' 箱 / ' + d1.floors + ' 层');
   P('每层三条分路（照明/插座/动力）', d1.perFloorCircuits.every(n => n === 3), JSON.stringify(d1.perFloorCircuits));
-  P('线管总量 > 400', d1.st.conduits > 400, JSON.stringify(d1.st.by_kind));
+  /* 总量只是防退化的下限：55 间房 × 5 层规模的楼，三百多段是合理密度。
+     插座/动力不铺走廊侧（那面墙全是门），所以比早先满铺时少一截，属预期。 */
+  P('线管总量 > 300', d1.st.conduits > 300, JSON.stringify(d1.st.by_kind));
   P('四类线管齐全（含楼层进线竖井）',
     ['light', 'socket', 'power', 'riser'].every(k => d1.st.by_kind[k] > 0));
+
+  /* 拓扑必须是"主干 → 干线 → 支线"的四级，不能还是逐墙乱铺 */
+  const bl = d1.st.by_layer || {};
+  P('五级拓扑齐全（主干/层进线/走廊干线/墙内下引/房间支线）',
+    ['trunk', 'feed', 'corridor', 'drop', 'room'].every(k => bl[k] > 0),
+    JSON.stringify(bl));
+  P('主干立管每层一段且上下对齐（一条通到底）', d1.riserAligned === true, d1.trunkText);
+
+  /* ---------- 1b. 管线连续性：干线支线都不能断成一截截 ---------- */
+  H('【1b】管线连续性');
+  const dc = await p.evaluate(() => {
+    const E = BIM.elec, M = BIM_MODEL;
+    /* 走廊干线：同一条分路在同一面墙上不该被切成很多小段 */
+    const corr = E.conduitsOf({ floor: 1, layer: 'corridor' });
+    const byWallKind = {};
+    corr.forEach(c => { const k = c.wall + '|' + c.kind; (byWallKind[k] = byWallKind[k] || []).push(c); });
+    const splits = Object.keys(byWallKind).map(k => byWallKind[k].length);
+    /* 房间支线：每间房四面墙都得铺到，一侧空缺就成了"半圈"，
+       看着就是断线。逐间逐面查。 */
+    const room = E.conduitsOf({ floor: 1, layer: 'room', kind: 'light' });
+    const miss = [];
+    M.rooms.filter(r => r.floor === 1 && r.zone !== 'corr').forEach(r => {
+      Object.keys(r.sides || {}).forEach(k => {
+        const n = room.filter(c => c.wall === r.sides[k]).length;
+        if (!n) miss.push(r.num + ':' + k);
+      });
+    });
+    return {
+      corrN: corr.length, maxSplit: Math.max.apply(null, splits.concat([0])),
+      roomN: room.length, miss: miss
+    };
+  });
+  P('走廊干线整段敷设（同一墙同一分路不被切碎）', dc.maxSplit <= 2,
+    dc.corrN + ' 段，单墙最多 ' + dc.maxSplit + ' 段');
+  P('房间照明支线绕满四周（四面墙都铺到，不留半圈）', dc.miss.length === 0,
+    dc.roomN + ' 段' + (dc.miss.length ? '，缺：' + dc.miss.join(',') : ''));
 
   /* ---------- 2. 通用性：任意楼层任意房间都成立 ---------- */
   H('【2】通用性（不写死房号）');
@@ -105,8 +155,9 @@ const H = t => { console.log('\n' + t); };
   H('【4】开窗/开门撞墙内线管');
   const d4 = await p.evaluate(() => {
     const E = BIM.elec, M = BIM_MODEL, C = BIM.calc;
-    /* 找一面带插座管（贴地 0.32 m）的墙 */
-    const cs = E.conduitsOf({ floor: 1, kind: 'socket' });
+    /* 找一面带插座管（贴地 0.32 m）的墙 —— 取房间支线，
+       不要拿走廊干线（2.80 m 桥架），那个高度门也撞不到 */
+    const cs = E.conduitsOf({ floor: 1, kind: 'socket', layer: 'room' });
     const c0 = cs[0];
     const wall = M.walls.find(w => w.id === c0.wall);
     const at = (c0.at0 + c0.at1) / 2;
@@ -130,7 +181,7 @@ const H = t => { console.log('\n' + t); };
   H('【5】牵线改道规划');
   const d5 = await p.evaluate(() => {
     const E = BIM.elec;
-    const c0 = E.conduitsOf({ floor: 1, kind: 'socket' })[0];
+    const c0 = E.conduitsOf({ floor: 1, kind: 'socket', layer: 'room' })[0];
     const hole = { at0: c0.at0 - 0.2, at1: c0.at1 + 0.2, z0: 0, z1: 2.4 };
     const plan = E.planReroute(c0, hole);
     const before = E.hitWall(BIM_MODEL.walls.find(w => w.id === c0.wall), { at: (c0.at0 + c0.at1) / 2, w: 1.8, h: 2.4, sill: 0 }).length;
@@ -195,23 +246,26 @@ const H = t => { console.log('\n' + t); };
   H('【7】冲突可视化');
   const d7 = await p.evaluate(async () => {
     const E = BIM.elec, M = BIM_MODEL, S = BIM.scene;
-    const c0 = E.conduitsOf({ floor: 1, kind: 'socket' })[0];
+    const c0 = E.conduitsOf({ floor: 1, kind: 'socket', layer: 'room' })[0];
     const wall = M.walls.find(w => w.id === c0.wall);
     S.showConduits(true);
     S.ghostWall(wall, true);
     S.clearConduitMarks();
+    /* 只显示这一根：其它分路整体隐藏（不是压暗），屏幕上干净才看得清 */
+    S.isolateConduits([c0]);
     S.markConduits([c0], 0xff3b30);
     const plan = E.planReroute(c0, { at0: c0.at0 - .2, at1: c0.at1 + .2, z0: 0, z1: 2.4 });
     S.showReroute(plan, 0x17a673);
     const R = S._dbg ? S._dbg() : {};
     return {
-      conduitOn: S.elecOn(), xray: S.xray,
+      conduitOn: S.elecOn(), xray: S.xray, isolated: S.hasIsolate ? S.hasIsolate() : null,
       /* 不依赖调试接口，用统计判断：标记后应该有线管处于高亮材质 */
       stats: E.stats()
     };
   });
   P('线管可整体显示', d7.conduitOn === true);
   P('显示线管时自动半透明楼体', d7.xray === true);
+  P('碰撞时只显示命中的管线（其它分路收起）', d7.isolated === true);
   const shot1 = 'outputs/elec-conflict.png';
   await p.screenshot({ path: shot1 });
 

@@ -50,13 +50,35 @@
   };
   E.SEC = SEC;
 
-  /* 标高（相对楼板面）
-     这三个数字是冲突行为的来源，别随手改：
+  /* 走廊干线的截面比支线粗一档：干线是"一根管子喂一层"，支线只是末端 */
+  const MAIN_SEC = {
+    light: { s: 0.062, d: 0.22 },
+    socket: { s: 0.072, d: 0.24 },
+    power: { s: 0.095, d: 0.30 }
+  };
+  E.MAIN_SEC = MAIN_SEC;
+
+  /* 走廊干线（桥架）标高：三条分路分层敷设，都走在吊顶里。
+     这几个数都高于常用门洞（2.1~2.4 m）和窗顶（2.4 m），
+     所以干线本身不会跟开门开窗打架 —— 会打架的永远是房间里的支线。
+     这也符合现场：桥架在吊顶上，凿墙开门根本碰不到它。 */
+  const MAIN_Z = { light: 3.00, socket: 2.80, power: 2.60 };
+  E.MAIN_Z = MAIN_Z;
+
+  /* 房间支线标高（相对楼板面）。这三个数字是冲突行为的来源，别随手改：
        插座 0.32 —— 贴地走，新开门洞（sill=0）撞的就是它，最真实的一种冲突
-       动力 2.35 —— 吊顶下沿的桥架/线槽，门洞 2.1~2.6 有时擦到，2.4 顶的高窗也会撞
+       动力 2.35 —— 房间内沿墙的动力线槽，门洞 2.1~2.6 有时擦到，2.4 顶的高窗也会撞
        照明 2.90 —— 吊顶里，普通窗（窗台 0.9 + 高 1.5，顶 2.4）够不着，
                    只有做到顶的高窗、落地窗才会碰上 */
-  const Z = { socket: 0.32, power: 2.35, light: 2.90 };
+  const BRANCH_Z = { light: 2.90, socket: 0.32, power: 2.35 };
+  E.BRANCH_Z = BRANCH_Z;
+
+  /* 管线在拓扑里属于哪一层。原来所有线管一视同仁，看不出"主干—干线—支线"，
+     加了这个字段，图例、统计、"这条管归谁"都能说清楚。 */
+  E.LAYER_CN = {
+    trunk: '主干立管', feed: '层进线', corridor: '走廊干线',
+    drop: '墙内下引', room: '房间支线'
+  };
 
   /* 洞口两侧要留的保护距离：线管不能贴着洞边，得留抹灰和护角 */
   const GUARD = 0.12;
@@ -72,12 +94,25 @@
   E.axis = axis;
   E.len = wall => axis(wall).L;
 
-  /* 把墙上的可用区间按已有洞口切成子段，每段两头各留 GUARD */
-  function splitByOpenings(wall, a, b) {
+  /* 把墙上的可用区间按已有洞口切成子段，每段两头各留 GUARD。
+
+     ★ 第二个参数 z / s 很关键：只在"高度上真能碰上"的洞口处断开。
+       不给 z 就是老行为（任何洞口都断）——干线在吊顶里、门洞只有 2.1 m 高，
+       按老行为会被每个门洞切断，看上去就是一截一截的，这正是之前
+       "红色管线不连续"的根源之一。 */
+  function splitByOpenings(wall, a, b, z, s) {
     const L = axis(wall).L;
     let lo = Math.max(0, a), hi = Math.min(L, b);
     if (hi - lo < 1e-6) return [];
-    const ops = (wall.openings || []).slice().sort((p, q) => p.at - q.at);
+    const z0 = z == null ? null : z - (s || 0) / 2 - 0.02;
+    const z1 = z == null ? null : z + (s || 0) / 2 + 0.02;
+    const ops = (wall.openings || []).slice()
+      .filter(o => {
+        if (z0 == null) return true;
+        const sill = o.sill || 0;
+        return !(sill + (o.h || 2.1) <= z0 || sill >= z1);   // 高度不重叠 → 不算挡路
+      })
+      .sort((p, q) => p.at - q.at);
     const out = [];
     let cur = lo;
     for (const o of ops) {
@@ -125,147 +160,278 @@
     return POWER_USE.test((r.use || '') + ' ' + (r.name || ''));
   }
 
-  /* ---------------- 生成 ---------------- */
+  /* ---------------- 生成 ----------------
+     拓扑（真实配电的四级，别拿"每间房顶上一根照明管"糊弄）：
+       
+       ① 主干立管 TRUNK —— 一条，在电气竖井里从 1F 楼板下直通顶层楼板上。
+          各层取同一平面位置、首尾严格相接，所以看上去是一根通到底的管子。
+       ② 层配电箱 PANEL + 层进线 FEED —— 每层一部箱子贴墙挂在电气间，
+          从主干水平引一根进线到箱子顶部。
+       ③ 走廊干线 CORRIDOR —— 从箱子出线，沿走廊两侧墙整段连续敷设（三条分路分层走桥架）。
+          走廊是"每层配电的主动脉"，一层的电先在这里横向跑一圈。
+       ④ 房间支线 ROOM —— 从走廊干线在墙里下引，进房间后沿四周墙整段连续敷设。
+          照明 / 插座 / 动力各一根；动力只进机房类房间。
+
+     为什么这么改（原来那版的毛病）：
+       · 原来逐墙逐房间铺，且每段只铺一部分（照明整段、插座 62%、动力中段 50%），
+         结果红色动力管一段一段的，看着像断线。现在**干线支线都整段连续**。
+       · 原来洞口切段不判标高，门洞（2.1 m）会把吊顶里的干线（2.8~3.0 m）也切断。
+         现在 splitByOpenings 带标高，够不着的洞口不断管。
+       · 原来每层配电箱各找各的墙，立管跟着箱子走，上下不在一条线上，
+         上一层和下一层的竖管错开，看着就"不连贯"。现在立管位置全楼统一。
+  */
   /* 模型换过（导入 IFC）之后必须重建：几何全变了，旧线管一根都不能留 */
   E.build = function () {
     const m = M();
-    const D = { panels: [], circuits: [], conduits: [], reroutes: {}, state: {} };
+    const D = { panels: [], circuits: [], conduits: [], risers: [], reroutes: {}, state: {}, trunk: null };
     if (!m || !m.walls) { E.data = D; return D; }
 
+    const allRooms = m.rooms || [], allWalls = m.walls || [];
+    const floors = (m.floors || []).slice().sort((a, b) => a.level - b.level);
     const byId = {};
+    const seen = {};                 // 去重：同一面墙同一区间不重复铺同一根管
     const addC = c => { D.circuits.push(c); byId[c.id] = c; return c; };
+    const liveCircs = [];            // 本层三条分路，铺管时要用
 
-    (m.floors || []).forEach(fl => {
-      const L = fl.level;
-      const rooms = (m.rooms || []).filter(r => r.floor === L);
+    /* ---- ① 电气竖井：每层各挑一间 ---- */
+    const shaftOf = {};
+    floors.forEach(fl => {
+      const rooms = allRooms.filter(r => r.floor === fl.level);
       if (!rooms.length) return;
-      /* 配电间：电气/机房类 > 核心筒 > 第一间。竖井位置决定了干线怎么落 */
-      const shaft = rooms.find(r => /电气|配电|强电|变电|竖井/.test((r.use || '') + (r.name || '')))
+      shaftOf[fl.level] = rooms.find(r => /电气|配电|强电|变电|竖井/.test((r.use || '') + (r.name || '')))
         || rooms.find(r => isPowerRoom(r))
         || rooms.find(r => r.zone === 'core')
         || rooms[0];
+    });
+    const shafts = floors.map(f => shaftOf[f.level]).filter(Boolean);
+
+    /* 主干立管的平面位置：取各层竖井平面区域的**公共部分**再往里收 0.45 m。
+       收得进去就说明各层竖井是一摞，立管就能真正竖直；收不进去（各层电气间
+       错得很开）就退回平均位置 —— 宁可立管穿过一点点房间，也不要它上下错位断掉。 */
+    let tx = 0, ty = 0;
+    if (shafts.length) {
+      const ix0 = Math.max.apply(null, shafts.map(s => s.x0));
+      const iy0 = Math.max.apply(null, shafts.map(s => s.y0));
+      const ix1 = Math.min.apply(null, shafts.map(s => s.x1));
+      const iy1 = Math.min.apply(null, shafts.map(s => s.y1));
+      if (ix1 - ix0 > 1.0 && iy1 - iy0 > 1.0) { tx = ix0 + 0.45; ty = iy0 + 0.45; }
+      else {
+        tx = shafts.reduce((a, s) => a + (s.x0 + s.x1) / 2, 0) / shafts.length;
+        ty = shafts.reduce((a, s) => a + (s.y0 + s.y1) / 2, 0) / shafts.length;
+      }
+    }
+    D.trunk = { x: tx, y: ty, s: 0.16, d: 0.16 };
+
+    /* ---- 通用铺管：沿一面墙铺一段**连续**线管 ----
+       这是全文件唯一拼 at 区间的地方。以前每处自己算 cover/中点，才会一段一段。 */
+    function runWall(wall, a, b, kind, circ, z, sec, layer, room) {
+      if (!wall || !circ) return;
+      if (z + sec.s / 2 > (wall.h || 3) - 0.03) return;      // 墙比这还矮就别铺了
+      splitByOpenings(wall, a, b, z, sec.s).forEach(([s0, s1]) => {
+        if (s1 - s0 < 0.25) return;
+        const tag = layer === 'corridor' ? 'C' : 'R';
+        const id = 'CD-' + wall.id + '-' + kind + '-' + tag + '-' +
+          Math.round(s0 * 100) + '-' + Math.round(s1 * 100);
+        if (seen[id]) return;
+        seen[id] = 1;
+        const c = {
+          id: id, floor: wall.floor, wall: wall.id, kind: kind, circuit: circ.id,
+          layer: layer, at0: s0, at1: s1, z: z, s: sec.s, d: sec.d,
+          room: room ? room.id : null, roomNum: room ? room.num : null, added: false
+        };
+        D.conduits.push(c);
+        circ.conduits.push(id);
+        if (room && circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+      });
+    }
+
+    /* 墙内竖直段：把不同标高的两根管接起来（走廊桥架 → 房间支线就是靠它"分下去"） */
+    function dropDown(wall, x, y, L, zLow, zHigh, sec, circ, room) {
+      if (!circ) return;
+      const id = 'VD-' + wall.id + '-' + Math.round(x * 100) + '-' + Math.round(y * 100) + '-' + circ.id;
+      if (seen[id]) return;
+      seen[id] = 1;
+      const c = {
+        id: id, floor: L, wall: wall.id, kind: circ.kind, circuit: circ.id,
+        layer: 'drop', vert: true, x: x, y: y, z0: zLow, z1: zHigh,
+        at0: 0, at1: 0, z: (zLow + zHigh) / 2, s: sec.s, d: sec.d,
+        room: room ? room.id : null, roomNum: room ? room.num : null, added: false
+      };
+      D.conduits.push(c);
+      circ.conduits.push(id);
+      if (room && circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+    }
+
+    /* ---- ② 每层：配电箱 + 三条分路 + 走廊干线 + 房间支线 ---- */
+    floors.forEach(fl => {
+      const L = fl.level;
+      const shaft = shaftOf[L];
+      if (!shaft) return;
+      const wAll = allWalls.filter(w => w.floor === L);
 
       const pid = 'AL-' + L;
-      const mkCirc = (suffix, kind, name) => addC({
+      const mkCirc = (suffix, kind, name, rated) => addC({
         id: 'L' + L + suffix, panel: pid, floor: L, kind: kind,
         name: L + 'F ' + name, color: E.COLOR[kind],
-        rooms: [], conduits: [], rated: kind === 'power' ? 63 : 32,
+        rooms: [], conduits: [], rated: rated,
         phase: suffix === 'A' ? 'L1' : (suffix === 'B' ? 'L2' : 'L3'),
         on: true
       });
-      const cA = mkCirc('A', 'light', '照明回路');
-      const cB = mkCirc('B', 'socket', '插座回路');
-      const cC = mkCirc('C', 'power', '动力回路');
+      const cA = mkCirc('A', 'light', '照明回路', 32);
+      const cB = mkCirc('B', 'socket', '插座回路', 32);
+      const cC = mkCirc('C', 'power', '动力回路', 63);
+      liveCircs.push({ L: L, cA: cA, cB: cB, cC: cC });
 
-      /* 配电箱：贴在配电间的一面墙上，箱中心标高 1.5 m。
-         优先选这层"不朝走廊"的那面墙，免得箱子挡在走道上 */
-      const wAll = (m.walls || []).filter(w => w.floor === L);
-      let pw = null, pat = 0;
-      const shaftWalls = [];
-      Object.keys(shaft.sides || {}).forEach(k => {
-        const w = wAll.find(x => x.id === shaft.sides[k]);
+      /* ---- 配电箱：贴电气间的一面墙上，箱子中心标高 1.5 m ----
+         挑墙的顺序：内墙且不朝走廊 > 不朝走廊 > 随便。
+         理由：箱子凸出墙面 0.09 m，挂在走廊墙上会侵占疏散净宽；
+         挂外墙上冬天结露。实在没有内墙才退让。 */
+      const cand = [];
+      ['south', 'north', 'east', 'west'].forEach(k => {
+        const w = wAll.find(x => x.id === (shaft.sides || {})[k]);
         if (!w) return;
         const sp = roomSpans(w).find(s => s.room.id === shaft.id);
-        if (sp) shaftWalls.push({ w: w, at: (sp.lo + sp.hi) / 2, span: sp });
+        if (!sp) return;
+        if (sp.hi - sp.lo < 0.9) return;                       // 墙太短，0.7 m 的箱子挂不住
+        const onWall = (w.rooms || []).map(id => allRooms.find(r => r.id === id)).filter(Boolean);
+        cand.push({ w: w, at: (sp.lo + sp.hi) / 2, corr: onWall.some(r => r.zone === 'corr') });
       });
-      // 走廊那面墙尽量不用（箱子凸出 0.15 m，走廊有净宽要求）
-      const corrW = shaftWalls.find(x => {
-        const other = (x.w.rooms || []).map(id => (m.rooms || []).find(r => r.id === id)).find(r => r && r.zone === 'corr');
-        return !other;
-      });
-      const pick = corrW || shaftWalls[0];
-      if (pick) { pw = pick.w; pat = pick.at; }
+      const pick = cand.filter(x => !x.corr && x.w.kind !== 'ext')[0]
+        || cand.filter(x => !x.corr)[0]
+        || cand[0] || null;
+
       const panel = {
         id: pid, floor: L, room: shaft.id, roomNum: shaft.num,
-        name: L + 'F 配电箱 ' + pid, wall: pw ? pw.id : null, at: pat,
+        name: L + 'F 配电箱 ' + pid, wall: pick ? pick.w.id : null, at: pick ? pick.at : 0,
         z: 1.5, w: 0.7, h: 0.9, d: 0.18,
         circuits: [cA.id, cB.id, cC.id]
       };
-      /* 位置换算成世界坐标，渲染与聚焦都要用 */
-      if (pw) {
-        const a = axis(pw);
-        const sgn = 0.5;   // 从墙中心往房间一侧偏
-        panel.x = a.ax + a.ux * pat;
-        panel.y = a.ay + a.uy * pat;
-        panel.dir = [a.ux, a.uy];
+      if (pick) {
+        const a = axis(pick.w);
+        panel.x = a.ax + a.ux * pick.at;      // 墙中心线上的点
+        panel.y = a.ay + a.uy * pick.at;
+        panel.dir = [a.ux, a.uy];             // 沿墙方向
+        /* 墙上法向：由"房间中心在哪一侧"定死，直接存进数据。
+           以前是渲染时自己推，推反了箱子就朝墙里翻，看着像悬空/歪着。 */
+        let nx = -a.uy, ny = a.ux;
+        const cx = (shaft.x0 + shaft.x1) / 2 - panel.x;
+        const cy = (shaft.y0 + shaft.y1) / 2 - panel.y;
+        if (nx * cx + ny * cy < 0) { nx = -nx; ny = -ny; }
+        panel.n = [nx, ny];
+        panel.t = pick.w.t;
       } else {
-        panel.x = (shaft.x0 + shaft.x1) / 2; panel.y = shaft.y0 + 0.2;
-        panel.dir = [1, 0];
+        panel.x = (shaft.x0 + shaft.x1) / 2; panel.y = shaft.y0 + 0.25;
+        panel.dir = [1, 0]; panel.n = [0, 1]; panel.t = 0.2;
       }
       D.panels.push(panel);
 
-      /* 逐面墙铺线管 */
-      wAll.forEach(wall => {
-        roomSpans(wall).forEach(sp => {
-          const room = sp.room;
-          if (room.zone === 'corr') {
-            // 走廊里只走照明与公共插座，不做动力
-            pushConduit(wall, sp, 'light', cA);
-            pushConduit(wall, sp, 'socket', cB, 0.5);
-            return;
-          }
-          pushConduit(wall, sp, 'light', cA);
-          pushConduit(wall, sp, 'socket', cB);
-          if (isPowerRoom(room)) pushConduit(wall, sp, 'power', cC, 0.34);
+      /* ---- ③ 走廊干线：沿走廊两侧墙整段连续，三条分路分层走桥架 ---- */
+      const corrs = allRooms.filter(r => r.floor === L && r.zone === 'corr');
+      const doneWall = {};
+      corrs.forEach(cr => {
+        Object.keys(cr.sides || {}).forEach(k => {
+          const w = wAll.find(x => x.id === cr.sides[k]);
+          if (!w || doneWall[w.id]) return;
+          if (w.kind === 'ext') return;                        // 干线不挂建筑外皮
+          const sp = roomSpans(w).find(s => s.room.id === cr.id);
+          if (!sp) return;
+          doneWall[w.id] = 1;
+          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'light', cA, MAIN_Z.light, MAIN_SEC.light, 'corridor', cr);
+          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'socket', cB, MAIN_Z.socket, MAIN_SEC.socket, 'corridor', cr);
+          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'power', cC, MAIN_Z.power, MAIN_SEC.power, 'corridor', cr);
         });
       });
 
-      function pushConduit(wall, sp, kind, circ, cover) {
-        const sec = SEC[kind], z = Z[kind], room = sp.room;
-        if (z + sec.s / 2 > (wall.h || 3) - 0.05) return;      // 墙比这还矮就别铺了
-        const spanLen = sp.hi - sp.lo;
-        /* 铺多长：不是满铺。照明沿整段（吊顶里本来就通长），
-           插座只铺靠墙角起的一截（真实做法：从门口/墙角引过去就够），
-           动力只铺房间中段。留白的位置就是以后能开洞的位置。 */
-        let a, b;
-        if (kind === 'light') {
-          a = sp.lo + 0.28; b = sp.hi - 0.28;
-        } else if (kind === 'socket') {
-          const run = Math.min(2.3, spanLen * (cover || 0.62));
-          a = sp.lo + 0.42; b = a + run;
-        } else {
-          const run = Math.min(2.6, spanLen * (cover || 0.5));
-          const mid = (sp.lo + sp.hi) / 2;
-          a = mid - run / 2; b = mid + run / 2;
-        }
-        if (b - a < 0.45) return;
-        splitByOpenings(wall, a, b).forEach(([s0, s1]) => {
-          if (s1 - s0 < 0.3) return;
-          const id = 'CD-' + wall.id + '-' + kind + '-' + Math.round(s0 * 100) + '-' + Math.round(s1 * 100);
-          if (D.conduits.some(c => c.id === id)) return;
-          const c = {
-            id: id, floor: wall.floor, wall: wall.id, kind: kind, circuit: circ.id,
-            at0: s0, at1: s1, z: z, s: sec.s, d: sec.d,
-            room: room.id, roomNum: room.num, added: false
-          };
-          D.conduits.push(c);
-          circ.conduits.push(id);
-          if (circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+      /* ---- ④ 房间支线：四周墙整段连续，靠"墙内下引"接走廊干线 ---- */
+      allRooms.filter(r => r.floor === L && r.zone !== 'corr').forEach(room => {
+        const pw = isPowerRoom(room);
+        const sides = room.sides || {};
+        let corrWall = null, corrSpan = null;
+        ['south', 'north', 'east', 'west'].forEach(k => {
+          const wall = wAll.find(x => x.id === sides[k]);
+          if (!wall) return;
+          const sp = roomSpans(wall).find(s => s.room.id === room.id);
+          if (!sp) return;
+          const a = sp.lo + 0.15, b = sp.hi - 0.15;
+          /* 这面墙的另一侧是不是走廊 */
+          const isCorr = (wall.rooms || []).some(id => {
+            const r = allRooms.find(x => x.id === id);
+            return r && r.zone === 'corr';
+          });
+          if (b - a >= 0.4) {
+            /* 照明走吊顶，哪面墙都得穿，满铺 */
+            runWall(wall, a, b, 'light', cA, BRANCH_Z.light, SEC.light, 'room', room);
+            /* 插座和动力不布在走廊那面墙上 —— 真实做法也是这么干的：
+               走廊侧全是门，插座开关在房间内侧墙上，设备更不会靠门摆。
+               顺带一个好处：在走廊墙上开门不用每次都撞到贴地线管，
+               而隔墙、外墙开门照样会撞，两种结果用户都能看到。 */
+            if (!isCorr) {
+              runWall(wall, a, b, 'socket', cB, BRANCH_Z.socket, SEC.socket, 'room', room);
+              if (pw) runWall(wall, a, b, 'power', cC, BRANCH_Z.power, SEC.power, 'room', room);
+            }
+          }
+          /* 临走廊的那面墙记下来，一会儿在这里下引 */
+          if (!corrWall && isCorr) { corrWall = wall; corrSpan = sp; }
         });
-      }
+
+        /* 从走廊干线引下来：在走廊墙靠房间端部立一根短管，
+           把 2.80 m 的桥架接到 0.32 m 的插座支线 —— 这就是"分到房间"的那一下。
+           照明支线 2.90 和干线 3.00 本来就挨着，不用单独下引。 */
+        if (corrWall && corrSpan) {
+          const a = axis(corrWall);
+          const atp = corrSpan.lo + Math.min(0.45, (corrSpan.hi - corrSpan.lo) / 2);
+          const mx = a.ax + a.ux * atp, my = a.ay + a.uy * atp;
+          dropDown(corrWall, mx, my, L, BRANCH_Z.socket, MAIN_Z.socket, SEC.socket, cB, room);
+          if (pw) dropDown(corrWall, mx, my, L, BRANCH_Z.power, MAIN_Z.power, SEC.power, cC, room);
+        }
+      });
     });
 
-    /* 楼层进线（竖管）：从本层配电箱竖直上去，接到上一层的配电箱。
-       这是"控制一个分路，整栋楼哪几层跟着动"能看出来的关键——
-       没有竖管，每层看着都是孤立的。归到该层动力回路（进线总开关）名下。 */
-    (m.floors || []).slice().sort((a, b) => a.level - b.level).forEach(fl => {
-      const L = fl.level;
-      const p = D.panels.find(x => x.floor === L);
-      const up = D.panels.find(x => x.floor === L + 1);
-      const circ = D.circuits.find(c => c.id === 'L' + L + 'C');
-      if (!p || !circ) return;
-      const thk = fl.height || 4.5;
-      const z0 = (p.z || 1.5);
-      const z1 = up ? (thk + up.z) : (thk + 0.4);
-      D.risers = D.risers || [];
-      const rs = {
-        id: 'RS-' + L, floor: L, from: L, to: up ? L + 1 : L,
-        x: p.x, y: p.y, z0: p.z, z1: z1, circuit: circ.id, kind: 'riser',
-        vert: true, s: 0.09, d: 0.09, wall: null, at0: 0, at1: 0, z: 0
+    /* ---- ⑤ 主干立管：一条，从 1F 楼板下直通顶层楼板上 ----
+       每层一段，z0/z1 严格按该层层高接起来：上一段的顶 = 下一段的底，
+       所以视觉上是一根通管，而不是五个断开的短柱。
+       归到各层动力分路（进线总开关）名下，这样"断某层动力"能看出是哪一段。 */
+    if (shafts.length) {
+      floors.forEach((fl, i) => {
+        const L = fl.level;
+        const circ = byId['L' + L + 'C'] || byId['L' + L + 'B'];
+        if (!circ) return;
+        const next = floors[i + 1];
+        const thk = fl.height || 4.2;
+        const id = 'TR-' + L;
+        const rs = {
+          id: id, floor: L, from: L, to: next ? next.level : L,
+          x: tx, y: ty, z0: 0, z1: thk, circuit: circ.id, kind: 'riser',
+          layer: 'trunk', vert: true, s: 0.16, d: 0.16,
+          wall: null, at0: 0, at1: 0, z: thk / 2
+        };
+        D.risers.push(rs);
+        D.conduits.push(rs);          // 也放进 conduits：高亮、统计、查询一条路走通
+        circ.conduits.push(id);
+      });
+    }
+
+    /* ---- ⑥ 层进线：从主干水平引到本层配电箱顶部 ----
+       这一段没有墙可依附，是房间里明敷的桥架/母线，所以用自由段（free）：
+       只给两端点，渲染时按两点连线建盒子。 */
+    D.panels.forEach(p => {
+      const circ = byId['L' + p.floor + 'C'] || byId['L' + p.floor + 'B'];
+      if (!circ || !shafts.length) return;
+      const nx = (p.n || [1, 0])[0], ny = (p.n || [1, 0])[1];
+      const bx = p.x + nx * ((p.t || 0.2) / 2);      // 箱子贴墙那一面的中点
+      const by = p.y + ny * ((p.t || 0.2) / 2);
+      if (Math.hypot(bx - tx, by - ty) < 0.25) return;
+      const zE = p.z + p.h / 2 + 0.10;              // 从箱子顶进线
+      const id = 'FD-' + p.floor;
+      const c = {
+        id: id, floor: p.floor, wall: null, kind: 'power', circuit: circ.id,
+        layer: 'feed', free: true, p1: [tx, ty, zE], p2: [bx, by, zE],
+        s: 0.12, d: 0.12, at0: 0, at1: 0, z: zE,
+        room: p.room, roomNum: p.roomNum, added: false
       };
-      D.risers.push(rs);
-      D.conduits.push(rs);          // 也放进 conduits：高亮、统计、查询一条路走通
-      circ.conduits.push('RS-' + L);
+      D.conduits.push(c);
+      circ.conduits.push(id);
+      if (circ.rooms.indexOf(p.room) < 0) circ.rooms.push(p.room);
     });
 
     /* 分路状态：重建时把原来的通断状态带过来。
@@ -477,6 +643,8 @@
       if (opt.room && c.room !== opt.room && c.roomNum !== opt.room) return false;
       if (opt.circuit && c.circuit !== opt.circuit) return false;
       if (opt.kind && c.kind !== opt.kind) return false;
+      if (opt.layer && c.layer !== opt.layer) return false;
+      if (opt.wall && c.wall !== opt.wall) return false;
       return true;
     });
   };
@@ -484,12 +652,22 @@
   /* 分路清单：给"这层有哪些分路"这种问题用 */
   E.list = function (floor) {
     return (ready().circuits || []).filter(c => floor == null || c.floor === floor)
-      .map(c => ({
-        id: c.id, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
-        panel: c.panel, phase: c.phase, rated: c.rated, on: c.on !== false,
-        rooms: c.rooms.length, conduits: c.conduits.length,
-        room_nums: E.circuitRooms(c.id).map(r => r.num)
-      }));
+      .map(c => {
+        /* 一条分路自己在拓扑里各层级的管段数：干线几段、支线几段。
+           回答"这路是怎么走的"要用，不然只能说"带 11 间房"，说不出路径。 */
+        const mine = (ready().conduits || []).filter(x => x.circuit === c.id);
+        const layers = ['trunk', 'feed', 'corridor', 'drop', 'room'].reduce((a, k) => {
+          const n = mine.filter(x => x.layer === k).length;
+          if (n) a[k] = n;
+          return a;
+        }, {});
+        return {
+          id: c.id, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
+          panel: c.panel, phase: c.phase, rated: c.rated, on: c.on !== false,
+          rooms: c.rooms.length, conduits: c.conduits.length, layers: layers,
+          room_nums: E.circuitRooms(c.id).map(r => r.num)
+        };
+      });
   };
 
   E.stats = function () {
@@ -499,14 +677,19 @@
       conduits: D.conduits.length, reroutes: Object.keys(D.reroutes || {}).length,
       by_kind: ['light', 'socket', 'power', 'riser'].reduce((a, k) => {
         a[k] = D.conduits.filter(c => c.kind === k).length; return a;
-      }, {})
+      }, {}),
+      /* 按拓扑层级统计：主干几根、走廊干线几根、房间支线几根，一眼看出是"树"不是"一盘散沙" */
+      by_layer: ['trunk', 'feed', 'corridor', 'drop', 'room'].reduce((a, k) => {
+        a[k] = D.conduits.filter(c => c.layer === k).length; return a;
+      }, {}),
+      trunk: D.trunk || null
     };
   };
 
   /* ---------------- 给校核和回复用的中文描述 ---------------- */
   E.hitText = function (c) {
-    return E.KIND_CN[c.kind] + '回路的线管（' + c.circuit + '，管中距地 ' + fmt(c.z) + ' m，截面 ' +
-      fmt(c.s * 100) + ' cm）';
+    return E.KIND_CN[c.kind] + '回路的' + (E.LAYER_CN[c.layer] || '线管') +
+      '（' + c.circuit + '，管中距地 ' + fmt(c.z) + ' m，截面 ' + fmt(c.s * 100) + ' cm）';
   };
   E.circuitText = function (c) {
     const rs = E.circuitRooms(c.id);

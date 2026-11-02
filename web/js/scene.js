@@ -1656,7 +1656,7 @@
      线管按分路（回路）分组建 mesh：15 条分路就是 15 个 mesh，
      高亮一条、压暗其他都在材质层面做，不改几何。 */
   const E = () => window.BIM.elec;
-  let eRoot = null, ePanels = null, eHitG = null;
+  let eRoot = null, ePanels = null, eHitG = null, eIsoG = null;
   let eByCirc = {};                 // circId -> { mat, ghost }
   let eOn = false;
 
@@ -1672,33 +1672,69 @@
     });
   }
 
-  /* 按分路建一批盒子：横铺的沿墙、竖着的是楼层进线 */
+  /* 一根线管 → 一个盒子的变换（size + matrix）。
+     所有"把线管画出来"的地方都走这里，别各写一份 —— 以前 eBuild / markConduits
+     各写一套几何，加了新的线管类型（自由段、墙内下引）就得改两处，容易漏。
+     opt.grow   截面放大倍数（冲突标记要把管子"罩"粗一点才醒目）
+     opt.through 进深要穿出墙面（红色标记要能透过半透明墙看到） */
+  function eItemOf(c, opt) {
+    if (!c) return null;
+    opt = opt || {};
+    const g = opt.grow || 1;
+    const el = ((M.floors.find(f => f.level === c.floor) || {}).elev) || 0;
+    /* 自由段：没有墙可依附（层进线这种明敷桥架），只给两端点，按两点连线建盒子 */
+    if (c.free && c.p1 && c.p2) {
+      const a = new THREE.Vector3(c.p1[0], el + c.p1[2], -c.p1[1]);
+      const b = new THREE.Vector3(c.p2[0], el + c.p2[2], -c.p2[1]);
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      if (len < 1e-3) return null;
+      const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(.5);
+      const q = new THREE.Quaternion().setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+      return {
+        size: [c.s * g, len, c.d * g],
+        matrix: new THREE.Matrix4().compose(mid, q, new THREE.Vector3(1, 1, 1))
+      };
+    }
+    /* 竖直段：主干立管、墙内下引 */
+    if (c.vert) {
+      return { size: [c.s * g, c.z1 - c.z0, c.d * g], matrix: frame(c.x, c.y, el + (c.z0 + c.z1) / 2, 1, 0) };
+    }
+    const wall = c.wall ? M.walls.find(w => w.id === c.wall) : null;
+    if (!wall) return null;
+    const a = E().axis(wall);
+    const len = c.at1 - c.at0;
+    if (len < 0.02) return null;
+    const mx = a.ax + a.ux * (c.at0 + len / 2), my = a.ay + a.uy * (c.at0 + len / 2);
+    let dep = Math.min(c.d, wall.t * .8) * g;
+    if (opt.through) dep = Math.max(dep, wall.t * 1.15);
+    return { size: [len, c.s * g, dep], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy) };
+  }
+
+  /* 按分路分批：一条分路一个 mesh，高亮/隔离都在材质层做，不改几何 */
+  function eBatch(list) {
+    const D = E() && E().data;
+    const per = {};
+    if (!D) return per;
+    (list || []).forEach(c => {
+      if (!D.circuits.some(x => x.id === c.circuit)) return;
+      const it = eItemOf(c);
+      if (!it) return;
+      (per[c.circuit] = per[c.circuit] || []).push(it);
+    });
+    return per;
+  }
+
+  /* 按分路建一批盒子 */
   function eBuild() {
     eDispose(eRoot); eRoot = null; eByCirc = {};
+    eDispose(eIsoG); eIsoG = null;          // 隔离组里放的是旧线管对象，重建后必须扔
     if (!E() || !E().data) return;
     const D = E().data;
     const root = new THREE.Group();
     root.name = 'elec';
-    const per = {};                 // circId -> items[]
-    (D.conduits || []).forEach(c => {
-      const circ = D.circuits.find(x => x.id === c.circuit);
-      if (!circ) return;
-      const wall = c.wall ? M.walls.find(w => w.id === c.wall) : null;
-      let it;
-      if (c.vert) {
-        // 竖向进线：从本层配电箱往上穿楼板
-        const el = (M.floors.find(f => f.level === c.floor) || {}).elev || 0;
-        it = { size: [c.s, c.z1 - c.z0, c.d], matrix: frame(c.x, c.y, el + (c.z0 + c.z1) / 2, 1, 0) };
-      } else {
-        if (!wall) return;
-        const a = E().axis(wall);
-        const len = c.at1 - c.at0;
-        if (len < 0.02) return;
-        const mx = a.ax + a.ux * (c.at0 + len / 2), my = a.ay + a.uy * (c.at0 + len / 2);
-        it = { size: [len, c.s, Math.min(c.d, wall.t * .8)], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy) };
-      }
-      (per[c.circuit] = per[c.circuit] || []).push(it);
-    });
+    const per = eBatch(D.conduits || []);
     Object.keys(per).forEach(cid => {
       const circ = D.circuits.find(x => x.id === cid);
       const col = new THREE.Color(EC()[circ.kind] || EC().light);
@@ -1736,13 +1772,27 @@
   function ePanelMesh(p) {
     const room = M.rooms.find(r => r.id === p.room);
     const wall = p.wall ? M.walls.find(w => w.id === p.wall) : null;
-    const ux = (p.dir && p.dir[0]) || 1, uy = (p.dir && p.dir[1]) || 0;
-    let nx = -uy, ny = ux;
-    if (room) {
-      const cx = (room.x0 + room.x1) / 2 - p.x, cy = (room.y0 + room.y1) / 2 - p.y;
-      if (nx * cx + ny * cy < 0) { nx = -nx; ny = -ny; }
+    /* ★ 这里踩过一个坑：原来写 (p.dir[0]) || 1，而南北向墙的 dir 是 [0,1]，
+       0 被 || 当成"没值"兜底成 1 → 基向量变成 (1,0,-1) 的 45° 对角，
+       箱子被整个拉斜。凡是取分量，不能用 || 兜底，只能判 undefined。 */
+    const dv = (Array.isArray(p.dir) && p.dir.length === 2) ? p.dir : [1, 0];
+    const ux = dv[0], uy = dv[1];
+    /* 墙面法向：数据层已经算好并存在 panel.n（指向房间内侧），这里直接用。
+       以前是渲染时按 panel.dir 现推，推反了箱子就朝墙里翻 —— 表现出来就是
+       "控制箱斜着放 / 悬空没贴墙"。方向只在数据层算一次，渲染只负责画。 */
+    let nx, ny;
+    if (p.n) {
+      nx = p.n[0]; ny = p.n[1];
+    } else {
+      nx = -uy; ny = ux;
+      if (room) {
+        const cx = (room.x0 + room.x1) / 2 - p.x, cy = (room.y0 + room.y1) / 2 - p.y;
+        if (nx * cx + ny * cy < 0) { nx = -nx; ny = -ny; }
+      }
     }
-    const off = (wall ? wall.t / 2 : 0.12) + p.d / 2 + 0.01;
+    const tw = wall ? wall.t : (p.t || 0.2);
+    /* 箱子背面正好压在墙面上：中心离墙中心线 = 半墙厚 + 半箱深，不留缝也不埋进去 */
+    const off = tw / 2 + p.d / 2;
     const px = p.x + nx * off, py = p.y + ny * off;
     const el = ((M.floors.find(f => f.level === p.floor) || {}).elev) || 0;
     const Y = el + p.z;
@@ -1751,6 +1801,14 @@
     // 沿墙偏 dw、竖直偏 dz、法向偏 df 的一个点
     const at = (dw, dz, df) => [px + ux * dw + nx * df, py + uy * dw + ny * df, Y + dz];
     const it = [];
+    /* 挂板：紧贴墙面的一块薄钢板。有这个，"箱子挂在墙上"才看得出来，
+       不然箱体像个盒子浮在半空。 */
+    const backOff = tw / 2 + 0.007;
+    it.push({
+      size: [W + .08, H + .08, .014],
+      matrix: frame(p.x + nx * backOff, p.y + ny * backOff, Y, ux, uy),
+      c: [.40, .44, .48]
+    });
     it.push({ size: [W, H, Dp], matrix: frame(px, py, Y, ux, uy), c: [.86, .89, .92] });
     it.push({ size: [W * .86, H * .88, .016], matrix: frame(...at(0, 0, F + .008), ux, uy), c: [.95, .96, .97] });   // 箱门
     for (let r = 0; r < 3; r++) {
@@ -1782,6 +1840,10 @@
     (E().data.panels || []).forEach(p => {
       try { g.add(ePanelMesh(p)); } catch (e) { }
     });
+    /* 配电箱属于电气专业，跟线管一起显隐。
+       以前它是一直挂着的，不开电气视图也能在房间里看到几个箱子，
+       看着就像"设备放歪了"。 */
+    g.visible = eOn;
     scene.add(g); ePanels = g;
   }
   S.rebuildPanels = ePanelBuild;
@@ -1792,12 +1854,49 @@
     if (eOn && !eRoot) eBuild();
     if (eOn && !ePanels) ePanelBuild();
     if (eRoot) eRoot.visible = eOn;
-    if (!eOn) S.showCircuit(null);
+    if (ePanels) ePanels.visible = eOn;
+    if (!eOn) { S.clearIsolate(); S.showCircuit(null); }
     if (eOn && !S.xray) S.setXray(true);
   };
 
-  /* 高亮一条分路：它自己发亮 + 穿透显示，别的分路压到很淡 */
+  /* 只显示这几根线管：其它分路整体隐藏，命中的管子按本体颜色单独画出来。
+     碰撞检查、查某面墙里埋了什么，都用它 ——
+     现场就是这样：墙里挡路的就那几根，别的管线全都跑来抢视线没有意义。 */
+  S.isolateConduits = function (list) {
+    if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
+    const D = E() && E().data;
+    if (!D) return;
+    if (eRoot) eRoot.visible = false;              // 先把整批藏起来
+    if (!list || !list.length) return;
+    const per = eBatch(list);
+    const g = new THREE.Group();
+    g.name = 'elec-iso';
+    Object.keys(per).forEach(cid => {
+      const circ = D.circuits.find(x => x.id === cid) || {};
+      const col = new THREE.Color(EC()[circ.kind] || EC().light);
+      const mat = new THREE.MeshStandardMaterial({
+        color: col, emissive: col.clone().multiplyScalar(.85), emissiveIntensity: 2.4,
+        roughness: .4, metalness: .3, transparent: true, opacity: 1
+      });
+      mat.userData.ownMat = true;
+      const mesh = new THREE.Mesh(boxGeo(per[cid]), mat);
+      mesh.renderOrder = 3;
+      g.add(mesh);
+    });
+    if (!g.children.length) { if (eRoot && eOn) eRoot.visible = true; return; }
+    scene.add(g); eIsoG = g;
+  };
+  S.clearIsolate = function () {
+    if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
+    if (eRoot && eOn) eRoot.visible = true;
+  };
+  S.hasIsolate = () => !!eIsoG;
+
+  /* 只看一条分路：它自己发亮 + 穿透显示，别的分路**整条隐藏**。
+     以前是把别的压到 0.07 透明度，屏幕上还是一堆管子在眼前晃；
+     用户要的是"就这一条"，所以直接不画。 */
   S.showCircuit = function (cid) {
+    S.clearIsolate();
     const D = E() && E().data;
     if (!D) return;
     Object.keys(eByCirc).forEach(id => {
@@ -1805,9 +1904,10 @@
       const on = !cid || id === cid;
       const circ = D.circuits.find(c => c.id === id) || {};
       const live = cid ? on : (circ.on !== false);
-      it.mat.opacity = cid ? (on ? 1 : .07) : .95;
+      it.mesh.visible = on;
+      it.mat.opacity = 1;
       it.mat.transparent = true;
-      it.mat.depthWrite = cid ? on : true;
+      it.mat.depthWrite = true;
       it.mat.emissiveIntensity = cid && on ? 2.1 : 1;
       it.mat.color.setHex(live ? (EC()[circ.kind] || EC().light) : EC().off);
       it.mat.emissive.setHex(live ? (EC()[circ.kind] || EC().light) : 0x000000);
@@ -1847,17 +1947,8 @@
     const c = new THREE.Color(color || EC().hit);
     const it = [];
     list.forEach(k => {
-      const wall = k.wall ? M.walls.find(w => w.id === k.wall) : null;
-      if (k.vert) {
-        const el = ((M.floors.find(f => f.level === k.floor) || {}).elev) || 0;
-        it.push({ size: [k.s * 2.4, k.z1 - k.z0, k.d * 2.4], matrix: frame(k.x, k.y, el + (k.z0 + k.z1) / 2, 1, 0) });
-        return;
-      }
-      if (!wall) return;
-      const a = E().axis(wall);
-      const len = k.at1 - k.at0;
-      const mx = a.ax + a.ux * (k.at0 + len / 2), my = a.ay + a.uy * (k.at0 + len / 2);
-      it.push({ size: [len, k.s * 2.4, wall.t * 1.15], matrix: frame(mx, my, wall.base + k.z, a.ux, a.uy) });
+      const one = eItemOf(k, { grow: 2.4, through: true });   // 罩粗一圈、穿出墙面
+      if (one) it.push(one);
     });
     if (!it.length) return;
     const g = new THREE.Group();
@@ -1877,6 +1968,7 @@
   S.clearConduitMarks = function () {
     if (eHitG) { eDispose(eHitG); eHitG = null; }
     S.clearReroute();
+    S.clearIsolate();
   };
 
   /* 改线后的新走向：用另一种颜色沿墙面画一条折线，穿透显示。
@@ -1977,12 +2069,14 @@
   /* ---------------- 调试 / 投影 ---------------- */
   S.camera = () => camera;
   S.controls = () => controls;
+  S.root = () => scene;              // 场景根，排查"某个组到底在哪儿"时要用
   S.project = function (x, y, z) {
     const v = new THREE.Vector3(x, z, -y).project(camera);
     const r = renderer.domElement.getBoundingClientRect();
     return { x: r.left + (v.x * .5 + .5) * r.width, y: r.top + (-v.y * .5 + .5) * r.height };
   };
   S.setCam = function (px, py, pz, tx, ty, tz) {
+    anim = null;                 // 掐掉正在跑的镜头缓动，否则下一帧就被它拉回去
     camera.position.set(px, py, pz);
     controls.target.set(tx, ty, tz);
     controls.update();
