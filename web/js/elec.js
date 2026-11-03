@@ -57,17 +57,17 @@
   /* 线管截面（米）：外径/槽宽 + 墙内埋深。数字按常见做法取：
      照明 BV2.5 穿 PC20、插座 BV4 穿 PC25、动力 YJV 走 40×25 线槽 */
   const SEC = {
-    light: { s: 0.045, d: 0.20 },     // s=竖向占位（含保护层），d=墙内埋深（从墙面往里）
-    socket: { s: 0.055, d: 0.24 },
-    power: { s: 0.075, d: 0.28 }
+    light: { s: 0.030, d: 0.13 },     // s=竖向占位（含保护层），d=墙内埋深（从墙面往里）
+    socket: { s: 0.037, d: 0.15 },
+    power: { s: 0.050, d: 0.18 }
   };
   E.SEC = SEC;
 
   /* 走廊干线的截面比支线粗一档：干线是"一根管子喂一层"，支线只是末端 */
   const MAIN_SEC = {
-    light: { s: 0.062, d: 0.22 },
-    socket: { s: 0.072, d: 0.24 },
-    power: { s: 0.095, d: 0.30 }
+    light: { s: 0.041, d: 0.14 },
+    socket: { s: 0.049, d: 0.16 },
+    power: { s: 0.064, d: 0.19 }
   };
   E.MAIN_SEC = MAIN_SEC;
 
@@ -749,7 +749,10 @@
 
       groups.forEach((g, gi) => {
         if (g.n < 2 && !g.tee) return;           // 单根管子的自由端不放接头
-        const r = Math.min(0.26, Math.max(0.10, g.s * 2.3));
+        /* 接头块 = 管径的 2.3 倍左右（弯头/三通本来就比管身鼓一圈）。
+           上下限跟着管径一起缩小过：下限 0.10 在管径缩到 0.03 以后会让接头
+           比管子粗三倍，看着像一串"糖葫芦"，所以改成 0.055。 */
+        const r = Math.min(0.18, Math.max(0.055, g.s * 2.3));
         D.joints.push({
           id: 'JT-' + cid + '-' + gi, floor: circ.floor, circuit: cid, kind: circ.kind,
           x: g.x, y: g.y, z: g.z, r: r, d: Math.min(r, g.d || r),

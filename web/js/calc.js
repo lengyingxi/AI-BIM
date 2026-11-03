@@ -53,14 +53,62 @@
       circs.join('、') + ' 回路），开洞会打断它';
   }
 
-  /* 单台设备的等效板中弯矩与影响参数 */
-  function meqOne(room, e, x, y, pad) {
+  /* ---------------- 打通之后：楼板按"联通大板"算 ----------------
+     把两间之间的墙整面拆掉以后，原来"两间各自四边支承"的两块小板，
+     实际受力上变成**一块整板**：中间那道墙不再是支座，跨度翻倍、弯矩按平方涨。
+     还按单间的小跨度算，弯矩和挠度都会算小——那是偏不安全，也不符合实际。
+     所以这里先求"拆掉的墙把哪几间连成了一片"（连通块），再取连通块的外包矩形当计算板跨。
+     只有整面拆（demolish）才算连通；墙上开个 1.8 m 的洞，板还是两块板，不能并。 */
+  C.plateOf = function (room) {
+    const M = window.BIM_MODEL;
+    const base = {
+      ids: [room.id], rooms: [room], x0: room.x0, x1: room.x1, y0: room.y0, y1: room.y1,
+      lx: room.x1 - room.x0, ly: room.y1 - room.y0, merged: false, via: []
+    };
+    if (!M || !M.passages || !M.rooms) return base;
+    const demo = (M.passages || []).filter(p => p && p.demolish && p.floor === room.floor);
+    if (!demo.length) return base;
+    const seen = {}; seen[room.id] = 1;
+    const list = [room], queue = [room], via = [];
+    /* 最多并 6 间就收手：真拆成一大片的时候，外包矩形做板跨已经很不准了，
+       这时候该上整体分析，不是这里能算的事 */
+    while (queue.length && list.length <= 6) {
+      const r = queue.pop();
+      demo.forEach(p => {
+        /* 优先用建洞口时记下的那两间（from/to）；老数据没有就退回 wall.rooms */
+        const ids = (p.from || p.to) ? [p.from, p.to].filter(Boolean) : (p.rooms || []);
+        if (ids.indexOf(r.id) < 0) return;
+        ids.forEach(id => {
+          if (seen[id]) return;
+          const rr = (M.rooms || []).find(x => x.id === id);
+          /* 走廊不并进来：交通空间的板带和活荷载跟房间完全不是一回事 */
+          if (!rr || rr.floor !== room.floor || rr.zone === 'corr') return;
+          seen[id] = 1; list.push(rr); queue.push(rr);
+          if (via.indexOf(p) < 0) via.push(p);
+        });
+      });
+    }
+    if (list.length < 2) return base;
+    const xs0 = list.map(r => r.x0), xs1 = list.map(r => r.x1);
+    const ys0 = list.map(r => r.y0), ys1 = list.map(r => r.y1);
+    const x0 = Math.min.apply(null, xs0), x1 = Math.max.apply(null, xs1);
+    const y0 = Math.min.apply(null, ys0), y1 = Math.max.apply(null, ys1);
+    return {
+      ids: list.map(r => r.id), rooms: list, x0: x0, x1: x1, y0: y0, y1: y1,
+      lx: x1 - x0, ly: y1 - y0, merged: true, via: via
+    };
+  };
+
+  /* 单台设备的等效板中弯矩与影响参数。
+     plate 不传就按单间算（兼容老的调用）；打通以后由 C.check 把联通大板传进来。 */
+  function meqOne(room, e, x, y, pad, plate) {
     const sl = room.slab;
-    const lx = room.x1 - room.x0, ly = room.y1 - room.y0;
+    const pl = plate || C.plateOf(room);
+    const lx = pl.lx, ly = pl.ly;
     const l = Math.min(lx, ly);
     const s = sl.thk + (pad ? 0.32 : 0.05);
     const ae = e.w + 2 * s, be = e.d + 2 * s;
-    const px = clamp(x - room.x0, 0, lx), py = clamp(y - room.y0, 0, ly);
+    const px = clamp(x - pl.x0, 0, lx), py = clamp(y - pl.y0, 0, ly);
     const dx = clamp(Math.min(px, lx - px) / (lx / 2), 0, 1);
     const dy = clamp(Math.min(py, ly - py) / (ly / 2), 0, 1);
     const kPos = clamp(((1 - (1 - dx) * (1 - dx)) + (1 - (1 - dy) * (1 - dy))) / 2, 0.3, 1);
@@ -74,7 +122,9 @@
   /* ---------------- 单板承载力校核（支持同房间多台设备叠加） ---------------- */
   C.check = function (opt, noAlt) {
     const room = opt.room, eq = opt.equip, sl = room.slab;
-    const m0 = meqOne(room, eq, opt.cx, opt.cy, opt.pad);
+    /* 先定"这块板到底多大"：没打通就是这一间，打过整面墙就是联通后的那块大板 */
+    const plate = opt.plate || C.plateOf(room);
+    const m0 = meqOne(room, eq, opt.cx, opt.cy, opt.pad, plate);
     const l = m0.l, lx = m0.lx, ly = m0.ly;
     const oneWay = Math.max(lx, ly) / l >= 2;
     const h0 = sl.thk * 1000 - sl.cover - sl.dia / 2;
@@ -86,9 +136,21 @@
     const dead = sl.thk * RHO + DEAD_FINISH;
     const Mdead = oneWay ? dead * l * l / 8 : dead * l * l / 24;
 
-    // 同房间已有的其它设备一起叠加
+    // 同一块板上的已有设备一起叠加
     const others = (opt.others || []).filter(e => e && e !== eq);
-    const oth = others.map(e => ({ eq: e, m: meqOne(room, e, e.x, e.y, e.pad) }));
+    /* 打通以后同一个连通块里的设备都压在同一块板上 —— 隔壁 202 那台也得算进来。
+       调用方传的 others 通常是"同一间房"的，这里补上联通的另外几间。 */
+    if (plate.merged) {
+      const all = (window.BIM && window.BIM.state && window.BIM.state.placed) || [];
+      all.forEach(e => {
+        if (!e || e === eq) return;
+        if (e.floor !== room.floor) return;
+        if (plate.ids.indexOf(e.room) < 0) return;
+        if (others.indexOf(e) >= 0) return;
+        others.push(e);
+      });
+    }
+    const oth = others.map(e => ({ eq: e, m: meqOne(room, e, e.x, e.y, e.pad, plate) }));
     const MeqOthers = oth.reduce((s, o) => s + o.m.Meq, 0);
     const POthers = oth.reduce((s, o) => s + o.m.P, 0);
 
@@ -134,6 +196,7 @@
     const r = {
       room, equip: eq, K, Kstruct, Kload, Kdef: Kdefv, verdict, v: vmap[verdict],
       l, lx, ly, oneWay, h0, Mu: Mu_min, dead, Mdead,
+      plate: plate, merged: !!plate.merged,
       Meq: m0.Meq, Meq0: m0.Meq0, MeqSum, MeqOthers, kPos: m0.kPos,
       bEff: m0.bEff, bStrip: m0.bStrip, P: m0.P, POthers, PTotal: m0.P + POthers,
       others: oth.map(o => ({ eq: o.eq, Meq: o.m.Meq, P: o.m.P })),
@@ -741,15 +804,24 @@
       blocks.push({ t: '这是外墙（兼承重墙），拆了整栋楼的传力路径就变了，不能开', k: 'structure' });
     }
     if (w < 0.8) blocks.push({ t: '洞口宽 ' + fmt(w, 2) + ' m 太窄，打穿了也没用（最小 0.8 m）', k: 'size' });
-    if (h > wall.h - 0.30) {
-      blocks.push({
-        t: '洞口高 ' + fmt(h, 2) + ' m，上方只剩 ' + fmt(wall.h - h, 2) + ' m，留不出过梁（墙净高 ' + fmt(wall.h, 2) + ' m）',
-        k: 'height'
-      });
+    /* 过梁和墙垛这两条只对"墙上挖洞"成立。
+       整面拆墙是另一回事：墙顶本来就是梁底，拆到顶不留过梁是对的；
+       两头拆到柱边也不叫"留不住墙垛"。拿开挖洞的规矩去卡拆墙，
+       结果就是"这面墙永远拆不掉"——用户要的恰恰是把这面墙去掉。 */
+    if (!whole) {
+      if (h > wall.h - 0.30) {
+        blocks.push({
+          t: '洞口高 ' + fmt(h, 2) + ' m，上方只剩 ' + fmt(wall.h - h, 2) + ' m，留不出过梁（墙净高 ' + fmt(wall.h, 2) + ' m）',
+          k: 'height'
+        });
+      }
+      const e0 = at - half, e1 = L - at - half;
+      if (e0 < 0.12) blocks.push({ t: e0 < 0.01 ? '洞口已经切到墙端头' : '离墙端头只有 ' + fmt(e0, 2) + ' 米，留不住墙垛', k: 'angle' });
+      if (e1 < 0.12) blocks.push({ t: e1 < 0.01 ? '洞口已经切到墙另一端头' : '离另一端头只有 ' + fmt(e1, 2) + ' 米，留不住墙垛', k: 'angle' });
+    } else {
+      warns.push('整段拆除：洞口 ' + fmt(w, 2) + '×' + fmt(h, 2) + ' m 拆到梁底，两端落在墙端/柱边，不再留过梁和墙垛');
+      if (h < wall.h - 0.10) warns.push('只拆到 ' + fmt(h, 2) + ' m 高，墙上还剩 ' + fmt(wall.h - h, 2) + ' m —— 那不是"整面拆掉"');
     }
-    const e0 = at - half, e1 = L - at - half;
-    if (e0 < 0.12) blocks.push({ t: e0 < 0.01 ? '洞口已经切到墙端头' : '离墙端头只有 ' + fmt(e0, 2) + ' 米，留不住墙垛', k: 'angle' });
-    if (e1 < 0.12) blocks.push({ t: e1 < 0.01 ? '洞口已经切到墙另一端头' : '离另一端头只有 ' + fmt(e1, 2) + ' 米，留不住墙垛', k: 'angle' });
 
     if (o.room && !whole) {
       const ts = [[o.room.x0, o.room.y0], [o.room.x1, o.room.y0], [o.room.x0, o.room.y1], [o.room.x1, o.room.y1]]
@@ -1055,12 +1127,17 @@
     const rows = [
       ['房间', room.name + '（' + room.use + '）'],
       ['平面尺寸', r.lx.toFixed(2) + ' × ' + r.ly.toFixed(2) + ' m'],
+      /* 打通以后这一行是必须写清的：跨度和边界条件都变了，
+         不然看计算书的人会以为还在按单间小板算 */
+      r.merged ? ['计算板跨',
+        '按联通大板：' + (r.plate.rooms || []).map(x => x.num).join(' + ') +
+        '（中间那道墙已整面拆除，不再是支座，跨度取合并后 ' + r.lx.toFixed(2) + ' × ' + r.ly.toFixed(2) + ' m）'] : null,
       ['板厚 / 混凝土', (room.slab.thk * 1000) + ' mm / ' + room.slab.grade],
       ['配筋', 'φ' + room.slab.dia + '@' + room.slab.sp + ' (As=' + room.slab.asx + ' mm2/m)'],
       ['板跨类型', r.oneWay ? '单向板' : '双向板'],
       ['永久荷载 g', r.dead.toFixed(2) + ' kN/m²'],
       ['楼面活荷载标准值 q', room.live.toFixed(1) + ' kN/m²']
-    ];
+    ].filter(Boolean);
     const rows2 = [
       ['设备', eq.name],
       ['自重', (eq.weight / 1000).toFixed(2) + ' t（' + r.P.toFixed(1) + ' kN）'],

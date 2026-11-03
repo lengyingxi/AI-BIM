@@ -27,6 +27,7 @@
   /* ---------------- 几何工具 ---------------- */
   const BASE = new THREE.BoxGeometry(1, 1, 1);
   const BP = BASE.attributes.position.array, BN = BASE.attributes.normal.array, BI = BASE.index.array;
+  const BUV = BASE.attributes.uv.array;
   const VPER = BP.length / 3;   // 24
 
   function boxGeo(items) {
@@ -37,7 +38,13 @@
     const col = hasC ? new Float32Array(n * BP.length) : null;
     // 带贴图的构件（风管、风口）要 UV，按"哪个面朝哪"挑投影平面，2 m 一个平铺周期
     const hasUV = items.some(it => it.uv);
-    const uvs = hasUV ? new Float32Array(n * VPER * 2) : null;
+    /* 线管的 UV 是另一套：u 必须沿**管子的走向**（米），不能按世界法向投影。
+       按世界投影的话，南北向那根管的走向会落到 v 上、东西向的落到 u 上，
+       流动条纹一会儿沿着管跑、一会儿横着扫过管子断面，像在管子上束腰带。
+       it.uvp = { ax:'x'|'y', flip:±1 }：ax 说这段管沿盒子的哪个局部轴长，
+       flip 说这个局部轴的正向是不是"顺电流"（+1 顺、-1 逆）。 */
+    const hasUVP = items.some(it => it.uvp);
+    const uvs = (hasUV || hasUVP) ? new Float32Array(n * VPER * 2) : null;
     let ui = 0;
     const idx = new (n * VPER > 65000 ? Uint32Array : Uint16Array)(n * BI.length);
     const v = new THREE.Vector3(), nm = new THREE.Vector3(), m = new THREE.Matrix4(), sc = new THREE.Matrix4();
@@ -58,12 +65,19 @@
           vi += 3;
         }
         if (uvs) {
-          const ax = Math.abs(nm.x), ay = Math.abs(nm.y), az = Math.abs(nm.z);
-          let uu, vv;
-          if (ay >= ax && ay >= az) { uu = v.x; vv = v.z; }        // 朝上/下的面
-          else if (ax >= az) { uu = v.z; vv = v.y; }               // 朝东/西
-          else { uu = v.x; vv = v.y; }                             // 朝南/北
-          uvs[ui++] = uu * .5; uvs[ui++] = vv * .5;
+          if (it.uvp) {
+            /* 管身：u = 沿管子走向的米数（乘 flip 定方向），v 直接用盒子自带的 0~1 环向，
+               条纹横跨整个周长，看着就是"管子自己在发光"而不是"贴了张图" */
+            const t = (it.uvp.ax === 'y' ? BP[i + 1] * it.size[1] : BP[i] * it.size[0]) * (it.uvp.flip || 1);
+            uvs[ui++] = t; uvs[ui++] = BUV[(i / 3) * 2 + 1] || 0;
+          } else {
+            const ax = Math.abs(nm.x), ay = Math.abs(nm.y), az = Math.abs(nm.z);
+            let uu, vv;
+            if (ay >= ax && ay >= az) { uu = v.x; vv = v.z; }        // 朝上/下的面
+            else if (ax >= az) { uu = v.z; vv = v.y; }               // 朝东/西
+            else { uu = v.x; vv = v.y; }                             // 朝南/北
+            uvs[ui++] = uu * .5; uvs[ui++] = vv * .5;
+          }
         }
       }
       const base = vo / 3 - VPER;
@@ -247,10 +261,14 @@
   }
 
   function buildWallMesh(w, mats) {
-    const geo = boxGeo(wallBoxes(w));
+    const boxes = wallBoxes(w);
+    const geo = boxGeo(boxes);
     const mesh = new THREE.Mesh(geo, w.kind === 'ext' ? mats.wallExt : mats.wallInt);
     mesh.userData = { kind: 'wall', data: w, floor: w.floor };
-    addEdges(mesh, geo, edgeMat);
+    /* 整面拆掉的墙一段都不剩（boxes 为空）—— 这时候不去生成描边：
+       EdgesGeometry 对着 0 个顶点算出来的空几何虽然不报错，但会白白挂一个对象，
+       而且楼层遍历里还得照顾它。mesh 本身留着（隔离/高亮按 wall.id 索引），只是没图形。 */
+    if (boxes.length) addEdges(mesh, geo, edgeMat);
     wallMeshById[w.id] = mesh;
     reg.wall.push(mesh);
     return mesh;
@@ -469,13 +487,32 @@
   };
 
   S.viewAll = function (animate) {
+    if (floorOnly) S.isolateFloor(0);       // 回全楼视角 = 不再只看一层
     const v = VIEWS.all;
     if (animate === false) { camera.position.copy(v.p); controls.target.copy(v.t); controls.update(); return; }
     flyTo(v.p, v.t);
   };
 
   /* ---------------- 楼层聚焦（去掉多余遮挡） ---------------- */
+  /* 只看一层：别的楼层**整块不画**（不是压暗成虚影）。
+     用户在"断一路看回路"时说的是"回路并没有去掉其他楼层的管线"——
+     压到 7% 的虚影在浅色背景上照样看得见，再叠上别层的墙/板/设备，
+     屏幕上就是一团分不清是谁的管线。看回路就要干净：只留本层。 */
+  let floorOnly = 0;
+  S.isolateFloor = function (level) {
+    floorOnly = level || 0;
+    floorGroups.forEach(f => {
+      f.g.visible = floorOnly ? (f.level === floorOnly) : (S.focus === 0 || f.level <= S.focus);
+    });
+    if (roof) roof.visible = !floorOnly && S.focus === 0;
+    if (D() && D().apply) D().apply();
+    syncPanels();
+  };
+  S.floorIsolated = () => floorOnly;
+
   S.setFocus = function (level, animate) {
+    /* 换了一层就不再是"只看原来那层"——这里不主动恢复，交给后面的常规逻辑设显隐 */
+    if (floorOnly && level !== floorOnly) floorOnly = 0;
     // 手动切到别的楼层 = 不想只看那一间了，先把隔离解开，否则藏过的东西回不来
     if (S.isoRoom) {
       const ir = M.rooms.find(r => r.id === S.isoRoom);
@@ -779,7 +816,12 @@
       id: 'P-' + wall.id + '-' + Math.round(at * 100), kind: 'passage', floor: wall.floor,
       wall: wall.id, name: op.name, pos: [ax + ux * at, ay + uy * at, wall.base],
       w: w, h: h, sill: 0, rooms: wall.rooms.slice(), dir: [ux, uy], t: wall.t, added: true,
-      to: (opt && opt.to) || null, demolish: !!(opt && opt.demolish)
+      to: (opt && opt.to) || null, demolish: !!(opt && opt.demolish),
+      /* 只记"这两间"（不是 wall.rooms）。一面长墙常常串着五六间房，
+         拿 wall.rooms 去做"打通后连成一片"的判断，会把整排房都并进同一块板里。 */
+      from: (opt && opt.from) || null,
+      /* 整面拆掉的墙要留个记号：楼板校核靠它判断"这两间已经是一块板了" */
+      merged: !!(opt && opt.demolish)
     };
     M.passages = M.passages || [];
     M.passages.push(p);
@@ -1433,7 +1475,7 @@
     }
     controls.update();
     scaleLabels();
-    tickFlux(t);
+    tickFlow(t);
     if (D() && D().update) D().update(t, camera);
     renderer.render(scene, camera);
   }
@@ -1689,15 +1731,45 @@
     });
   }
 
+  /* 这段线管"往哪边是顺电流"，给流动条纹定方向。
+     跟 S.flux 当年判光点方向用的是同一个办法：不排拓扑，用**距配电箱的平面距离**
+     判上游——离箱子近的那头是上游。竖直段没有平面位移，改看标高：
+     主干立管由下往上送电，墙内下引由上往下落到房间。
+     返回 { ax, flip }：ax 说这段管沿盒子的哪个局部轴长，flip=+1 表示该轴正向即顺电流。 */
+  function flowAxis(c) {
+    const D = E() && E().data;
+    const panel = D ? ((D.panels || []).find(p => p.floor === c.floor) || null) : null;
+    const src = panel ? { x: panel.x, y: panel.y } : null;
+    const near = p => (src ? Math.hypot(p.x - src.x, p.y - src.y) : 0);
+    if (c.vert) {
+      const up = (c.layer === 'trunk' || c.layer === 'feed');
+      return { ax: 'y', flip: up ? 1 : -1 };
+    }
+    if (c.free && c.p1 && c.p2) {
+      /* 自由段：盒子长边是局部 Y，四元数把 +Y 转到 p1→p2 方向 */
+      if (!src) return { ax: 'y', flip: 1 };
+      return { ax: 'y', flip: near({ x: c.p1[0], y: c.p1[1] }) <= near({ x: c.p2[0], y: c.p2[1] }) ? 1 : -1 };
+    }
+    /* 墙内横段：盒子长边是局部 X，正向 = at0 → at1 */
+    const wall = c.wall ? M.walls.find(w => w.id === c.wall) : null;
+    if (!wall || !src) return { ax: 'x', flip: 1 };
+    const a = E().axis(wall);
+    const p0 = { x: a.ax + a.ux * c.at0, y: a.ay + a.uy * c.at0 };
+    const p1 = { x: a.ax + a.ux * c.at1, y: a.ay + a.uy * c.at1 };
+    return { ax: 'x', flip: near(p0) <= near(p1) ? 1 : -1 };
+  }
+
   /* 一根线管 → 一个盒子的变换（size + matrix）。
      所有"把线管画出来"的地方都走这里，别各写一份 —— 以前 eBuild / markConduits
      各写一套几何，加了新的线管类型（自由段、墙内下引）就得改两处，容易漏。
      opt.grow   截面放大倍数（冲突标记要把管子"罩"粗一点才醒目）
-     opt.through 进深要穿出墙面（红色标记要能透过半透明墙看到） */
+     opt.through 进深要穿出墙面（红色标记要能透过半透明墙看到）
+     opt.pipe   要挂流动条纹 → 顺手把"沿管子走向"的 UV 也带上 */
   function eItemOf(c, opt) {
     if (!c) return null;
     opt = opt || {};
     const g = opt.grow || 1;
+    const uvp = opt.pipe ? flowAxis(c) : null;
     const el = ((M.floors.find(f => f.level === c.floor) || {}).elev) || 0;
     /* 自由段：没有墙可依附（层进线这种明敷桥架），只给两端点，按两点连线建盒子 */
     if (c.free && c.p1 && c.p2) {
@@ -1711,12 +1783,13 @@
         new THREE.Vector3(0, 1, 0), dir.clone().normalize());
       return {
         size: [c.s * g, len, c.d * g],
-        matrix: new THREE.Matrix4().compose(mid, q, new THREE.Vector3(1, 1, 1))
+        matrix: new THREE.Matrix4().compose(mid, q, new THREE.Vector3(1, 1, 1)),
+        uvp: uvp
       };
     }
     /* 竖直段：主干立管、墙内下引 */
     if (c.vert) {
-      return { size: [c.s * g, c.z1 - c.z0, c.d * g], matrix: frame(c.x, c.y, el + (c.z0 + c.z1) / 2, 1, 0) };
+      return { size: [c.s * g, c.z1 - c.z0, c.d * g], matrix: frame(c.x, c.y, el + (c.z0 + c.z1) / 2, 1, 0), uvp: uvp };
     }
     const wall = c.wall ? M.walls.find(w => w.id === c.wall) : null;
     if (!wall) return null;
@@ -1726,7 +1799,7 @@
     const mx = a.ax + a.ux * (c.at0 + len / 2), my = a.ay + a.uy * (c.at0 + len / 2);
     let dep = Math.min(c.d, wall.t * .8) * g;
     if (opt.through) dep = Math.max(dep, wall.t * 1.15);
-    return { size: [len, c.s * g, dep], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy) };
+    return { size: [len, c.s * g, dep], matrix: frame(mx, my, wall.base + c.z, a.ux, a.uy), uvp: uvp };
   }
 
   /* 接头 / 弯头：数据层（elec ⑦）已经算好每个接头的位置和尺寸，
@@ -1754,7 +1827,8 @@
     const D = E() && E().data;
     const per = {};
     if (!D) return per;
-    const opt = grow ? { grow: grow } : null;
+    /* pipe:true —— 每段管都带上"沿管子走向"的 UV，材质才能在上面跑流动条纹 */
+    const opt = { grow: grow || 1, pipe: true };
     (list || []).forEach(c => {
       if (!D.circuits.some(x => x.id === c.circuit)) return;
       const it = eItemOf(c, opt);
@@ -2038,128 +2112,121 @@
     /* 画粗一档：这一屏是把整层框进来，原尺寸的管子在屏幕上只有一两个像素，
        不放大根本看不出"这条电是从竖井下来、沿走廊跑、再分进哪几间房" */
     S.isolateConduits(list, { grow: 3.0 });
-    /* 光点从电闸一路跑到房间 —— 这是"电往哪走"最直观的表达 */
+    /* 光点改成贴在管身上的流动条纹了（见 S.flux），从电闸一路跑到房间 */
     S.flux(list, { floor: circ.floor });
     if (rooms && rooms.length) S.highlightRooms(rooms, 0x17a673); else disposeHl();
     S.setFocus(circ.floor, true);
+    S.isolateFloor(circ.floor);         // 只留这一层：别层的管线一根都不许露面
     return list;
   };
 
-  /* ---------------- 电流流向（发光光点沿管线跑） ----------------
+  /* ---------------- 电流流向：贴在管子表面的流动条纹 ----------------
      "从电闸到房间"这件事光画管子看不出来 —— 线在墙里绕一圈，用户不知道电往哪边走。
-     办法：在涉及到的每一段管子上撒一串发光小点，整体沿"闸 → 干线 → 房间"的方向匀速流动。
-     方向不靠排拓扑，用**距电闸的平面距离**判：一段管子两端，离闸近的那头是上游。
-     竖直段（立管、墙内下引）两端平面位置相同，改看标高 ——
-     立管从下往上（一层往上送），下引从上往下（从桥架落到房间）。 */
-  let fluxG = null, fluxItems = [], fluxT0 = 0, fluxTex = null;
+     早先是往空中撒一串发光小点（Sprite）沿管子跑。问题很明显：光点是**飘在空间里**的，
+     关掉透视、或者镜头一转，就成了一屋子乱飞的白点，跟管子对不上，也不像"电在管子里流"。
+     用户的原话是"需要在对应的管子模型上附着流向材质特效"。
+     所以改成：在**线管自己的材质**上加一层流动条纹（emissiveMap，黑底亮条），
+     每帧只推纹理 offset —— 条纹表面沿管子走，视觉上就是电在管子里流动。
+     方向靠 UV 定（见 flowAxis / boxGeo 的 it.uvp）：u 沿管走向、按 flip 定正负，
+     所以同一批 mesh 里每段管各流各的方向，共用一张贴图、一个 offset 就够。 */
+  const FLOW_PERIOD = 0.42;         // 一个条纹周期的长度（米）
+  const FLOW_SPEED = 0.75;          // 条纹沿线速度（m/s）
+  let flowTex = null, flowCircs = {}, flowCount = 0, flowPrev = 0;
 
-  function fluxSprite() {
-    if (fluxTex) return fluxTex;
-    const SZ = 64, cv = document.createElement('canvas');
-    cv.width = cv.height = SZ;
+  function flowTexture() {
+    if (flowTex) return flowTex;
+    const W = 256, H = 8, cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
     const g = cv.getContext('2d');
-    const rg = g.createRadialGradient(SZ / 2, SZ / 2, 0, SZ / 2, SZ / 2, SZ / 2);
-    rg.addColorStop(0, 'rgba(255,255,255,.92)');
-    rg.addColorStop(.28, 'rgba(255,255,255,.62)');
-    rg.addColorStop(.62, 'rgba(255,255,255,.16)');
-    rg.addColorStop(1, 'rgba(255,255,255,0)');
-    g.fillStyle = rg;
-    g.fillRect(0, 0, SZ, SZ);
-    fluxTex = new THREE.CanvasTexture(cv);
-    fluxTex.needsUpdate = true;
-    return fluxTex;
+    g.fillStyle = '#000';
+    g.fillRect(0, 0, W, H);
+    /* 一束"彗星"式条纹：暗底（留一点底光，管子不至于黑掉）→ 亮头 → 长尾。
+       黑底是关键：emissiveMap 是乘上去的，黑就是"这儿没电光"，管子保持本色。 */
+    const lg = g.createLinearGradient(0, 0, W, 0);
+    lg.addColorStop(0.00, '#0a0a0a');
+    lg.addColorStop(0.10, '#3a3a3a');
+    lg.addColorStop(0.26, '#ffffff');
+    lg.addColorStop(0.34, '#c8c8c8');
+    lg.addColorStop(0.52, '#2e2e2e');
+    lg.addColorStop(0.72, '#101010');
+    lg.addColorStop(1.00, '#0a0a0a');
+    g.fillStyle = lg;
+    g.fillRect(0, 0, W, H);
+    const t = new THREE.CanvasTexture(cv);
+    /* u 的单位是米（见 boxGeo），所以 repeat = 1/周期 就把条纹铺成"每 0.42 m 一道" */
+    t.wrapS = THREE.RepeatWrapping;
+    t.wrapT = THREE.ClampToEdgeWrapping;
+    t.repeat.set(1 / FLOW_PERIOD, 1);
+    t.offset.set(0, 0);
+    t.anisotropy = 4;
+    flowTex = t;
+    return t;
   }
 
-  function fluxOff() {
-    if (fluxG) {
-      scene.remove(fluxG);
-      fluxG.traverse(o => { if (o.material) o.material.dispose(); });
-      fluxG = null;
+  /* 给一条分路的 mesh 开/关流动条纹。只动材质，不重建几何。 */
+  function setMeshFlow(mesh, on) {
+    const m = mesh && mesh.material;
+    if (!m) return false;
+    const has = !!m.emissiveMap;
+    if (on && !has) {
+      m.emissiveMap = flowTexture();
+      m.needsUpdate = true;
+      return true;
     }
-    fluxItems = [];
+    if (!on && has) {
+      m.emissiveMap = null;
+      m.needsUpdate = true;
+    }
+    return false;
   }
-  S.fluxOff = fluxOff;
 
-  /* list: 参与流动的线管数组；opt.floor 用来找电闸位置（不传就从第一条管子的楼层取） */
-  S.flux = function (list, opt) {
-    fluxOff();
+  /* 按当前"哪些分路要展示流向"重刷一遍材质。
+     eRoot（全楼管线）和 eIsoG（隔离出来的那几根）都要刷 —— 看回路时画的是后者，
+     只刷前者的话用户看到的还是没条纹的管子。
+     ★ 这里**不按 live 过滤**：用户刚把某一路断开时要看的正是"这一路管到哪几间"，
+     那一根管子已经变灰了，但它是这一屏的主角，条纹照样要跑；
+     条纹说的是"这一路电的走向"，灰不灰说的是"现在有没有电"，两件事。 */
+  function applyFlow() {
     const D = E() && E().data;
-    if (!D || !list || !list.length) return null;
-    opt = opt || {};
-    const floor = opt.floor != null ? opt.floor
-      : (list.find(c => c.floor != null) || {}).floor;
-    const panel = (D.panels || []).find(p => p.floor === floor) || null;
-    const src = panel ? { x: panel.x, y: panel.y } : { x: 0, y: 0 };
-    const near = p => Math.hypot(p.x - src.x, p.y - src.y);
+    let n = 0;
+    if (!D) return 0;
+    const walk = g => {
+      if (!g) return;
+      g.children.forEach(mesh => {
+        const cid = mesh.userData && mesh.userData.circ;
+        if (!cid || !mesh.isMesh) return;
+        const on = !!flowCircs[cid];
+        setMeshFlow(mesh, on);
+        if (on) n++;
+      });
+    };
+    walk(eRoot); walk(eIsoG);
+    flowCount = n;
+    return n;
+  }
+  S.applyFlow = applyFlow;
 
-    const tex = fluxSprite();
-    const g = new THREE.Group();
-    g.name = 'elec-flux';
-    /* 光点用普通混合：加色混合在浅色楼体上会糊成一片白，
-       看不出是"哪条回路在走电"；普通混合能保住回路本色（黄/蓝/红）。
-       depthTest 关掉，光点才能穿透实墙显示 —— 它标的是墙里那根管。 */
-    const mat = new THREE.SpriteMaterial({
-      map: tex, color: 0xffffff, transparent: true, opacity: .92,
-      depthWrite: false, depthTest: false, blending: THREE.NormalBlending
-    });
-
-    (list || []).forEach(c => {
-      const e = (E().segEnds ? E().segEnds(c) : null);
-      if (!e || e.length < 2) return;
-      let a = e[0], b = e[1];
-      const da = near(a), db = near(b);
-      if (Math.abs(da - db) > 0.2) {
-        /* 平面位置差得开：离闸近的一头是上游 */
-        if (db < da) { const t = a; a = b; b = t; }
-      } else {
-        /* 竖直段：立管由下往上，墙内下引由上往下 */
-        const up = c.layer === 'trunk';
-        const aLow = a.z <= b.z;
-        if ((up && !aLow) || (!up && aLow)) { const t = a; a = b; b = t; }
-      }
-      const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
-      if (len < 0.25) return;
-      /* 每 0.9 m 放一个光点，长管子能连成一串，短支线至少一个 */
-      const n = Math.max(1, Math.min(8, Math.round(len / 0.9)));
-      const circ = (D.circuits || []).find(x => x.id === c.circuit);
-      /* 光点用回路本色提亮一档：白色光点叠在浅色楼体上根本看不出来 */
-      const base = new THREE.Color(circColor(circ) || 0xffffff);
-      const hsl = {}; base.getHSL(hsl);
-      base.setHSL(hsl.h, Math.min(1, hsl.s * 1.15), Math.min(0.9, hsl.l + 0.28));
-      for (let i = 0; i < n; i++) {
-        const sp = new THREE.Sprite(mat.clone());
-        sp.material.color.copy(base);
-        const sc = (c.layer === 'trunk' || c.layer === 'feed') ? 0.42 : 0.30;
-        sp.scale.set(sc, sc, sc);
-        sp.userData = { a: a, b: b, phase: i / n, seg: len };
-        g.add(sp);
-        fluxItems.push(sp);
-      }
-    });
-
-    if (!fluxItems.length) return null;
-    fluxT0 = performance.now();
-    scene.add(g);
-    fluxG = g;
-    return { points: fluxItems.length, segments: list.length };
+  /* list: 参与流动的线管数组（分路 id 从这里取）；opt.floor 目前只用于兼容老调用 */
+  S.flux = function (list, opt) {
+    flowCircs = {};
+    (list || []).forEach(c => { if (c && c.circuit) flowCircs[c.circuit] = true; });
+    const n = applyFlow();
+    flowPrev = 0;
+    return { segments: (list || []).length, meshes: n, mode: 'material' };
+  };
+  S.fluxOff = function () {
+    flowCircs = {};
+    applyFlow();
   };
 
-  /* 每帧推进：整串光点同步走，看起来就是一股电在管子里流 */
-  function tickFlux(t) {
-    if (!fluxG || !fluxItems.length) return;
-    const cycle = 2200;                       // 一个光点走完一段用 2.2 s
-    fluxItems.forEach(sp => {
-      const u = sp.userData;
-      const k = (((t - fluxT0) / cycle) + u.phase) % 1;
-      /* three 的坐标是 (x, z, -y) */
-      sp.position.set(
-        u.a.x + (u.b.x - u.a.x) * k,
-        u.a.z + (u.b.z - u.a.z) * k,
-        -(u.a.y + (u.b.y - u.a.y) * k)
-      );
-      /* 走到两端淡出，避免光点在接头处硬跳 */
-      sp.material.opacity = .45 + .55 * Math.sin(Math.PI * k);
-    });
+  /* 每帧推进会：offset 减 = 条纹朝 u 正方向走，而 u 正方向就是"顺电流"。
+     只有真的有管子在流、而且材质还挂着贴图时才推，平时不动省 GPU。 */
+  function tickFlow(t) {
+    if (!flowCount || !flowTex) { flowPrev = 0; return; }
+    const prev = flowPrev || t;
+    const dt = Math.min(0.12, Math.max(0, (t - prev) / 1000));
+    flowPrev = t;
+    flowTex.offset.x -= dt * FLOW_SPEED / FLOW_PERIOD;
   }
 
 
@@ -2172,7 +2239,7 @@
     /* 配电箱不跟电气层开关走 —— 它是真装在墙上的设备，关掉"看管线"也得留着。
        这里只按当前楼层重算显隐。 */
     syncPanels();
-    if (!eOn) { S.clearIsolate(); S.showCircuit(null); fluxOff(); }
+    if (!eOn) { S.clearIsolate(); S.showCircuit(null); S.fluxOff(); }
     if (eOn && !S.xray) S.setXray(true);
   };
 
@@ -2197,11 +2264,15 @@
       });
       mat.userData.ownMat = true;
       const mesh = new THREE.Mesh(boxGeo(per[cid]), mat);
+      /* userData.circ 必须带上：流动条纹是按"这条分路带不带电、要不要流"挂的，
+         少了这个字段，隔离出来的管子永远挂不上材质（屏幕上就是"看不见电在走"）。 */
+      mesh.userData = { kind: 'conduit', circ: cid, floor: circ.floor };
       mesh.renderOrder = 3;
       g.add(mesh);
     });
     if (!g.children.length) { if (eRoot && eOn) eRoot.visible = true; return; }
     scene.add(g); eIsoG = g;
+    applyFlow();                       // 新画出来的这批管也要按当前"谁在流"挂上条纹
   };
   S.clearIsolate = function () {
     if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
@@ -2257,6 +2328,9 @@
       }
       it.mat.needsUpdate = true;
     });
+    /* 通了电才有条纹、断开就没条纹 —— 这正是"断电"最直观的那一眼。
+       放在这里而不是各调用点：任何改分路状态的地方最后都会过这一道。 */
+    applyFlow();
   };
 
   /* 冲突线管：亮红罩一层，并且穿透墙体显示（就是"把冲突的管线位置指出来"） */

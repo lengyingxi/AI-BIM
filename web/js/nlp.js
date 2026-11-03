@@ -498,8 +498,12 @@
     }
 
     if (out.intent === 'passage') {
-      /* "整面拆了"和"打个洞"是两件事：前者挖掉整段（留墙垛），后者只开一块 */
-      out.mode = /拆|整面|全拆|拆掉|拆了|墙不要了/.test(t) ? 'demolish' : 'cut';
+      /* "打通/拆墙"默认就是**把这面墙整段去掉**，不是墙上开个小洞 ——
+         用户的纠正原话："打通不是在墙上开一个很小的洞，是需要去除这个墙"。
+         只有明确说"打个洞 / 开个口子 / 挖个洞 / 开个门洞"才按局部开洞做。 */
+      const holeWord = /打\S{0,2}洞|开\S{0,2}洞|挖\S{0,2}洞|洞口|口子|门洞|小洞|开个门/.test(t);
+      const wholeWord = /整面|全拆|拆掉|拆了|拆掉|墙不要了|拆|去掉|去除|不要这面/.test(t);
+      out.mode = (holeWord && !wholeWord) ? 'cut' : 'demolish';
       applySide(out, findSide(t));
       const pw = findWidth(t);
       out.width = pw ? Math.min(6, Math.max(0.8, pw)) : (out.mode === 'demolish' ? null : 1.8);

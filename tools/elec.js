@@ -758,13 +758,33 @@ const H = t => { console.log('\n' + t); };
         if (bb.min.y < el - 0.35 || bb.max.y > el + h2 + 0.35) bad++;
       });
     }
-    const flux = S.root().getObjectByName('elec-flux');
-    let pts = 0;
-    if (flux) flux.traverse(o => { if (o.isSprite) pts++; });
+    /* 流向改成贴在管身上的流动条纹以后，"有没有流向"要看材质上有没有 emissiveMap，
+       以及那个纹理的 offset 是不是在动 —— 空中的光点已经没有了。 */
+    const isoG = S.root().getObjectByName('elec-iso');
+    let flowMeshes = 0, flowTex = null;
+    if (isoG) isoG.traverse(o => {
+      if (!o.isMesh || !o.material || !o.material.emissiveMap) return;
+      flowMeshes++;
+      if (!flowTex) flowTex = o.material.emissiveMap;
+    });
+    const off0 = flowTex ? flowTex.offset.x : null;
+    /* 轮询等它动：单帧抖动（掉帧/GC）不该被判成"没在流" */
+    let off1 = off0, tries = 0;
+    while (flowTex && off1 === off0 && tries < 14) {
+      await new Promise(r => setTimeout(r, 120));
+      off1 = flowTex.offset.x; tries++;
+    }
+    let sprites = 0;
+    S.root().traverse(o => { if (o.isSprite) sprites++; });
     const c = E.circuit('L2B');
+    /* 只显本层：别的楼层整块不画（不是压暗） */
+    const floorVis = {};
+    S.root().children.forEach(g => { if (/^F\d$/.test(g.name)) floorVis[g.name] = g.visible; });
     return {
-      isolated: S.hasIsolate(), meshes: meshes, outOfFloor: bad, pts: pts,
-      hasFlux: !!flux, focus: S.focus,
+      isolated: S.hasIsolate(), meshes: meshes, outOfFloor: bad,
+      flowMeshes: flowMeshes, flowMoves: off0 != null && off1 != null && off1 !== off0,
+      sprites: sprites, floorVis: floorVis, floorOnly: S.floorIsolated ? S.floorIsolated() : null,
+      focus: S.focus,
       circOn: c.on, othersLive: E.list(2).filter(x => x.id !== 'L2B').every(x => x.live !== false),
       floorAll: E.conduitsOf({ floor: 2 }).length,
       allConduits: E.ready().conduits.length
@@ -775,8 +795,13 @@ const H = t => { console.log('\n' + t); };
   P('图上只留本层管线（没有一个 mesh 落在别的楼层）',
     d13c.isolated === true && d13c.meshes > 0 && d13c.outOfFloor === 0,
     d13c.meshes + ' 个 mesh，越界 ' + d13c.outOfFloor + ' 个；本层 ' + d13c.floorAll + ' 段 / 全楼 ' + d13c.allConduits + ' 段');
-  P('管线上挂出了发光流向（从电闸往房间跑的光点）',
-    d13c.hasFlux === true && d13c.pts > 0, d13c.pts + ' 个流点');
+  P('流向贴在管子材质上（流动条纹，不是飘在空中的光点）',
+    d13c.flowMeshes > 0 && d13c.flowMoves === true,
+    d13c.flowMeshes + ' 条分路的管身挂着条纹，纹理 offset 在推进；场景里 Sprite 共 ' + d13c.sprites + ' 个（都是房间号标签）');
+  P('只显本层：别的楼层整块不画（不是压暗成虚影）',
+    d13c.floorOnly === 2 && d13c.floorVis.F2 === true &&
+    Object.keys(d13c.floorVis).filter(k => k !== 'F2').every(k => d13c.floorVis[k] === false),
+    JSON.stringify(d13c.floorVis));
   P('镜头推到本层配电箱', d13c.focus === 2, 'focus=' + d13c.focus);
 
   /* 13d. 问"两个房间能不能打通"：只有那面墙半透明，别的墙还是实心的 */
@@ -886,6 +911,110 @@ const H = t => { console.log('\n' + t); };
   P('说明里写清六路固定映射', d13e.six === true);
   P('说明里讲清管线上的发光流向', d13e.flux === true);
   P('说明里讲清"只留本层管线"', d13e.onlyFloor === true);
+
+  /* ---------- 14. 拆墙 = 整段拆除 + 联通大板 ---------- */
+  H('【14】拆墙：整段拆到梁底 + 拆完按联通大板算荷载');
+  const d14 = await p.evaluate(async () => {
+    const S = BIM.scene, M = BIM_MODEL, E = BIM.elec, C = BIM.calc;
+    const OPP = { south: 'north', north: 'south', east: 'west', west: 'east' };
+    /* 挑一对"共墙还是完整内隔墙"的房（前面用例可能已经把某面墙打过了） */
+    const used = {};
+    (M.passages || []).forEach(x => { used[x.wall] = 1; });
+    (M.walls || []).forEach(w => { if ((w.openings || []).some(o => o.kind === 'passage')) used[w.id] = 1; });
+    const a = M.rooms.filter(r => r.floor === 2 && r.zone !== 'corr');
+    let pick = null;
+    for (let i = 0; i < a.length && !pick; i++) {
+      for (let j = i + 1; j < a.length; j++) {
+        const s1 = a[i].sides || {}, s2 = a[j].sides || {};
+        const k = Object.keys(s1).find(kk => s1[kk] && s1[kk] === s2[OPP[kk]]);
+        if (!k) continue;
+        const wl = M.walls.find(x => x.id === s1[k]);
+        if (!wl || wl.kind === 'ext' || used[wl.id]) continue;
+        /* 已经并进某块大板的房间不再选：要验的是"拆之前单间、拆之后大板" */
+        if (C.plateOf(a[i]).merged || C.plateOf(a[j]).merged) continue;
+        pick = { r1: a[i], r2: a[j], wall: wl };
+        break;
+      }
+    }
+    if (!pick) return { skip: true };
+    const diag = { pair: pick.r1.num + '+' + pick.r2.num, wall: pick.wall.id, err: null };
+    try {
+    const dev = { id: 'TEST14', name: '测试机柜', w: 0.8, d: 0.8, h: 1.6, weight: 800, rot: 0 };
+    const cxy = { cx: (pick.r1.x0 + pick.r1.x1) / 2, cy: (pick.r1.y0 + pick.r1.y1) / 2 };
+    const plog = { t: typeof C.plateOf };
+    const before = {
+      plate: C.plateOf(pick.r1), res: C.check({ room: pick.r1, equip: dev, cx: cxy.cx, cy: cxy.cy, others: [] })
+    };
+    plog.bp = before.plate ? Object.keys(before.plate).join(',') : 'UNDEF';
+    plog.bk = before.res ? Object.keys(before.res).length : 'UNDEF';
+    /* 用户原话就是"打通"——不给宽度、不说"开洞"，看它是不是默认整段拆 */
+    await BIM.app.send(pick.r1.num + '和' + pick.r2.num + '打通');
+    await new Promise(r => setTimeout(r, 3200));
+    const pl = (M.passages || [])[M.passages.length - 1] || null;
+    const w = pick.wall;
+    /* 墙上一段都不剩：几何顶点数为 0 才算"整面拆干净"。
+       留过梁 / 留墙垛的话，墙还会有若干段几何。 */
+    let wallVerts = null;
+    S.root().traverse(o => {
+      if (o.isMesh && o.userData && o.userData.kind === 'wall' && o.userData.data && o.userData.data.id === w.id) {
+        wallVerts = o.geometry && o.geometry.attributes && o.geometry.attributes.position
+          ? o.geometry.attributes.position.count : 0;
+      }
+    });
+    const ap = C.plateOf(pick.r1);
+    const after = C.check({ room: pick.r1, equip: dev, cx: cxy.cx, cy: cxy.cy, others: [] });
+    const span = (function () {
+      const [ax, ay] = w.p1, [bx, by] = w.p2;
+      const L = Math.hypot(bx - ax, by - ay) || 1, ux = (bx - ax) / L, uy = (by - ay) / L;
+      const ts = [[pick.r1.x0, pick.r1.y0], [pick.r1.x1, pick.r1.y0], [pick.r1.x0, pick.r1.y1], [pick.r1.x1, pick.r1.y1]]
+        .map(([x, y]) => (x - ax) * ux + (y - ay) * uy);
+      return Math.max.apply(null, ts) - Math.min.apply(null, ts);
+    })();
+    const msgs = document.querySelectorAll('.msg.ai');
+    return {
+      skip: false, r1: pick.r1.num, r2: pick.r2.num, wall: w.id,
+      wallH: w.h, span: span,
+      pass: pl && { w: pl.w, h: pl.h, demolish: pl.demolish, from: pl.from, to: pl.to },
+      wallVerts: wallVerts,
+      before: { merged: before.plate.merged, lx: before.plate.lx, ly: before.plate.ly, K: +before.res.K.toFixed(3), chkLx: before.res.lx },
+      after: {
+        merged: ap.merged, ids: ap.ids, lx: ap.lx, ly: ap.ly,
+        K: +after.K.toFixed(3), chkLx: after.lx, chkMerged: after.merged
+      },
+      lastTxt: ((msgs[msgs.length - 1] || {}).textContent || '').slice(0, 160)
+    };
+    } catch (e) {
+      return {
+        skip: false, diag: diag, plog: plog,
+        err: e.message + ' @' + (e.stack || '').split('\n')[1]
+      };
+    }
+  });
+  if (d14.err) {
+    console.log('  ✗ 用例本身出错：' + d14.err + ' ｜ ' + JSON.stringify(d14.diag) + ' ' + JSON.stringify(d14.plog));
+    P('拆墙用例跑得通（没有脚本错误）', false, d14.err);
+  } else if (!d14.skip) {
+    P('说"打通"默认整段拆（demolish），不是墙上开个小洞',
+      d14.pass && d14.pass.demolish === true && d14.pass.from && d14.pass.to,
+      d14.pass ? ('w=' + d14.pass.w.toFixed(2) + ' h=' + d14.pass.h.toFixed(2) + ' demolish=' + d14.pass.demolish) : '无洞口');
+    P('洞宽打满这间房在这一段墙上的整段长（不留墙垛）',
+      d14.pass && Math.abs(d14.pass.w - d14.span) < 0.06,
+      d14.pass ? ('洞宽 ' + d14.pass.w.toFixed(2) + ' m / 房在这面墙上的长 ' + d14.span.toFixed(2) + ' m') : '');
+    P('洞高拆到梁底（等于墙净高，不留过梁）',
+      d14.pass && Math.abs(d14.pass.h - d14.wallH) < 0.06,
+      d14.pass ? ('洞高 ' + d14.pass.h.toFixed(2) + ' m / 墙净高 ' + d14.wallH.toFixed(2) + ' m') : '');
+    P('墙上真的一段都不剩（几何 0 个顶点）', d14.wallVerts === 0, '墙面顶点数 ' + d14.wallVerts);
+    P('拆之前按单间小板算', d14.before.merged === false && Math.abs(d14.before.chkLx - d14.before.lx) < 1e-6,
+      d14.before.lx.toFixed(2) + '×' + d14.before.ly.toFixed(2) + ' m，K=' + d14.before.K);
+    P('拆之后按联通后的大板算（跨度=合并后外包）',
+      d14.after.merged === true && Math.abs(d14.after.chkLx - d14.after.lx) < 1e-6 && d14.after.lx > d14.before.lx + 0.1,
+      '并了 ' + (d14.after.ids || []).join('+') + ' → ' + d14.after.lx.toFixed(2) + '×' + d14.after.ly.toFixed(2) +
+      ' m，K 从 ' + d14.before.K + ' 降到 ' + d14.after.K);
+    P('大板的安全系数比单间小板低（跨度变大，结果变保守）',
+      d14.after.K <= d14.before.K + 1e-6, d14.before.K + ' → ' + d14.after.K);
+  } else {
+    console.log('  · 跳过拆墙用例：找不到还没打过的共墙房间对');
+  }
 
 
   /* ---------- 8. MCP 工具暴露 ---------- */

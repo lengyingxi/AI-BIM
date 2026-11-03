@@ -15,6 +15,10 @@
     flowOn: false,       // 流向是否正在展示（只在看阀门影响时亮）
     doorAsked: {}        // 哪几间房已经问过「要不要拓门」，别一台一台重复问
   };
+  /* 已放设备要能被计算层读到：拆墙打通以后，隔壁那台设备也压在同一块板上，
+     楼板校核必须把联通块里的设备一起叠加（calc.js 的 C.check 会从这里取）。 */
+  window.BIM = window.BIM || {};
+  window.BIM.state = ST;
 
   /* 模型树是"场景的一份视图"：设备增删改之后重建一次，树上马上能看见 */
   function refreshTree() {
@@ -1410,12 +1414,19 @@
       ? '<div class="res-grid"><div><i>这块板上已有</i><b>' + n + ' 台 / ' + (r.POthers * 1000 / 9.81 / 1000).toFixed(2) + ' t</b></div>' +
       '<div><i>合计压着</i><b>' + (r.PTotal * 1000 / 9.81 / 1000).toFixed(2) + ' t</b></div></div>'
       : '';
+    /* 打通以后必须点名"按哪块板算的"：跨度和边界都变了，
+       用户看到安全系数变小会以为算错了，得让他知道是"中间那道墙没了"。 */
+    const merged = r.merged && r.plate
+      ? '<div class="res-adv" style="border-top:1px solid #eef1f5"><s>·</s> 这块板和 ' +
+      (r.plate.rooms || []).filter(x => x.id !== r.room.id).map(x => x.num).join('、') +
+      ' 已经打通，中间那道墙不再是支座，按联通后的大板 ' + r.lx.toFixed(2) + '×' + r.ly.toFixed(2) +
+      ' m 校核（不再按单间小板算）</div>' : '';
     return '<div class="res ' + r.v.cls + '">' +
       '<div class="res-top"><span class="k">' + C.fmt(r.K) + '</span><span class="kl">安全系数</span><span class="tag">' + r.v.tag + '</span></div>' +
       '<div class="res-grid">' +
       '<div><i>建议上限</i><b>' + (r.Pmax_kg / 1000).toFixed(2) + ' t</b></div>' +
       '<div><i>这台设备</i><b>' + (r.equip.weight / 1000).toFixed(2) + ' t</b></div>' +
-      '</div>' + extra +
+      '</div>' + extra + merged +
       '<div class="res-adv">' + r.advice.map(a => '<s>·</s> ' + a).join('<br>') + '</div></div>';
   }
 
@@ -2535,12 +2546,17 @@
     }
 
     /* ③ 牵不了线 → 顺墙挪个不撞管线的位置（挪多少要如实说）
-       整段拆不能挪：挪了就不是"拆这面墙"了，只能走改线或者别拆。
+       整段拆不能挪：挪了就不是"拆这面墙"了。
        手点的位置也不能挪：用户点的就是这儿。 */
     if (o.demolish) {
+      /* 整面拆墙时墙里的线管是另一个性质的问题：墙都没了，管子没有"绕过去"这条路，
+         只能随墙作废、从吊顶或相邻墙重新敷设。这时候报"拆不了"等于告诉用户
+         这面墙永远拆不掉 —— 不是他要的答案。所以照样放行，但把要重做的线点出来。 */
       return {
-        ok: false, chk: c0, hits: hits, plans: plans,
-        why: '这面墙整段都有线管，整段拆又没法挪位置——只能先把这几路电改到别处（或者换一面墙拆）'
+        ok: true, at: at, chk: c0, hits: hits, reroutes: [], needReroute: false,
+        moved: false, movedBy: 0, demolishNote: true,
+        note: '墙里的 ' + hits.length + ' 根线管随墙一起作废，要从吊顶或相邻墙重新敷设',
+        why: '', moveNote: '', rerouteNote: ''
       };
     }
     if (o.noMove) {
@@ -2821,16 +2837,21 @@
       return [pick].concat(inner, all).filter((v, i, a) => v && a.indexOf(v) === i);
     })();
 
-    /* 一面墙的洞口几何：拆墙=整段留 0.3 米墙垛；打穿=指定宽度，默认 1.8 米。
-       宽度不能超过这段墙能给的量，否则校核会一直报"出房间"。 */
+    /* 一面墙的洞口几何：拆墙=**整段到底**（洞宽打满本房间在这一段墙上的长度、
+       洞高拆到梁底，不留过梁也不留墙垛）；打穿=指定宽度，默认 1.8 米。
+       用户原话："打通不是在墙上开一个很小的洞，是需要去除这个墙"——
+       所以 demolish 不能再用"墙高减 0.3 m 的过梁"和"两侧各留墙垛"这套开挖洞的规矩，
+       否则屏幕上还是一片墙只中间掏空，跟没拆一样。 */
     function passageGeom(wl) {
       const sp = roomSpanOnWall(wl, room);
       const spanLen = Math.max(0.8, sp.hi - sp.lo);
+      if (whole) {
+        return { w: spanLen, h: wl.h, at: (sp.lo + sp.hi) / 2, full: true };
+      }
       const hMax = Math.max(1.2, wl.h - 0.30);
-      const hh = Math.min(whole ? Math.min(2.4, hMax) : (step.height || 2.2), hMax);
-      let ww = whole ? Math.max(1.0, spanLen - 0.30) : (step.width || 1.8);
-      ww = Math.min(ww, Math.max(0.8, spanLen - 0.26));
-      let aa = whole ? (sp.lo + sp.hi) / 2 : (step.at != null ? step.at : (sp.lo + sp.hi) / 2);
+      const hh = Math.min(step.height || 2.2, hMax);
+      let ww = Math.min(step.width || 1.8, Math.max(0.8, spanLen - 0.26));
+      let aa = step.at != null ? step.at : (sp.lo + sp.hi) / 2;
       const loA = sp.lo + ww / 2 + 0.1, hiA = sp.hi - ww / 2 - 0.1;
       if (hiA > loA) aa = Math.min(Math.max(aa, loA), hiA);
       return { w: ww, h: hh, at: aa };
@@ -2929,7 +2950,9 @@
       eaten = grab(M.doors || [], S.doorAt, 'door').concat(grab(M.windows || [], S.windowAt, 'window'));
       eaten.forEach(e => { e.kind === 'door' ? S.removeDoor(e.obj) : S.removeWindow(e.obj); });
     }
-    const p = S.addPassage(wall, dec.at, w, h, { to: room2 ? room2.id : null, demolish: whole });
+    const p = S.addPassage(wall, dec.at, w, h, {
+      to: room2 ? room2.id : null, from: room.id, demolish: whole
+    });
     focusSoft(room);
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 2, sp.y - 2, sp.x + 2, sp.y + 2)) S.focusDoor(wall, dec.at, room);
@@ -2949,7 +2972,9 @@
     /* 画面按"打通预览"收口：楼体实心、这面墙半透明、只留墙内管线，
        有改线方案再叠一层绿色走向 —— 用户看完就知道动了哪根电、怎么绕的。
        必须放在 refreshElec 之后：重建电气层会把隔离组一起清掉，先摆就白摆了。 */
-    previewPassage(wall, dec.hits || []);
+    /* 整面拆的时候不描红那几根已经作废的线管：墙都没了，红色粗条会挂在空房间中间，
+       看着像还剩一道红墙。哪几路随墙作废，卡片里逐条列了。 */
+    previewPassage(wall, whole ? [] : (dec.hits || []));
     (dec.reroutes || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
 
     /* 回复里要把"连通到哪、留了多少过梁、线管怎么处理、还要补什么"一次说清 */
@@ -2963,13 +2988,22 @@
     const movedWallTxt = pickedFrom
       ? '你说的那面（' + N.SIDE_CN[pick] + '墙）过不去，我改成了' + N.SIDE_CN[side] + '墙'
       : '';
+    /* 整面拆的时候"上方过梁"这一格没有意义（拆到梁底，本来就不留），
+       换成"拆除高度"；墙里作废的线管单独列一块 —— 这是拆完以后必须补做的事。 */
+    const scrap = (whole && !dec.needReroute && (dec.hits || []).length)
+      ? '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
+      (dec.hits || []).map(c => '<s>·</s> ' + (window.BIM.elec ? window.BIM.elec.KIND_CN[c.kind] : '') +
+        '线管 ' + c.circuit + ' 随墙作废，需从吊顶重新敷设').join('<br>') + '</div>'
+      : '';
     const card =
       '<div class="res ' + (dec.needReroute || dec.moved ? 'warn' : 'ok') + '">' +
-      '<div class="res-top"><span class="k">可以开</span><span class="tag">' +
+      '<div class="res-top"><span class="k">' + (whole ? '可以拆' : '可以开') + '</span><span class="tag">' +
       (dec.needReroute ? '已改线' : (dec.moved ? '已挪位' : '无碰撞')) + '</span></div>' +
-      '<div class="res-grid"><div><i>洞口宽</i><b>' + w.toFixed(2) + ' m</b></div>' +
-      '<div><i>洞口高</i><b>' + h.toFixed(2) + ' m</b></div>' +
-      '<div><i>上方过梁</i><b>' + above.toFixed(2) + ' m</b></div></div>' +
+      '<div class="res-grid"><div><i>' + (whole ? '拆除宽度' : '洞口宽') + '</i><b>' + w.toFixed(2) + ' m</b></div>' +
+      '<div><i>' + (whole ? '拆除高度' : '洞口高') + '</i><b>' + h.toFixed(2) + ' m</b></div>' +
+      '<div><i>' + (whole ? '拆到梁底' : '上方过梁') + '</i><b>' +
+      (whole ? h.toFixed(2) + ' m 全高' : above.toFixed(2) + ' m') + '</b></div></div>' +
+      scrap +
       ((dec.needReroute || dec.moved)
         ? '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
         (dec.hits || []).map(c => '<s>·</s> ' + (window.BIM.elec ? window.BIM.elec.KIND_CN[c.kind] : '') +
@@ -2982,11 +3016,17 @@
       dec.chk.warns.slice(0, 3).map(x => '<s>·</s> ' + x).join('<br>') +
       (eatenTxt ? '<br><s>·</s> ' + eatenTxt : '') + '</div></div>';
 
-    ai(room.num + ' ' + N.SIDE_CN[side] + '墙' + title + '：洞口 ' + w.toFixed(2) + '×' + h.toFixed(2) +
-      ' 米' + toTxt + '。上面留了 ' + above.toFixed(2) + ' 米过梁' +
+    /* 拆墙的叙述跟挖洞不一样：不说"洞口多大、上面留多少过梁"，
+       而是"整面墙没了、拆到梁底、两端落在柱边"。 */
+    const wholeTxt = whole
+      ? ('这段墙 ' + w.toFixed(2) + ' 米长、' + h.toFixed(2) +
+        ' 米高全部拆到梁底，两端落到墙端/柱边，不留过梁也不留墙垛')
+      : ('洞口 ' + w.toFixed(2) + '×' + h.toFixed(2) + ' 米，上面留了 ' + above.toFixed(2) + ' 米过梁');
+    ai(room.num + ' ' + N.SIDE_CN[side] + '墙' + title + '：' + wholeTxt + toTxt +
       (eatenTxt ? '，' + eatenTxt : '') +
       (dec.moved ? '，' + dec.moveNote : '') +
       (dec.needReroute ? '，墙里的 ' + dec.hits.length + ' 根线管已经改道（' + dec.rerouteNote + '）' : '') +
+      (scrap ? '，墙里的 ' + (dec.hits || []).length + ' 根线管随墙一起作废，得从吊顶或相邻墙重新敷设' : '') +
       '。' + (movedWallTxt ? movedWallTxt + '。' : '') + (dec.chk.warns[0] || ''), card);
 
     lastData = {
@@ -3220,6 +3260,9 @@
        一层六路已经够密了，再叠上另外四层根本看不清），
        再让电从这只空开出发、沿走廊、下引、进房间跑一遍。 */
     S.showConduits(true);
+    /* 只留本层：别的楼层整块不画。以前只是压暗成虚影，用户看到的仍然是
+       "别的楼层的管线还在"，分不清哪根管是本层的 —— 看回路的时候必须干净。 */
+    S.isolateFloor && S.isolateFloor(circ.floor);
     const floorCond = E.conduitsOf({ floor: circ.floor });
     if (floorCond.length) S.isolateConduits(floorCond, { grow: 1.6 });
     const fluxList = E.conduitsOf({ circuit: circ.id }).concat(
@@ -3331,6 +3374,7 @@
     S.focusPanel(floor);
     S.refreshPanels(floor);
     S.showConduits(true);
+    S.isolateFloor && S.isolateFloor(floor);      // 只留本层，别层的管/墙/板一并不画
     /* 总开关动的是整层，只留本层的管子；六路全部参与流动，
        一眼看出"这一闸管的就是这一层的这六条路"。 */
     const floorAll = E.conduitsOf({ floor: floor });
@@ -5696,7 +5740,7 @@
            模型经常顺手再猜一个 side，猜错就变成"打南外墙被拒绝"这种答非所问。
            所以只要 to 在，side 一律不采纳。 */
         side: a.to ? undefined : a.side,
-        width: a.width, height: a.height, mode: a.mode === 'demolish' ? 'demolish' : 'cut'
+        width: a.width, height: a.height, mode: a.mode === 'cut' ? 'cut' : 'demolish'
       }),
 
       /* ---- 电路 ---- */
