@@ -2581,17 +2581,49 @@
     return n;
   }
 
+  /* 打通预览：用户问"这两间能不能打通"时要的那一屏。
+     三件事必须同时成立，缺一个就不是他想要的样子：
+       ① 楼体整体保持实心（不整层压成虚影）—— 空间结构得还看得出来
+       ② 只有**要打通的那面墙**半透明 —— 一眼看到墙里有什么
+       ③ 管线只留这面墙里的，别的分路全收起来
+     这跟"显示线管"的默认行为正好相反（那道开关会把整层墙都变虚），
+     所以这里每次都先 setXray(false) 把它掰回来。 */
+  function previewPassage(wall, markList) {
+    if (!window.BIM.elec || !wall) return;
+    const E = window.BIM.elec;
+    const inWall = (E.conduitsOf({ wall: wall.id }) || []);
+    S.showConduits(true);
+    S.setXray(false);
+    S.clearGhostWalls && S.clearGhostWalls();
+    S.ghostWall(wall, true);
+    S.clearConduitMarks();
+    /* 空数组也调：墙里一根管都没有时，整个电气层就一根都不画 */
+    S.isolateConduits(inWall);
+    if (markList && markList.length) S.markConduits(markList, 0xff3b30);
+    S.syncCircuitPower();
+    return inWall;
+  }
+
   /* 把"撞上的线管 / 改线走向 / 半透明墙体"一次性摆到屏幕上。
      用户要的就是这一眼：墙里哪根管子挡着，新的线打算怎么走。 */
   function showHoleConflict(wall, hits, plans, alsoOpen) {
     if (!window.BIM.elec) return;
     const all = (hits || []).concat((alsoOpen && alsoOpen.conduits) || []);
     S.showConduits(true);
+    /* showConduits 会顺手把整层墙都压成半透明（为了让墙里的管能看见）。
+       但看"能不能打通"的时候，用户要的是**空间结构还在**：别的房间的墙、
+       隔墙、外墙都得是实心的，只有要打通的那面墙半透明 ——
+       否则一屋子全是虚影，根本分不清打通以后是什么样。
+       所以这里**无条件**关透视：之前哪怕正在看分路透视，进了打通视图也一律回到实墙。 */
+    S.setXray(false);
+    S.clearGhostWalls && S.clearGhostWalls();
     S.ghostWall(wall, true);
     S.clearConduitMarks();
     /* 只留真正撞上的这几根：其它分路的线管全收起来。
-       满屏管子的时候根本看不清撞点在哪儿，"只显示碰撞的管线"是这个功能的前提。 */
-    if (all.length) S.isolateConduits(all);
+       满屏管子的时候根本看不清撞点在哪儿，"只显示碰撞的管线"是这个功能的前提。
+       这面墙里一根管都没有时也要调一次 —— 传空数组等于"一根都不画"，
+       画面只剩干净的墙体和空间关系，正是用户说的"隐藏管线的显示"。 */
+    S.isolateConduits(all);
     S.markConduits(all, 0xff3b30);
     (plans || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
     S.syncCircuitPower();
@@ -2702,12 +2734,18 @@
   function pickPassageSide(room, step) {
     const sides = room.sides || {};
     const cands = ['south', 'north', 'east', 'west'].filter(k => sides[k]);
-    if (step.side && sides[step.side]) return step.side;
-    // 有明确的隔壁房号 → 选两面共用的那面墙
+    /* 有明确的隔壁房号 → 先取两面共用的那面墙，**优先于 side**。
+       "把 201 和 202 打通"只可能是两家中间那道墙；模型或方向换算给出的 side
+       一旦猜错，就会跑去拆南外墙，然后回一句"承重墙不能拆"——答非所问。
+       只有找不到共用墙时才退回 side。 */
     if (step.to) {
       const other = window.BIM.agent.roomByNum(step.to, step.floor);
       if (other) {
-        const hit = cands.find(k => sides[k] === (other.sides || {})[k]);
+        /* 关键：两间房"共用一面墙"必须是**对边**关系（我这面 east = 你那面 west）。
+           201 和 202 并排时，南北两条长墙两边都挂着它们俩，用"同名边相等"去比，
+           先命中的会是南外墙 —— 于是系统跑去拆承重外墙，回一句"四面都是外墙"。 */
+        const OPP = { south: 'north', north: 'south', east: 'west', west: 'east' };
+        const hit = cands.find(k => sides[k] && sides[k] === ((other.sides || {})[OPP[k]]));
         if (hit) return hit;
         const shared = cands.find(k => {
           const w = M.walls.find(x => x.id === sides[k]);
@@ -2716,6 +2754,8 @@
         if (shared) return shared;
       }
     }
+    /* 没有隔壁房号（或找不到共用墙）时，才认用户/相机给的方向 */
+    if (step.side && sides[step.side]) return step.side;
     // 没指定 → 优先内隔墙（外墙不能拆），且这面墙的另一侧真有房间
     const inner = cands.filter(k => {
       const w = M.walls.find(x => x.id === sides[k]);
@@ -2745,6 +2785,8 @@
       S.rebuildElec();
       S.rebuildPanels();
       S.showConduits(true);
+      /* 同上：开完洞不要把整层墙都变虚，只保留要打通的那面墙的半透明 */
+      S.setXray(false);
       if (hits && hits.length) S.markConduits(hits, 0xff3b30);
       (plans || []).forEach(p => { if (p && p.ok) S.showReroute(p, 0x17a673); });
       S.syncCircuitPower();
@@ -2824,8 +2866,20 @@
       const f = tried[0] || null;
       focusSoft(room);
       if (f && f.wall) S.highlightWall(f.wall, 0xdd534f);
-      if (f && f.dec && f.dec.hits && f.dec.hits.length) showHoleConflict(f.wall, f.dec.hits, f.dec.plans);
+      /* 打不通也要摆这一屏：楼体实心、只半透明这面墙、只留墙内管线。
+         用户得能看见"到底卡在哪儿"，而不是一屋子虚影加满屏管子。 */
+      if (f && f.wall) {
+        previewPassage(f.wall, (f.dec && f.dec.hits) || []);
+        ((f.dec && f.dec.plans) || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
+      }
       const bs = (f && f.blocks && f.blocks.length) ? f.blocks : [{ t: '这个位置打不通' }];
+      /* 打不通也要留一份结构化结果：调用方/测试要能看出"系统拿的是哪面墙、
+         为什么不给开"，而不是只读一句自然语言。 */
+      lastData = {
+        passage: 'blocked', room: room.num, side: (f && f.side) || pick,
+        wall: (f && f.wall) ? f.wall.id : null, to: step.to || null,
+        blocks: bs.map(b => b.t)
+      };
       const others = tried.slice(1).filter(x => !x.ext);
       const allExt = tried.every(x => x.ext);
       if (allExt) {
@@ -2879,7 +2933,6 @@
     focusSoft(room);
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 2, sp.y - 2, sp.x + 2, sp.y + 2)) S.focusDoor(wall, dec.at, room);
-    if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
     pushUndo('把刚打穿的洞补回去', () => {
       S.removePassage(p);
       S.markDoorSpotClear && S.markDoorSpotClear();
@@ -2893,6 +2946,11 @@
       if (eaten.length) S.rebuildWall(wall);
     });
     refreshElec(dec.hits, dec.reroutes);
+    /* 画面按"打通预览"收口：楼体实心、这面墙半透明、只留墙内管线，
+       有改线方案再叠一层绿色走向 —— 用户看完就知道动了哪根电、怎么绕的。
+       必须放在 refreshElec 之后：重建电气层会把隔离组一起清掉，先摆就白摆了。 */
+    previewPassage(wall, dec.hits || []);
+    (dec.reroutes || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
 
     /* 回复里要把"连通到哪、留了多少过梁、线管怎么处理、还要补什么"一次说清 */
     const above = wall.h - h;
@@ -2949,11 +3007,19 @@
      用户说"3 楼照明是哪路电""把这路断电看看影响谁""这间房有几路电"都走这里。
      切分路要同时做三件事：分路变色、关联房间高亮、楼体半透明——
      不然光把线管变灰，看不出"这几间跟着黑了"。 */
+  /* 回路显示名：六路之后一律以数据里的 kind_cn 为准（照明1/照明2/…），
+     万一碰到老数据没带 kind_cn 才退回"照明/插座/动力"。 */
+  function cnOf(c) {
+    const E = window.BIM.elec;
+    if (!c) return '';
+    return c.kind_cn || c.short || (E && E.KIND_CN && E.KIND_CN[c.kind]) || '电';
+  }
+
   function circuitSummary(circ) {
     const E = window.BIM.elec;
     const rooms = E.circuitRooms(circ.id);
     return {
-      id: circ.id, name: circ.name, kind: E.KIND_CN[circ.kind], on: circ.on !== false,
+      id: circ.id, name: circ.name, kind: cnOf(circ), on: circ.on !== false,
       panel: circ.panel, phase: circ.phase, rated: circ.rated,
       rooms: rooms.map(r => r.num), room_names: rooms.map(r => r.name),
       conduits: circ.conduits.length
@@ -2983,18 +3049,18 @@
         '<div><i>第' + (c.no || 1) + '路 ' + c.kind_cn + '</i><b>' +
         (c.on ? '合闸·有电' : (c.switch_on === false ? '已断开' : '手柄合着·无电')) + '</b></div>').join('');
       ai(floor + ' 楼配电箱 ' + p.id + ' 的总开关现在是' + (pmain ? '合着的（整层有电）' : '断开的（整层没电）') +
-        '。总开关管整层三路，现在：' +
+        '。总开关管整层六路，现在：' +
         list.map(c => '第' + (c.no || 1) + '回路（' + c.kind_cn + '）' +
           (c.on ? '正常' : (c.switch_on === false ? '已断开' : '无电'))).join('、') + '。' +
-        '控制范围不一样：总开关一断，三路一起停（' + (imp.count || 0) + ' 间房全黑）；' +
+        '控制范围不一样：总开关一断，六路一起停（' + (imp.count || 0) + ' 间房全黑）；' +
         '分路只各管自己那一路，断一路只停那一类功能。' +
         '要操作就说"把 ' + floor + ' 楼总开关' + (pmain ? '断开' : '送电') + '"。',
         '<div class="res ok"><div class="res-top"><span class="k">' + p.id + ' 总开关</span>' +
         '<span class="tag">' + (pmain ? '合闸' : '断开') + '</span></div>' +
         '<div class="res-grid">' + swRow + '</div>' +
         '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-        '<s>·</s> 最左一只总开关管整层三路；右边 1/2/3 号手柄各管自己那一路' +
-        '<br><s>·</s> 总开关断 = 三路一起停；分路断 = 只停那一类' +
+        '<s>·</s> 最左一只总开关管整层六路；右边 1~6 号手柄各管自己那一路' +
+        '<br><s>·</s> 总开关断 = 六路一起停；分路断 = 只停那一类' +
         '</div></div>');
       chips([
         { label: pmain ? '拉下总开关' : '合上总开关', fn: () => send('把' + floor + '楼总开关' + (pmain ? '断开' : '送电')) },
@@ -3024,23 +3090,23 @@
       const dead = cs.filter(c => !liveOf(c));
       const hostMain = E.mainOn(room.floor);
       /* 每路在这间房里管什么，一起说清楚——不然"有几路电"答完也没用 */
-      const perRoom = c => E.KIND_CN[c.kind] +
+      const perRoom = c => cnOf(c) +
         (!liveOf(c) ? (ownOff(c) ? '（这一路已断开，现在不能用）' : '（手柄没动，但总开关断了，现在没电）') : '');
       ai(room.num + ' 由 ' + cs.length + ' 路电供：' +
         cs.map(c => c.name + '（' + c.id + '，' + (liveOf(c) ? '正常' : (ownOff(c) ? '已断开' : '无电')) + '）').join('、') +
         '。' + cs.map(perRoom).join('、') + '。' +
         (dead.length ? '现在 ' + dead.length + ' 路没电，这间房的' +
-          dead.map(c => E.KIND_CN[c.kind]).join('/') + '是停的。'
-          : '三路都通，照明、插座、动力都正常。') +
-        (hostMain ? '' : '注意：' + room.floor + ' 楼配电箱的总开关是断的，三路是一起失电的，' +
+          dead.map(cnOf).join('/') + '是停的。'
+          : '六路都通，照明、插座、动力都正常。') +
+        (hostMain ? '' : '注意：' + room.floor + ' 楼配电箱的总开关是断的，六路是一起失电的，' +
           '不是单独哪一路出问题，合上总开关才整层恢复。') +
         '要断哪一路，说"把 ' + room.num + ' 的照明断电"。',
         '<div class="res ok"><div class="res-top"><span class="k">' + room.num + '</span><span class="tag">' + cs.length + ' 路</span></div>' +
-        '<div class="res-grid">' + cs.map(c => '<div><i>' + E.KIND_CN[c.kind] + ' ' + c.id + '</i><b>' +
+        '<div class="res-grid">' + cs.map(c => '<div><i>' + cnOf(c) + ' ' + c.id + '</i><b>' +
           (liveOf(c) ? '通电' : (ownOff(c) ? '断开' : '无电')) + '</b></div>').join('') + '</div>' +
         '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
         '<s>·</s> 每路管一类用电：照明是灯、插座是墙面取电、动力是空调和大设备，断一路只停那一类' +
-        (dead.length ? '<br><s>·</s> 当前停用：' + dead.map(c => E.KIND_CN[c.kind]).join('、') : '') +
+        (dead.length ? '<br><s>·</s> 当前停用：' + dead.map(cnOf).join('、') : '') +
         (hostMain ? '' : '<br><s>·</s> 根子在总开关：' + room.floor + 'F 配电箱最左边那只手柄现在是断的') +
         '</div></div>');
       lastData = { room: room.num, circuits: cs.map(circuitSummary), lost: pw.lost, still: pw.still };
@@ -3063,16 +3129,16 @@
       '。走向是：电气竖井里的主干立管下来，进本层配电箱 ' + pid +
       '，再沿走廊桥架横铺一圈（' + corrN + ' 段干线），最后从走廊分进各房间。' +
       (pmain
-        ? pid + ' 的总开关（箱门最左边那只）在合位，三路各自独立，断哪一路只停那一类。'
-        : '⚠ ' + pid + ' 的总开关现在是断的：三路一起失电，三个分路手柄虽然都还停在合位，整层照样没电。' +
+        ? pid + ' 的总开关（箱门最左边那只）在合位，六路各自独立，断哪一路只停那一类。'
+        : '⚠ ' + pid + ' 的总开关现在是断的：六路一起失电，六个分路手柄虽然都还停在合位，整层照样没电。' +
           '说"把 ' + floor + ' 楼总开关合上"可以一次全恢复。') +
       '要断哪一路，说"把 ' + floor + ' 楼第 1 回路断电"。',
       '<div class="res ok"><div class="res-top"><span class="k">' + floor + 'F 配电</span><span class="tag">' + list.length + ' 路</span></div>' +
       '<div class="res-grid">' + list.map(c => '<div><i>第' + (c.no || 1) + '回路 ' + c.kind_cn + '</i><b>' +
         (c.on ? c.room_nums.length + ' 间' : (c.switch_on === false ? '已断开' : '总开关断')) + '</b></div>').join('') + '</div>' +
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-      '<s>·</s> 总开关（最左一只）管整层三路；右边 1/2/3 号手柄各管自己那一路' +
-      '<br><s>·</s> 总开关断开时三个分路手柄不会动，只是失电 —— 屏幕上手柄仍朝上、灯变暗' +
+      '<s>·</s> 总开关（最左一只）管整层六路；右边 1~6 号手柄各管自己那一路' +
+      '<br><s>·</s> 总开关断开时六个分路手柄不会动，只是失电 —— 屏幕上手柄仍朝上、灯变暗' +
       '<br><s>·</s> 主干立管（竖井）→ ' + pid + ' → 走廊干线 → 房间支线' +
       '<br><s>·</s> 干线在吊顶里分层走桥架，比房间支线粗；开关房门碰不到它</div></div>');
     lastData = { floor: floor, circuits: list };
@@ -3089,7 +3155,7 @@
     const txt = step.text || '';
 
     /* ── 总开关分支 ──
-       总开关（进线断路器）管整层三路，分路只管自己那一路，这是两层控制，不能混。
+       总开关（进线断路器）管整层六路，分路只管自己那一路，这是两层控制，不能混。
        不加这道拦截，说"把 2 楼总闸拉下来"会掉进下面按分路找路的逻辑 ——
        结果只断了随机某一路，用户以为整层黑了，其实只停了一类。 */
     const isMain = step.mainSwitch === true
@@ -3103,7 +3169,9 @@
     if (step.circuit) circ = E.circuit(step.circuit) || E.circuit(String(step.circuit).toUpperCase());
     if (!circ) {
       const no = step.circuitNo || (() => {
-        const m = txt.match(/第\s*([一二三四五六1-6])\s*回/) || txt.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/);
+        const m = txt.match(/第\s*([一二三四五六1-6])\s*回/)
+          || txt.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/)
+          || txt.match(/第\s*([一二三四五六1-6])\s*(?:个|只|路|号)?\s*(?:空开|空气开关|电闸|闸刀|断路|开关)/);
         return m ? (N.CN_NUM ? N.CN_NUM[m[1]] : ({ 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }[m[1]] || +m[1])) : null;
       })();
       if (no) circ = E.circuitByNo(floor, no);
@@ -3111,12 +3179,22 @@
     if (!circ) {
       const kind = step.kind || (/照明|灯/.test(txt) ? 'light'
         : (/插座/.test(txt) ? 'socket' : (/动力|设备|空调/.test(txt) ? 'power' : null)));
-      const pool = E.list(floor).filter(c => !kind || c.kind === kind);
-      if (room) {
-        const mine = pool.filter(c => (c.room_nums || []).indexOf(room.num) >= 0);
-        circ = E.circuit((mine[0] || pool[0] || {}).id) || null;
-      } else {
-        circ = E.circuit((pool[0] || {}).id) || null;
+      /* 同类里的第几条："照明2""插座1""动力2"。
+         用户带序号说的时候要精确落到那一条，不能含糊成"第 1 条"。 */
+      let sub = step.circuitSub || null;
+      if (!sub) {
+        const ms = txt.match(/(照明|插座|动力)\s*([12一二])/);
+        if (ms) sub = /[12]/.test(ms[2]) ? +ms[2] : (N.CN_NUM ? N.CN_NUM[ms[2]] : null);
+      }
+      if (kind && sub) circ = E.circuitByKind(floor, kind, sub);
+      if (!circ) {
+        const pool = E.list(floor).filter(c => !kind || c.kind === kind);
+        if (room) {
+          const mine = pool.filter(c => (c.room_nums || []).indexOf(room.num) >= 0);
+          circ = E.circuit((mine[0] || pool[0] || {}).id) || null;
+        } else {
+          circ = E.circuit((pool[0] || {}).id) || null;
+        }
       }
     }
     if (!circ) {
@@ -3138,8 +3216,15 @@
        顺序不能反：refreshPanels 必须在 toggle 之后，几何是按当前状态烘的。 */
     const panel = S.focusPanel(circ.floor);
     S.refreshPanels(circ.floor);
-    /* 图纸上这一路也一起标出来（半透明楼体 + 只有这一路亮着） */
+    /* 图纸上这一路也一起标出来：先只留**本层**的管子（别的楼层全收起来，
+       一层六路已经够密了，再叠上另外四层根本看不清），
+       再让电从这只空开出发、沿走廊、下引、进房间跑一遍。 */
     S.showConduits(true);
+    const floorCond = E.conduitsOf({ floor: circ.floor });
+    if (floorCond.length) S.isolateConduits(floorCond, { grow: 1.6 });
+    const fluxList = E.conduitsOf({ circuit: circ.id }).concat(
+      floorCond.filter(c => c.layer === 'trunk' || c.layer === 'feed'));
+    S.flux(fluxList, { floor: circ.floor });
     S.syncCircuitPower();
 
     /* 影响面按"功能"算：一层只有一条照明、一条插座、一条动力，
@@ -3179,13 +3264,13 @@
       '<span class="tag">' + (circ.label || circ.name) + ' · ' + circ.phase + '</span></div>' +
       '<div class="res-grid wrap">' + rows + '</div>' +
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-      '<s>·</s> 配电箱 ' + circ.panel + ' 上三只分路手柄，从左数第 ' + (circ.no || 1) + ' 只（' + (E.KIND_CN[K] || '') + '）已' +
+      '<s>·</s> 配电箱 ' + circ.panel + ' 上六只分路手柄，从左数第 ' + (circ.no || 1) + ' 只（' + cnOf(circ) + '）已' +
       (nowOn ? '合上，指示灯变绿' : '落下，指示灯变红') +
       (!pmain ? '（不过这层的总开关还断着，整层现在没电）' : '') +
-      (nowOn ? '' : '；这一路带 ' + imp.count + ' 间房的' + (E.KIND_CN[K] || '') + '，' + LOSS.gone) +
+      (nowOn ? '' : '；这一路带 ' + imp.count + ' 间房的' + cnOf(circ) + '，' + LOSS.gone) +
       (nowOn ? '' : '<br><s>·</s> ' + LOSS.keep) +
       (bare.length ? '<br><s>·</s> 其中 ' + bare.length + ' 间本来就只有这一路，等于彻底没电' : '') +
-      '<br><s>·</s> 总开关（最左那只）管整层三路，右边这三只各管自己那一路' +
+      '<br><s>·</s> 总开关（最左那只）管整层六路，右边这六只各管自己那一路' +
       '<br><s>·</s> 整条路径：' + circ.floor + 'F 竖井主干 → 层进线 → ' + circ.panel +
       ' → 走廊吊顶干线 → 墙内下引 → 各房间支线' +
       '<br><s>·</s> 点下面的「查看回路影响」可以只看这一条路走到哪几间房</div>' +
@@ -3213,20 +3298,20 @@
 
     lastData = {
       circuit: circ.id, name: circ.name, label: circ.label, no: circ.no,
-      kind: E.KIND_CN[circ.kind], on: nowOn,
+      kind: cnOf(circ), on: nowOn,
       switch_on: circ.on !== false, main_on: pmain,
       panel: circ.panel, phase: circ.phase, rated: circ.rated,
       rooms: implicitRoomNums(rooms),
       dark_rooms: dark,
       bare_rooms: bare,
       partial_rooms: imp.partial_rooms,
-      function_lost: nowOn ? null : (E.KIND_CN[circ.kind] || ''),
+      function_lost: nowOn ? null : cnOf(circ),
       still_powered: rooms.filter(r => E.roomPower(r).on.length > 0).map(r => r.num)
     };
     return true;
   }
 
-  /* 总开关（进线断路器）：一拉整层三路全停，一合三路一起恢复。
+  /* 总开关（进线断路器）：一拉整层六路全停，一合六路一起恢复。
      和"断某一分路"必须分开讲 —— 用户要能把"整层黑了"和"只停了一类"分清楚，
      也要知道总开关合上以后，之前单独断开的分路并不会跟着自动恢复。 */
   async function stepMainSwitch(step, floor) {
@@ -3246,6 +3331,11 @@
     S.focusPanel(floor);
     S.refreshPanels(floor);
     S.showConduits(true);
+    /* 总开关动的是整层，只留本层的管子；六路全部参与流动，
+       一眼看出"这一闸管的就是这一层的这六条路"。 */
+    const floorAll = E.conduitsOf({ floor: floor });
+    if (floorAll.length) S.isolateConduits(floorAll, { grow: 1.6 });
+    S.flux(floorAll, { floor: floor });
     S.syncCircuitPower();
 
     const list = E.list(floor) || [];
@@ -3257,16 +3347,16 @@
 
     let msg = floor + ' 楼配电箱 ' + p.id + ' 的总开关';
     if (nowOn) {
-      msg += '已合上：照明、插座、动力三路一起恢复，' + (imp.count || 0) + ' 间房重新有电。';
+      msg += '已合上：照明1/2、插座1/2、动力1/2 六路一起恢复，' + (imp.count || 0) + ' 间房重新有电。';
       if (stillOff.length) {
         msg += '不过 ' + stillOff.map(c => '第' + (c.no || 1) + '回路（' + c.kind_cn + '）').join('、') +
           ' 自己的手柄还断着，它带的那几间现在仍然没电 —— 总开关只管"整层有没有电送进来"，' +
           '分路该合还得单独合：说"把 ' + floor + ' 楼第 ' + (stillOff[0].no || 1) + ' 回路送电"。';
       }
     } else {
-      msg += '已拉下：照明、插座、动力三路一起失电，整层 ' + (imp.count || 0) + ' 间房全停' +
+      msg += '已拉下：照明1/2、插座1/2、动力1/2 六路一起失电，整层 ' + (imp.count || 0) + ' 间房全停' +
         (rooms.length ? '（' + short(rooms.map(r => r.num)) + '）' : '') + '。' +
-        '三个分路手柄我一个没碰，还都停在合位 —— 总闸一断分路不会自己跳，' +
+        '六个分路手柄我一个没碰，还都停在合位 —— 总闸一断分路不会自己跳，' +
         '箱子上看到的就是"手柄全朝上、灯全灭"。' +
         '只想停某一类，用"把 ' + floor + ' 楼第 1 回路断电"，那才只停那一路。';
     }
@@ -3281,7 +3371,7 @@
       return '<div><i>' + r.num + '</i><b>' + st + '</b></div>';
     }).join('');
 
-    /* 三路各自的状态：这里能直接看出"手柄位置"和"有没有电"是两件事 */
+    /* 六路各自的状态：这里能直接看出"手柄位置"和"有没有电"是两件事 */
     const swRow = list.map(c =>
       '<div><i>第' + (c.no || 1) + '路 ' + c.kind_cn + '</i><b>' +
       (c.on ? '合闸·有电' : (c.switch_on === false ? '已断开' : '手柄合着·无电')) + '</b></div>').join('');
@@ -3289,11 +3379,11 @@
     const card =
       '<div class="res ' + (nowOn ? 'ok' : 'warn') + '">' +
       '<div class="res-top"><span class="k">' + p.id + ' 总开关</span>' +
-      '<span class="tag">' + floor + 'F · 管整层三路</span></div>' +
+      '<span class="tag">' + floor + 'F · 管整层六路</span></div>' +
       '<div class="res-grid wrap">' + rows + '</div>' +
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
-      '<s>·</s> 总开关在箱门最左边，中间隔了一道挡板；右边三个手柄才是第 1/2/3 回路' +
-      '<br><s>·</s> 左只管全层、右各管一路：总开关断 = 三路一起停，分路断 = 只停那一类' +
+      '<s>·</s> 总开关在箱门最左边，中间隔了一道挡板；右边六个手柄才是第 1~6 回路' +
+      '<br><s>·</s> 左只管全层、右各管一路：总开关断 = 六路一起停，分路断 = 只停那一类' +
       (nowOn ? '' : '<br><s>·</s> 分路手柄没有被拉下来，只是没电（灯变暗表示失电，不是断开）') +
       (stillOff.length ? '<br><s>·</s> 仍有 ' + stillOff.length + ' 路自己断着：' +
         stillOff.map(c => '第' + (c.no || 1) + '回路').join('、') : '') +
@@ -3426,8 +3516,8 @@
       const cs = byCirc[id];
       const circ = E.circuit(id) || {};
       const kinds = [];
-      cs.forEach(c => { const k = E.KIND_CN[c.kind]; if (kinds.indexOf(k) < 0) kinds.push(k); });
-      return '<div><i>' + id + ' ' + (E.KIND_CN[circ.kind] || '') + '</i><b>' +
+      cs.forEach(c => { const k = cnOf(c); if (kinds.indexOf(k) < 0) kinds.push(k); });
+      return '<div><i>' + id + ' ' + cnOf(circ) + '</i><b>' +
         cs.length + ' 段 · ' + kinds.join('/') + '</b></div>';
     }).join('');
     const zs = list.map(c => c.z).sort((a, b) => a - b);
@@ -3450,7 +3540,7 @@
     lastData = {
       room: room.num, side: side,
       conduits: list.map(c => ({
-        id: c.id, circuit: c.circuit, kind: E.KIND_CN[c.kind],
+        id: c.id, circuit: c.circuit, kind: cnOf(c),
         layer: c.layer, layer_cn: E.LAYER_CN[c.layer] || c.layer,
         at0: +c.at0.toFixed(2), at1: +c.at1.toFixed(2), z: c.z
       }))
@@ -5601,7 +5691,11 @@
 
       /* ---- 墙：打穿 / 拆墙 ---- */
       open_passage: a => runTool({
-        act: 'passage', text: '', room: a.room, floor: a.floor, to: a.to, side: a.side,
+        act: 'passage', text: '', room: a.room, floor: a.floor, to: a.to,
+        /* 用户说的是"这两间打通"（给了隔壁房号）时，墙只能是两间共用的那一面。
+           模型经常顺手再猜一个 side，猜错就变成"打南外墙被拒绝"这种答非所问。
+           所以只要 to 在，side 一律不采纳。 */
+        side: a.to ? undefined : a.side,
         width: a.width, height: a.height, mode: a.mode === 'demolish' ? 'demolish' : 'cut'
       }),
 
@@ -5612,7 +5706,8 @@
       }),
       toggle_circuit: a => runTool({
         act: 'circuitset', text: '', circuit: a.circuit, room: a.room, floor: a.floor,
-        circuitNo: a.circuit_no, kind: a.kind, action: a.action === 'on' ? 'on' : 'off',
+        circuitNo: a.circuit_no, circuitSub: a.circuit_sub, kind: a.kind,
+        action: a.action === 'on' ? 'on' : 'off',
         mainSwitch: a.main_switch === true, scope: a.main_switch === true ? 'floor' : undefined
       }),
       query_conduits: a => runTool({ act: 'conduits', text: '', room: a.room, floor: a.floor, side: a.side }),

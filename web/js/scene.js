@@ -1433,6 +1433,7 @@
     }
     controls.update();
     scaleLabels();
+    tickFlux(t);
     if (D() && D().update) D().update(t, camera);
     renderer.render(scene, camera);
   }
@@ -1667,7 +1668,17 @@
   let eOn = false;
 
   S.elecOn = () => eOn;
-  const EC = () => (E() ? E().COLOR : { light: 0xf0b429, socket: 0x3b9ae1, power: 0xd8544f, reroute: 0x17a673, hit: 0xff3b30, off: 0x8a929b });
+  const EC = () => (E() ? E().COLOR : {
+    light: 0xf0b429, light2: 0xd08b0e, socket: 0x3b9ae1, socket2: 0x2168ab,
+    power: 0xd8544f, power2: 0xa03229, reroute: 0x17a673, hit: 0xff3b30, off: 0x8a929b
+  });
+  /* 一条回路的本色。同类拆成 1/2 两条以后，颜色不能再只看 kind —
+     只看 kind 的话照明1 和照明2 是同一个色，走廊里并排跑完全分不出来。 */
+  const circColor = circ => {
+    if (!circ) return EC().off;
+    if (E() && E().colorOf) return E().colorOf(circ);
+    return circColor(circ);
+  };
 
   function eDispose(g) {
     if (!g) return;
@@ -1775,7 +1786,7 @@
     const per = eBatch(D.conduits || [], true);
     Object.keys(per).forEach(cid => {
       const circ = D.circuits.find(x => x.id === cid);
-      const col = new THREE.Color(EC()[circ.kind] || EC().light);
+      const col = new THREE.Color(circColor(circ));
       const mat = new THREE.MeshStandardMaterial({
         color: col, emissive: col.clone().multiplyScalar(.45), emissiveIntensity: 1,
         roughness: .42, metalness: .3, transparent: true, opacity: .95,
@@ -1870,36 +1881,58 @@
     const L_G = [.10, .90, .40], L_R = [.98, .22, .14], L_NA = [.30, .31, .33], L_DEAD = [.95, .66, .10];
 
     /* 导轨 */
-    it.push({ size: [W * .80, .012, .012], matrix: frame(...at(0, -.055, F + .018), ux, uy), c: [.62, .66, .70] });
+    it.push({ size: [W * .84, .012, .012], matrix: frame(...at(0, -.055, F + .018), ux, uy), c: [.62, .66, .70] });
 
-    /* 两组的边框：左边"管整层"一只，右边"各管一路"三只。
+    /* 两组的边框：左边"管整层"一只，右边"各管一路"六只。
        光靠位置和一条细挡板区分不够，远看还是一排开关；
        各圈一个凹槽（先画外框、再画壳体，壳体盖住中间只剩边），分组一眼就出来。 */
     const G_FRAME = [.44, .48, .52];
-    it.push({ size: [.150, .262, .020], matrix: frame(...at(-W * .34, .030, F + .012), ux, uy), c: G_FRAME });
-    it.push({ size: [.336, .262, .020], matrix: frame(...at(.075, .030, F + .012), ux, uy), c: G_FRAME });
+    it.push({ size: [.150, .262, .020], matrix: frame(...at(-W * .30, .030, F + .012), ux, uy), c: G_FRAME });
+
+    /* 六路分路的排布由电路条数决定，不写死三个位置 ——
+       以后再加回路（照明3 之类）不用回来改渲染。 */
+    const N = Math.max(1, circs.length || (p.circuits || []).length || 6);
+    const x0 = -W * .158, x1 = W * .42;
+    const dws = [];
+    for (let i = 0; i < N; i++) dws.push(N > 1 ? x0 + (x1 - x0) * i / (N - 1) : (x0 + x1) / 2);
+    const grpC = (x0 + x1) / 2, grpW = (x1 - x0) + .082;
+    it.push({ size: [grpW, .262, .020], matrix: frame(...at(grpC, .030, F + .012), ux, uy), c: G_FRAME });
 
     /* 总开关：位置固定在最左边，手柄只认 mainOn */
-    const mw = -W * .34;
+    const mw = -W * .30;
     it.push({ size: [.105, .225, .030], matrix: frame(...at(mw, .030, F + .022), ux, uy), c: [.86, .89, .92] });
     it.push({ size: [.062, .066, .038], matrix: frame(...at(mw, mainOn ? .090 : -.030, F + .036), ux, uy), c: mainOn ? H_ON : H_OFF });
     it.push({ size: [.030, .030, .024], matrix: frame(...at(mw, .178, F + .022), ux, uy), c: mainOn ? L_G : L_R });
 
-    /* 分组挡板：左边这只"管全层"，右边三只"各管一路"，中间隔开一条。
+    /* 分组挡板：左边这只"管全层"，右边六只"各管一路"，中间隔开一条。
        位置取两个边框之间的空档，别压在框沿上，否则两块连成一片反而更糊。 */
-    it.push({ size: [.016, .240, .028], matrix: frame(...at(-W * .183, .030, F + .020), ux, uy), c: [.26, .29, .33] });
+    it.push({
+      size: [.016, .240, .028],
+      matrix: frame(...at(((-W * .30 + .075) + (grpC - grpW / 2)) / 2, .030, F + .020), ux, uy),
+      c: [.26, .29, .33]
+    });
 
-    /* 三路分路，从左到右 = 第 1/2/3 回路 */
-    [-.055, .075, .205].forEach((dw, i) => {
+    /* 六路分路，从左到右 = 第 1…6 回路（照明1/照明2/插座1/插座2/动力1/动力2） */
+    dws.forEach((dw, i) => {
       const c = circs[i];
       const has = !!c;
       const on = has ? c.on !== false : true;              // 手柄位置：只看分路自己
       const live = has ? (mainOn && on) : false;           // 实际带电：还要过总开关
       const hc = !has ? H_NA : (live ? H_ON : (on ? H_DEAD : H_OFF));
       const lc = !has ? L_NA : (live ? L_G : (on ? L_DEAD : L_R));
-      it.push({ size: [.078, .200, .028], matrix: frame(...at(dw, .030, F + .020), ux, uy), c: has ? [.90, .92, .94] : [.85, .87, .90] });
-      it.push({ size: [.054, .060, .038], matrix: frame(...at(dw, on ? .090 : -.030, F + .034), ux, uy), c: hc });
-      it.push({ size: [.028, .028, .024], matrix: frame(...at(dw, .178, F + .020), ux, uy), c: lc });
+      /* 壳体窄一档：六只挤在一排，太宽会互相顶住 */
+      it.push({ size: [.072, .200, .028], matrix: frame(...at(dw, .030, F + .020), ux, uy), c: has ? [.90, .92, .94] : [.85, .87, .90] });
+      it.push({ size: [.048, .060, .038], matrix: frame(...at(dw, on ? .090 : -.030, F + .034), ux, uy), c: hc });
+      it.push({ size: [.026, .026, .024], matrix: frame(...at(dw, .178, F + .020), ux, uy), c: lc });
+      /* 类别色标：手柄下面一小块，六只开关一眼分出哪只是照明、哪只是插座、哪只是动力 */
+      if (has && c.color != null) {
+        const col = new THREE.Color(c.color);
+        it.push({
+          size: [.040, .014, .022],
+          matrix: frame(...at(dw, -.082, F + .020), ux, uy),
+          c: [col.r, col.g, col.b]
+        });
+      }
     });
 
     /* 底排：电能表 / 铭牌 / 电源指示灯 */
@@ -2005,10 +2038,130 @@
     /* 画粗一档：这一屏是把整层框进来，原尺寸的管子在屏幕上只有一两个像素，
        不放大根本看不出"这条电是从竖井下来、沿走廊跑、再分进哪几间房" */
     S.isolateConduits(list, { grow: 3.0 });
+    /* 光点从电闸一路跑到房间 —— 这是"电往哪走"最直观的表达 */
+    S.flux(list, { floor: circ.floor });
     if (rooms && rooms.length) S.highlightRooms(rooms, 0x17a673); else disposeHl();
     S.setFocus(circ.floor, true);
     return list;
   };
+
+  /* ---------------- 电流流向（发光光点沿管线跑） ----------------
+     "从电闸到房间"这件事光画管子看不出来 —— 线在墙里绕一圈，用户不知道电往哪边走。
+     办法：在涉及到的每一段管子上撒一串发光小点，整体沿"闸 → 干线 → 房间"的方向匀速流动。
+     方向不靠排拓扑，用**距电闸的平面距离**判：一段管子两端，离闸近的那头是上游。
+     竖直段（立管、墙内下引）两端平面位置相同，改看标高 ——
+     立管从下往上（一层往上送），下引从上往下（从桥架落到房间）。 */
+  let fluxG = null, fluxItems = [], fluxT0 = 0, fluxTex = null;
+
+  function fluxSprite() {
+    if (fluxTex) return fluxTex;
+    const SZ = 64, cv = document.createElement('canvas');
+    cv.width = cv.height = SZ;
+    const g = cv.getContext('2d');
+    const rg = g.createRadialGradient(SZ / 2, SZ / 2, 0, SZ / 2, SZ / 2, SZ / 2);
+    rg.addColorStop(0, 'rgba(255,255,255,.92)');
+    rg.addColorStop(.28, 'rgba(255,255,255,.62)');
+    rg.addColorStop(.62, 'rgba(255,255,255,.16)');
+    rg.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = rg;
+    g.fillRect(0, 0, SZ, SZ);
+    fluxTex = new THREE.CanvasTexture(cv);
+    fluxTex.needsUpdate = true;
+    return fluxTex;
+  }
+
+  function fluxOff() {
+    if (fluxG) {
+      scene.remove(fluxG);
+      fluxG.traverse(o => { if (o.material) o.material.dispose(); });
+      fluxG = null;
+    }
+    fluxItems = [];
+  }
+  S.fluxOff = fluxOff;
+
+  /* list: 参与流动的线管数组；opt.floor 用来找电闸位置（不传就从第一条管子的楼层取） */
+  S.flux = function (list, opt) {
+    fluxOff();
+    const D = E() && E().data;
+    if (!D || !list || !list.length) return null;
+    opt = opt || {};
+    const floor = opt.floor != null ? opt.floor
+      : (list.find(c => c.floor != null) || {}).floor;
+    const panel = (D.panels || []).find(p => p.floor === floor) || null;
+    const src = panel ? { x: panel.x, y: panel.y } : { x: 0, y: 0 };
+    const near = p => Math.hypot(p.x - src.x, p.y - src.y);
+
+    const tex = fluxSprite();
+    const g = new THREE.Group();
+    g.name = 'elec-flux';
+    /* 光点用普通混合：加色混合在浅色楼体上会糊成一片白，
+       看不出是"哪条回路在走电"；普通混合能保住回路本色（黄/蓝/红）。
+       depthTest 关掉，光点才能穿透实墙显示 —— 它标的是墙里那根管。 */
+    const mat = new THREE.SpriteMaterial({
+      map: tex, color: 0xffffff, transparent: true, opacity: .92,
+      depthWrite: false, depthTest: false, blending: THREE.NormalBlending
+    });
+
+    (list || []).forEach(c => {
+      const e = (E().segEnds ? E().segEnds(c) : null);
+      if (!e || e.length < 2) return;
+      let a = e[0], b = e[1];
+      const da = near(a), db = near(b);
+      if (Math.abs(da - db) > 0.2) {
+        /* 平面位置差得开：离闸近的一头是上游 */
+        if (db < da) { const t = a; a = b; b = t; }
+      } else {
+        /* 竖直段：立管由下往上，墙内下引由上往下 */
+        const up = c.layer === 'trunk';
+        const aLow = a.z <= b.z;
+        if ((up && !aLow) || (!up && aLow)) { const t = a; a = b; b = t; }
+      }
+      const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+      if (len < 0.25) return;
+      /* 每 0.9 m 放一个光点，长管子能连成一串，短支线至少一个 */
+      const n = Math.max(1, Math.min(8, Math.round(len / 0.9)));
+      const circ = (D.circuits || []).find(x => x.id === c.circuit);
+      /* 光点用回路本色提亮一档：白色光点叠在浅色楼体上根本看不出来 */
+      const base = new THREE.Color(circColor(circ) || 0xffffff);
+      const hsl = {}; base.getHSL(hsl);
+      base.setHSL(hsl.h, Math.min(1, hsl.s * 1.15), Math.min(0.9, hsl.l + 0.28));
+      for (let i = 0; i < n; i++) {
+        const sp = new THREE.Sprite(mat.clone());
+        sp.material.color.copy(base);
+        const sc = (c.layer === 'trunk' || c.layer === 'feed') ? 0.42 : 0.30;
+        sp.scale.set(sc, sc, sc);
+        sp.userData = { a: a, b: b, phase: i / n, seg: len };
+        g.add(sp);
+        fluxItems.push(sp);
+      }
+    });
+
+    if (!fluxItems.length) return null;
+    fluxT0 = performance.now();
+    scene.add(g);
+    fluxG = g;
+    return { points: fluxItems.length, segments: list.length };
+  };
+
+  /* 每帧推进：整串光点同步走，看起来就是一股电在管子里流 */
+  function tickFlux(t) {
+    if (!fluxG || !fluxItems.length) return;
+    const cycle = 2200;                       // 一个光点走完一段用 2.2 s
+    fluxItems.forEach(sp => {
+      const u = sp.userData;
+      const k = (((t - fluxT0) / cycle) + u.phase) % 1;
+      /* three 的坐标是 (x, z, -y) */
+      sp.position.set(
+        u.a.x + (u.b.x - u.a.x) * k,
+        u.a.z + (u.b.z - u.a.z) * k,
+        -(u.a.y + (u.b.y - u.a.y) * k)
+      );
+      /* 走到两端淡出，避免光点在接头处硬跳 */
+      sp.material.opacity = .45 + .55 * Math.sin(Math.PI * k);
+    });
+  }
+
 
   /* 显示/隐藏墙内线管。开的时候自动把墙压成半透明，不然什么都看不见 */
   S.showConduits = function (on) {
@@ -2019,7 +2172,7 @@
     /* 配电箱不跟电气层开关走 —— 它是真装在墙上的设备，关掉"看管线"也得留着。
        这里只按当前楼层重算显隐。 */
     syncPanels();
-    if (!eOn) { S.clearIsolate(); S.showCircuit(null); }
+    if (!eOn) { S.clearIsolate(); S.showCircuit(null); fluxOff(); }
     if (eOn && !S.xray) S.setXray(true);
   };
 
@@ -2037,7 +2190,7 @@
     g.name = 'elec-iso';
     Object.keys(per).forEach(cid => {
       const circ = D.circuits.find(x => x.id === cid) || {};
-      const col = new THREE.Color(EC()[circ.kind] || EC().light);
+      const col = new THREE.Color(circColor(circ));
       const mat = new THREE.MeshStandardMaterial({
         color: col, emissive: col.clone().multiplyScalar(.85), emissiveIntensity: 2.4,
         roughness: .4, metalness: .3, transparent: true, opacity: 1
@@ -2073,8 +2226,8 @@
       it.mat.transparent = true;
       it.mat.depthWrite = true;
       it.mat.emissiveIntensity = cid && on ? 2.1 : 1;
-      it.mat.color.setHex(live ? (EC()[circ.kind] || EC().light) : EC().off);
-      it.mat.emissive.setHex(live ? (EC()[circ.kind] || EC().light) : 0x000000);
+      it.mat.color.setHex(live ? (circColor(circ)) : EC().off);
+      it.mat.emissive.setHex(live ? (circColor(circ)) : 0x000000);
       it.mat.emissive.multiplyScalar(cid && on ? .8 : .45);
       it.mat.needsUpdate = true;
       if (it.glow) {
@@ -2084,20 +2237,22 @@
     });
   };
 
-  /* 断电的分路在图上变灰：不切断也能看出"这几间现在是没电的" */
+  /* 断电的分路在图上变灰：不切断也能看出"这几间现在是没电的"。
+     判的是 live（有没有电），不是 on（手柄位置）——
+     总开关一断，六只手柄都还合着，可这一层确实一点电都没有。 */
   S.syncCircuitPower = function () {
     const D = E() && E().data;
     if (!D) return;
     Object.keys(eByCirc).forEach(id => {
       const it = eByCirc[id];
       const circ = D.circuits.find(c => c.id === id) || {};
-      if (circ.on === false) {
+      if (circ.live === false || circ.on === false) {
         it.mat.color.setHex(EC().off);
         it.mat.emissive.setHex(0x000000);
         it.mesh.userData.off = true;
       } else {
-        it.mat.color.setHex(EC()[circ.kind] || EC().light);
-        it.mat.emissive.setHex(EC()[circ.kind] || EC().light).multiplyScalar(.45);
+        it.mat.color.setHex(circColor(circ));
+        it.mat.emissive.setHex(circColor(circ)).multiplyScalar(.45);
         it.mesh.userData.off = false;
       }
       it.mat.needsUpdate = true;

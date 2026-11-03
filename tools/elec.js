@@ -50,11 +50,47 @@ const H = t => { console.log('\n' + t); };
       kinds: E.data.circuits.map(c => c.kind).filter((v, i, a) => a.indexOf(v) === i),
       perFloorCircuits: Object.keys(byFloor).map(f => E.list(+f).length),
       riserAligned: aligned && chained,
-      trunkText: rs.length ? ('x=' + rs[0].x.toFixed(2) + ' y=' + rs[0].y.toFixed(2) + '，' + rs.length + ' 段首尾相接') : '无立管'
+      trunkText: rs.length ? ('x=' + rs[0].x.toFixed(2) + ' y=' + rs[0].y.toFixed(2) + '，' + rs.length + ' 段首尾相接') : '无立管',
+      /* 六路固定映射：no 1~6 ↔ 照明1/照明2/插座1/插座2/动力1/动力2 */
+      sixOk: (function () {
+        const want = ['照明1', '照明2', '插座1', '插座2', '动力1', '动力2'];
+        const total = E.data.circuits.length;
+        if (total !== M.floors.length * 6) return false;
+        return M.floors.every(f => {
+          const l = E.list(f.level);
+          if (l.length !== 6) return false;
+          return want.every((nm, i) => {
+            const c = l.find(x => x.no === i + 1);
+            return c && c.kind_cn === nm && /第\s*\d+\s*回路/.test(c.label || '');
+          });
+        });
+      })(),
+      sixText: E.list(2).map(c => c.no + ':' + c.kind_cn + '/' + c.phase).join(' '),
+      phaseOk: E.list(2).every(c => c.phase === 'L' + ((c.no - 1) % 3 + 1)),
+      phaseText: E.list(2).map(c => c.phase).join(','),
+      /* 同类第 2 条必须换标高，否则走廊里照明1/照明2 会画成同一根 */
+      zStagger: (function () {
+        const l = E.list(2);
+        const mainZ = k => l.filter(c => c.kind === k).map(c => E.zMain(c.kind, c.sub));
+        const brZ = k => l.filter(c => c.kind === k).map(c => E.zBranch(c.kind, c.sub));
+        return ['light', 'socket', 'power'].every(k => {
+          const m = mainZ(k), b = brZ(k);
+          return m.length === 2 && Math.abs(m[0] - m[1]) > 0.05 &&
+            b.length === 2 && Math.abs(b[0] - b[1]) > 0.05;
+        });
+      })(),
+      zText: ['light', 'socket', 'power'].map(k =>
+        k + ' 主干 ' + E.list(2).filter(c => c.kind === k).map(c => E.zMain(c.kind, c.sub).toFixed(2)).join('/')).join('，')
     };
   });
   P('每层一部配电箱', d1.panels === d1.floors, d1.panels + ' 箱 / ' + d1.floors + ' 层');
-  P('每层三条分路（照明/插座/动力）', d1.perFloorCircuits.every(n => n === 3), JSON.stringify(d1.perFloorCircuits));
+  P('每层六条分路（照明1/2、插座1/2、动力1/2）', d1.perFloorCircuits.every(n => n === 6), JSON.stringify(d1.perFloorCircuits));
+  P('六路编号 1~6 且名称带序号',
+    d1.sixOk === true, d1.sixText);
+  P('六路按三条相线轮换（L1/L2/L3）',
+    d1.phaseOk === true, d1.phaseText);
+  P('同类两条回路标高错开（不会叠成一根）',
+    d1.zStagger === true, d1.zText);
   /* 总量只是防退化的下限：55 间房 × 5 层规模的楼，三百多段是合理密度。
      插座/动力不铺走廊侧（那面墙全是门），所以比早先满铺时少一截，属预期。 */
   P('线管总量 > 300', d1.st.conduits > 300, JSON.stringify(d1.st.by_kind));
@@ -289,14 +325,28 @@ const H = t => { console.log('\n' + t); };
       Math.abs(j.x - p.x) < TOL && Math.abs(j.y - p.y) < TOL && Math.abs(j.z - p.z) < TOL);
     let total = 0, bare = 0;
     D.conduits.forEach(c => endsOf(c).forEach(p => { total++; if (!covered(c.circuit, p)) bare++; }));
+    /* 下引管（走廊桥架 → 房间支线）最容易悬空：它上端扎进干线、下端要正好落在
+       房间墙角的支线端头上。下端要是没接住，就是一根吊在半空的短管，
+       比"末端自由"那种正常断头严重得多，所以单独卡这一条。 */
+    let dropBot = 0, dropBotBare = 0;
+    D.conduits.filter(c => c.layer === 'drop' && c.vert).forEach(c => {
+      dropBot++;
+      const p = { x: c.x, y: c.y, z: Math.min(c.z0, c.z1) };
+      if (!covered(c.circuit, p)) dropBotBare++;
+    });
     /* 绕行段两端必须接上：竖段底/顶 + 横段两端 */
     let detEnds = 0, detBare = 0;
-    det.forEach(c => endsOf(c).forEach(p => { detEnds++; if (!covered(c.circuit, p)) detBare++; }));
+    const detBad = [];
+    det.forEach(c => endsOf(c).forEach(p => {
+      detEnds++;
+      if (!covered(c.circuit, p)) { detBare++; detBad.push(c.id + '@' + (+p.z.toFixed(2))); }
+    }));
     const types = joints.reduce((a, j) => (a[j.type] = (a[j.type] || 0) + 1, a), {});
     return {
       conduits: D.conduits.length, joints: joints.length, types: types,
       detour: det.length, detRooms: det.map(c => c.roomNum).filter(Boolean).slice(0, 4),
-      detBare: detBare, detEnds: detEnds,
+      detBare: detBare, detEnds: detEnds, detBad: detBad.slice(0, 6),
+      dropBot: dropBot, dropBotBare: dropBotBare,
       barePct: Math.round(bare / total * 100), bare: bare, total: total,
       stat: E.stats().joints
     };
@@ -304,8 +354,15 @@ const H = t => { console.log('\n' + t); };
   P('生成了弯头/接头', d9.joints > 100, d9.joints + ' 个（弯头 ' + (d9.types.elbow || 0) + ' / 三通 ' + (d9.types.tee || 0) + '）');
   P('接头进了统计（渲染和查询同一份数据）', d9.stat === d9.joints, 'stats.joints=' + d9.stat);
   P('门窗洞处的管段做了绕行', d9.detour >= 3, d9.detour + ' 段绕行，房间 ' + d9.detRooms.join('/'));
-  P('绕行段两端都接上了（不是断头管）', d9.detBare === 0, d9.detBare + ' / ' + d9.detEnds + ' 个端点悬空');
-  P('全楼断头端点 < 12%', d9.barePct < 12, d9.bare + ' / ' + d9.total + ' = ' + d9.barePct + '%');
+  P('绕行段两端都接上了（不是断头管）',
+    d9.detBare === 0, d9.detBare + ' / ' + d9.detEnds + ' 个端点悬空' + (d9.detBad && d9.detBad.length ? '：' + d9.detBad.join(' ') : ''));
+  /* 分回路本身就会有"末端自由"的管子：一条支路铺到最后一个接线点就结束了，
+     那不是断链。改成六路以后末端数量翻倍，所以门槛按新拓扑重定。
+     真正要卡死的是"下引管悬空"——那是接错了，不是末端。 */
+  P('下引管下端全部落在支线上（没有吊在半空的短管）',
+    d9.dropBotBare === 0, d9.dropBotBare + ' / ' + d9.dropBot + ' 根悬空');
+  P('全楼断头端点 < 20%（末端自由是正常的，断链不是）',
+    d9.barePct < 20, d9.bare + ' / ' + d9.total + ' = ' + d9.barePct + '%');
 
   /* 接头几何真的进了场景：把 joints 清空重建，顶点数应该明显变少 */
   const d9b = await p.evaluate(() => {
@@ -429,7 +486,7 @@ const H = t => { console.log('\n' + t); };
     S.clearIsolate(); S.showConduits(false);
     const p = E.panelOf(2);
     const out = { hasPanel: !!p, mainInit: !!p && p.mainOn !== false };
-    /* 先复位：三路都合、总开关合 */
+    /* 先复位：六路都合、总开关合 */
     E.togglePanel(2, true);
     E.list(2).forEach(c => E.toggle(c.id, true));
     out.allLive = E.list(2).every(c => c.on === true);
@@ -448,8 +505,8 @@ const H = t => { console.log('\n' + t); };
     return out;
   });
   P('每层都有一台配电箱、且带总开关字段', d12.hasPanel && d12.mainInit === true);
-  P('总开关一断：三路全部失电', d12.live.every(v => v === false), 'live=' + d12.live.join(','));
-  P('总开关一断：三个分路手柄仍停在合位（没人去拨它们）',
+  P('总开关一断：六路全部失电', d12.live.every(v => v === false), 'live=' + d12.live.join(','));
+  P('总开关一断：六个分路手柄仍停在合位（没人去拨它们）',
     d12.switchOn.every(v => v === true), 'switch_on=' + d12.switchOn.join(','));
   P('配电箱统计跟着变成"一路都不带电"',
     d12.panelLiveCount === 0 && d12.panelAnyLive === false, 'liveCount=' + d12.panelLiveCount);
@@ -475,12 +532,12 @@ const H = t => { console.log('\n' + t); };
     };
   });
   const iA = d12b.ids.indexOf('L2A');
-  P('总开关合着、只断 L2A：另两路仍然带电',
+  P('总开关合着、只断 L2A：另外五路仍然带电',
     iA >= 0 && d12b.live[iA] === false && d12b.live.filter(v => v === true).length === d12b.live.length - 1,
     d12b.ids.join(',') + ' live=' + d12b.live.join(','));
   P('L2A 自己的手柄确实落下了',
     iA >= 0 && d12b.switchOn[iA] === false, 'switch_on=' + d12b.switchOn.join(','));
-  P('分路只停一类功能（总开关是三类一起停）',
+  P('分路只停一类功能、且只有这一条（总开关是六路一起停）',
     d12b.affected > 0 && d12b.funcs.length === 1,
     '影响 ' + d12b.affected + ' 间，丢的功能=' + d12b.funcs.join(','));
 
@@ -600,16 +657,16 @@ const H = t => { console.log('\n' + t); };
       live: l.map(c => c.on),
       switchOn: l.map(c => c.switch_on),
       mentionMain: /总开关|总闸/.test(txt),
-      mentionScope: /整层|三路/.test(txt),
+      mentionScope: /整层|六路/.test(txt),
       focus: S.focus,
       last: BIM.app.lastData || null
     };
   });
   P('对话"把2楼总开关拉下来"真的把总开关断了', d12h.main === false, 'mainOn=' + d12h.main);
-  P('三路一起失电，但手柄都没动',
+  P('六路一起失电，但手柄都没动',
     d12h.live.every(v => v === false) && d12h.switchOn.every(v => v === true),
     'live=' + d12h.live.join(',') + ' switch=' + d12h.switchOn.join(','));
-  P('回复里点明是总开关、且讲清"整层三路"这个范围',
+  P('回复里点明是总开关、且讲清"整层六路"这个范围',
     d12h.mentionMain && d12h.mentionScope);
   P('总开关操作后回到 2 楼', d12h.focus === 2, 'focus=' + d12h.focus);
 
@@ -619,8 +676,216 @@ const H = t => { console.log('\n' + t); };
     await new Promise(r => setTimeout(r, 2600));
     return { main: E.mainOn(2), live: E.list(2).map(c => c.on) };
   });
-  P('再合上总开关：三路一起恢复',
+  P('再合上总开关：六路一起恢复',
     d12i.main === true && d12i.live.every(v => v === true), 'live=' + d12i.live.join(','));
+
+
+  /* ---------- 13. 六路分路 + 空开口语 + 只显本层 + 流向 ---------- */
+  H('【13】六路分路：编号/口语/只显本层/发光流向');
+
+  /* 13a. 空开 / 空气开关 / 电闸 / 闸刀 —— 电工口语都得落到这六路分路上 */
+  const d13a = await p.evaluate(() => {
+    const N = window.BIM.nlp, E = BIM.elec;
+    const f = t => N.parse(t);
+    const a = f('把2楼第3个空开拉下来');
+    const b = f('3楼电闸合上');
+    const c = f('把2楼照明2断电');
+    const e = f('2楼空气开关一共有几个');
+    const g = f('把2楼第6回路断电');
+    return {
+      a: { intent: a.intent, no: a.circuitNo, act: a.action, main: a.mainSwitch === true },
+      b: { intent: b.intent, act: b.action, main: b.mainSwitch === true },
+      c: { intent: c.intent, kind: c.kind, sub: c.circuitSub, act: c.action },
+      e: { intent: e.intent },
+      g: { intent: g.intent, no: g.circuitNo, act: g.action },
+      /* 类别+序号要能直接换到具体那一条回路 */
+      byKind: (E.circuitByKind(2, 'light', 2) || {}).id,
+      byKindP: (E.circuitByKind(2, 'power', 2) || {}).id,
+      byNo6: (E.list(2).find(x => x.no === 6) || {}).id,
+      nameOf6: (E.list(2).find(x => x.no === 6) || {}).kind_cn
+    };
+  });
+  P('"第3个空开" → 分路 3 号、断电',
+    d13a.a.intent === 'circuitset' && d13a.a.no === 3 && d13a.a.act === 'off', JSON.stringify(d13a.a));
+  P('"电闸合上" → 合闸动作、不是总开关', d13a.b.intent === 'circuitset' && d13a.b.act === 'on' && d13a.b.main === false,
+    JSON.stringify(d13a.b));
+  P('"照明2" → kind=light + 序号 2', d13a.c.intent === 'circuitset' && d13a.c.kind === 'light' && d13a.c.sub === 2,
+    JSON.stringify(d13a.c));
+  P('"空气开关一共有几个" → 只查不改', d13a.e.intent !== 'circuitset', JSON.stringify(d13a.e));
+  P('"第6回路" → 6 号（动力2）',
+    d13a.g.no === 6 && d13a.g.act === 'off' && d13a.byNo6 === 'L2F' && d13a.nameOf6 === '动力2',
+    'no=' + d13a.g.no + ' → ' + d13a.byNo6 + ' ' + d13a.nameOf6);
+  P('类别+序号能定位到具体回路（照明2→' + d13a.byKind + '，动力2→' + d13a.byKindP + '）',
+    d13a.byKind === 'L2B' && d13a.byKindP === 'L2F');
+
+  /* 13b. 动力1 = 机房主机、动力2 = 各房间空调末端 */
+  const d13b = await p.evaluate(() => {
+    const E = BIM.elec, M = BIM_MODEL;
+    const pw = M.rooms.filter(r => r.floor === 2 && r.zone !== 'corr');
+    const host = pw.filter(r => r.zone === 'core');
+    const norm = pw.filter(r => r.zone !== 'core');
+    const rE = (E.circuit('L2E') || { rooms: [] }).rooms || [];
+    const rF = (E.circuit('L2F') || { rooms: [] }).rooms || [];
+    return {
+      hostN: host.length, normN: norm.length,
+      eN: rE.length, fN: rF.length,
+      fHasNorm: norm.some(r => rF.indexOf(r.id) >= 0),
+      eInNorm: rE.filter(id => norm.some(r => r.id === id)).length,
+      spare: E.list(2).filter(c => c.spare).map(c => c.kind_cn)
+    };
+  });
+  P('动力1 带机房主机、动力2 带普通房间末端',
+    d13b.fHasNorm === true, '动力1 ' + d13b.eN + ' 间 / 动力2 ' + d13b.fN + ' 间（本层普通房 ' + d13b.normN + ' 间）');
+
+  /* 13c. 断一路：图上只留本层管线（含本层那一段主干），别的楼层一根都不画 */
+  const d13c = await p.evaluate(async () => {
+    const E = BIM.elec, S = BIM.scene, M = BIM_MODEL;
+    E.togglePanel(2, true); E.list(2).forEach(c => E.toggle(c.id, true));
+    await BIM.app.send('把2楼照明2断电');
+    await new Promise(r => setTimeout(r, 2600));
+    const iso = S.root().getObjectByName('elec-iso');
+    let meshes = 0, bad = 0;
+    const el = (M.floors.find(f => f.level === 2) || {}).elev || 0;
+    const h2 = (M.floors.find(f => f.level === 2) || {}).height || 3.3;
+    if (iso) {
+      iso.updateMatrixWorld(true);
+      iso.traverse(o => {
+        if (!o.isMesh) return;
+        meshes++;
+        o.geometry.computeBoundingBox();
+        const bb = o.geometry.boundingBox.clone().applyMatrix4(o.matrixWorld);
+        /* 有一点点越界（箱子高度）容忍 0.3 m */
+        if (bb.min.y < el - 0.35 || bb.max.y > el + h2 + 0.35) bad++;
+      });
+    }
+    const flux = S.root().getObjectByName('elec-flux');
+    let pts = 0;
+    if (flux) flux.traverse(o => { if (o.isSprite) pts++; });
+    const c = E.circuit('L2B');
+    return {
+      isolated: S.hasIsolate(), meshes: meshes, outOfFloor: bad, pts: pts,
+      hasFlux: !!flux, focus: S.focus,
+      circOn: c.on, othersLive: E.list(2).filter(x => x.id !== 'L2B').every(x => x.live !== false),
+      floorAll: E.conduitsOf({ floor: 2 }).length,
+      allConduits: E.ready().conduits.length
+    };
+  });
+  P('对话"把2楼照明2断电"真的断了 L2B', d13c.circOn === false, 'L2B.on=' + d13c.circOn);
+  P('只断了这一路，另外五路照常有电', d13c.othersLive === true);
+  P('图上只留本层管线（没有一个 mesh 落在别的楼层）',
+    d13c.isolated === true && d13c.meshes > 0 && d13c.outOfFloor === 0,
+    d13c.meshes + ' 个 mesh，越界 ' + d13c.outOfFloor + ' 个；本层 ' + d13c.floorAll + ' 段 / 全楼 ' + d13c.allConduits + ' 段');
+  P('管线上挂出了发光流向（从电闸往房间跑的光点）',
+    d13c.hasFlux === true && d13c.pts > 0, d13c.pts + ' 个流点');
+  P('镜头推到本层配电箱', d13c.focus === 2, 'focus=' + d13c.focus);
+
+  /* 13d. 问"两个房间能不能打通"：只有那面墙半透明，别的墙还是实心的 */
+  const d13d = await p.evaluate(async () => {
+    const S = BIM.scene, M = BIM_MODEL, E = BIM.elec;
+    S.clearIsolate(); S.fluxOff && S.fluxOff();
+    const a = M.rooms.filter(r => r.floor === 2 && r.zone !== 'corr');
+    if (a.length < 2) return { skip: true };
+    /* 优先找"共墙里真的埋着线管"的那一对 —— 这样"只显示墙内管线"才有东西可验 */
+    /* 共墙必须按**对边**认（我这面 east = 你那面 west）。并排两间房往往连南北两条
+       长墙都"同名同墙"，按同名边比会认成外墙，那是错的。 */
+    const OPP = { south: 'north', north: 'south', east: 'west', west: 'east' };
+    let pick = null, fallback = null;
+    for (let i = 0; i < a.length && !pick; i++) {
+      for (let j = i + 1; j < a.length; j++) {
+        const s1 = a[i].sides || {}, s2 = a[j].sides || {};
+        const k = Object.keys(s1).find(kk => s1[kk] && s1[kk] === s2[OPP[kk]]);
+        if (!k) continue;
+        const w = s1[k];
+        const wl = M.walls.find(x => x.id === w);
+        if (!wl || wl.kind === 'ext') continue;
+        const n = E.conduitsOf({ wall: w }).length;
+        if (!fallback) fallback = { r1: a[i], r2: a[j], w: w, n: n };
+        if (n > 0) { pick = { r1: a[i], r2: a[j], w: w, n: n }; break; }
+      }
+    }
+    const t = pick || fallback;
+    if (!t) return { skip: true };
+    /* 前面用例可能把透视打开了，这里先故意开着拍照，
+       就是要验"进了打通视图会强制回到实墙" */
+    S.setXray(true);
+    await BIM.app.send(t.r1.num + '和' + t.r2.num + '能不能打通');
+    await new Promise(r => setTimeout(r, 2800));
+    /* 只看本层（focus 层）的墙：别的楼层本来就是压暗的虚影，不算"被半透明" */
+    const fl = S.focus || t.r1.floor;
+    const ghost = [], solid = [];
+    S.root().traverse(o => {
+      if (!o.isMesh || !o.userData || o.userData.kind !== 'wall') return;
+      if (o.userData.floor !== fl) return;
+      const m = o.material;
+      if (m && m.transparent && m.opacity <= 0.35) ghost.push(o.userData.data.id);
+      else solid.push(o.userData.data.id);
+    });
+    const iso = S.root().getObjectByName('elec-iso');
+    let isoMeshes = 0;
+    if (iso) iso.traverse(o => { if (o.isMesh) isoMeshes++; });
+    const eRoot = S.root().getObjectByName('elec');
+    /* 打穿成功时墙里的管已经改道出去了，所以要按**当下**这面墙里还剩几段来比，
+       不能拿开洞前的数量当基准。 */
+    const nowInWall = E.conduitsOf({ wall: t.w }).length;
+    /* App 最后到底拿哪面墙算的 —— 以它自己回报的为准，别用脚本猜的那面 */
+    const ld = BIM.app.lastData || {};
+    let wantWall = null;
+    if (ld.room != null && ld.side) {
+      const rr = M.rooms.find(x => x.num === ld.room && x.floor === t.r1.floor);
+      if (rr) wantWall = (rr.sides || {})[ld.side] || null;
+    }
+    const msgs = document.querySelectorAll('.msg.ai');
+    const lastTxt = ((msgs[msgs.length - 1] || {}).textContent || '').slice(0, 120);
+    return {
+      skip: false, r1: t.r1.num, r2: t.r2.num, shared: t.w, inWall: t.n,
+      lastTxt: lastTxt,
+      ld: JSON.stringify(ld).slice(0, 200),
+      xray: !!S.xray, ghost: ghost, solid: solid.length, fl: fl,
+      isoMeshes: isoMeshes, wantWall: wantWall, ldRoom: ld.room, ldSide: ld.side,
+      nowInWall: nowInWall,
+      allConduitDrawn: eRoot ? eRoot.visible : null,
+      allN: E.conduitsOf({ floor: fl }).length
+    };
+  });
+  if (!d13d.skip) {
+    P('进了打通视图强制回实墙，不留上一屏的分路透视', d13d.xray === false, 'xray=' + d13d.xray);
+    P('只有要打通的那面墙半透明，本层其它墙仍是实心',
+      d13d.ghost.length === 1 && d13d.ghost[0] === d13d.shared,
+      '半透明 ' + d13d.ghost.length + ' 面 / 实心 ' + d13d.solid + ' 面' +
+      '（' + d13d.r1 + '↔' + d13d.r2 + ' 的共墙）' +
+      ' ｜ App 回答：「' + d13d.lastTxt.slice(0, 60) + '」');
+    P('管线只留这面墙里的，其它分路全收起',
+      d13d.allConduitDrawn === false &&
+      (d13d.nowInWall > 0 ? d13d.isoMeshes > 0 : d13d.isoMeshes === 0),
+      '开洞前墙内 ' + d13d.inWall + ' 段、开洞后剩 ' + d13d.nowInWall + ' 段 → 画了 ' +
+      d13d.isoMeshes + ' 个 mesh（本层 ' + d13d.allN + ' 段已隐藏）');
+  } else {
+    console.log('  · 跳过打通用例：找不到共墙房间对');
+  }
+
+  /* 13e. MCP 要把"空开"这套口语和流向写进说明，并暴露 circuit_sub */
+  const d13e = await p.evaluate(() => {
+    const tc = (BIM.mcp.tools || []).find(t => t.function && t.function.name === 'toggle_circuit') || {};
+    const g = BIM.mcp.guide || '';
+    const d = (tc.function || {}).description || '';
+    const props = ((tc.function || {}).parameters || {}).properties || {};
+    return {
+      sub: props.circuit_sub || null,
+      no: (props.circuit_no || {}).description || '',
+      alias: /空开|空气开关|电闸/.test(g) && /空开|空气开关|电闸/.test(d),
+      six: /照明1/.test(g) && /照明2/.test(g) && /插座1/.test(g) && /插座2/.test(g) &&
+        /动力1/.test(g) && /动力2/.test(g),
+      flux: /发光|流点|电流方向/.test(g) && /发光|流点/.test(d),
+      onlyFloor: /本层/.test(d)
+    };
+  });
+  P('toggle_circuit 暴露 circuit_sub（类别+序号）',
+    !!d13e.sub && JSON.stringify(d13e.sub.enum) === '[1,2]', JSON.stringify(d13e.sub));
+  P('circuit_no 说明限定 1~6', /1~6/.test(d13e.no), d13e.no.slice(0, 40));
+  P('说明里把"空开/空气开关/电闸"当成回路本身', d13e.alias === true);
+  P('说明里写清六路固定映射', d13e.six === true);
+  P('说明里讲清管线上的发光流向', d13e.flux === true);
+  P('说明里讲清"只留本层管线"', d13e.onlyFloor === true);
 
 
   /* ---------- 8. MCP 工具暴露 ---------- */
@@ -649,7 +914,7 @@ const H = t => { console.log('\n' + t); };
   P('给大模型的说明里提到打通/分路/线管', d8.guide.every(Boolean));
   P('toggle_circuit 暴露了 main_switch（总开关）参数', d8.mainProp);
   P('query_circuits 也能查总开关', d8.mainPropQ);
-  P('说明里讲清"总开关管整层、分路管自己"', d8.mainGuide && /整层三路|一断三路/.test(d8.desc));
+  P('说明里讲清"总开关管整层、分路管自己"', d8.mainGuide && /整层六路|一断六路/.test(d8.desc));
   P('说明里讲清"主干立管只画本层"', d8.trunkGuide);
   P('说明里讲清"配电箱平时就在"', d8.panelGuide);
 

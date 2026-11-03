@@ -30,16 +30,29 @@
 
   const fmt = v => (Math.round(v * 100) / 100).toFixed(2);
 
-  /* 分路配色：和界面图例、三维线管用同一套，不要各写各的 */
+  /* 分路配色：和界面图例、三维线管用同一套，不要各写各的。
+     每类拆成 1/2 两条回路，第二条用同色系深一档 ——
+     走廊里六根管子并排跑，同色的话根本分不出哪根是哪根。 */
   E.COLOR = {
-    light: 0xf0b429,     // 照明：琥珀
-    socket: 0x3b9ae1,    // 插座：蓝
-    power: 0xd8544f,     // 动力：红
+    light: 0xf0b429,     // 照明1：琥珀
+    light2: 0xd08b0e,    // 照明2：深琥珀
+    socket: 0x3b9ae1,    // 插座1：蓝
+    socket2: 0x2168ab,   // 插座2：深蓝
+    power: 0xd8544f,     // 动力1：红
+    power2: 0xa03229,    // 动力2：深红
     reroute: 0x17a673,   // 改线后的走向：绿
     hit: 0xff3b30,       // 冲突：亮红
     off: 0x8a929b        // 分路断开：灰
   };
+  /* 大类别名。三类别名照旧（照明/插座/动力），要带序号的用 circ.kind_cn */
   E.KIND_CN = { light: '照明', socket: '插座', power: '动力', riser: '楼层进线' };
+  /* 电工嘴里说的"空开 / 电闸 / 空气开关"指的都是这排分路开关本身 */
+  E.CIRCUIT_ALIAS = ['空开', '空气开关', '电闸', '闸刀', '断路', '开关'];
+  E.colorOf = function (circ) {
+    if (!circ) return E.COLOR.off;
+    const k = circ.kind, sub = circ.sub === 2 ? 2 : 1;
+    return E.COLOR[sub === 2 ? k + '2' : k] || E.COLOR[k] || E.COLOR.off;
+  };
 
   /* 线管截面（米）：外径/槽宽 + 墙内埋深。数字按常见做法取：
      照明 BV2.5 穿 PC20、插座 BV4 穿 PC25、动力 YJV 走 40×25 线槽 */
@@ -72,6 +85,13 @@
                    只有做到顶的高窗、落地窗才会碰上 */
   const BRANCH_Z = { light: 2.90, socket: 0.32, power: 2.35 };
   E.BRANCH_Z = BRANCH_Z;
+
+  /* 同类两条回路必须错开标高，否则六根管子在墙里/桥架里叠在一起，看着是一根。
+     第二条（照明2/插座2/动力2）统一比第一条再高 0.10 m 走干线、低 0.10 m 走支线 ——
+     干线在上、支线在下，两条之间始终留着间距，图上能一根根数出来。 */
+  const SUB_DZ = 0.10;
+  E.zMain = (kind, sub) => (MAIN_Z[kind] || 2.9) + (sub === 2 ? SUB_DZ : 0);
+  E.zBranch = (kind, sub) => (BRANCH_Z[kind] || 2.9) - (sub === 2 ? SUB_DZ : 0);
 
   /* 管线在拓扑里属于哪一层。原来所有线管一视同仁，看不出"主干—干线—支线"，
      加了这个字段，图例、统计、"这条管归谁"都能说清楚。 */
@@ -152,8 +172,10 @@
       if (o1 <= cur) continue;
       if (o0 > cur) {
         segs.push([cur, Math.min(o0, hi)]);
-        /* 只有整段洞口都在本次铺管范围内，才有地方做绕行 */
-        if (o0 >= lo && o1 <= hi) {
+        /* 只有整段洞口都在本次铺管范围内、而且**两头都还有管子**，才做绕行。
+           洞口正好开在墙段起点（或终点）时，那一头本来就没有管子，
+           绕过去也没东西可接，硬画就是一根悬空的短管。 */
+        if (o0 >= lo && o1 <= hi && o0 > lo + 0.06 && o1 < hi - 0.06) {
           gaps.push({ at0: o0, at1: o1, top: (o.sill || 0) + (o.h || 2.1), sill: o.sill || 0 });
         }
       }
@@ -161,7 +183,9 @@
       if (cur >= hi) break;
     }
     if (cur < hi) segs.push([cur, hi]);
-    return { segs: segs.filter(x => x[1] - x[0] >= 0.3), gaps: gaps };
+    /* 碎段门槛跟 runWall 保持一致（0.06 m）。定 0.3 时，墙角到第一个洞口之间
+       经常只剩十几厘米，一砍掉，下引管和洞口绕行段的底端就都悬空了。 */
+    return { segs: segs.filter(x => x[1] - x[0] >= 0.06), gaps: gaps };
   }
   E.scanWall = scanWall;
 
@@ -269,9 +293,16 @@
       if (z + sec.s / 2 > (wall.h || 3) - 0.03) return;      // 墙比这还矮就别铺了
       const sc = scanWall(wall, a, b, z, sec.s);
       sc.segs.forEach(([s0, s1]) => {
-        if (s1 - s0 < 0.25) return;
+        /* 太短的碎段不铺。但门槛不能定太高：墙角到下引点的这一小截常常只有
+           0.15~0.2 m，砍掉它，下引管下端和洞口绕行段的底端就都没东西可接，
+           图上会冒出两根吊在半空的短管。0.10 m 只用来滤真正的噪声。 */
+        if (s1 - s0 < 0.06) return;
         const tag = layer === 'corridor' ? 'C' : 'R';
-        const id = 'CD-' + wall.id + '-' + kind + '-' + tag + '-' +
+        /* id 里必须带回路号：分成六路以后，同一面墙同一种线管会同时出现两条
+           （照明1/照明2、插座1/插座2、动力1/动力2），只按"墙+种类+区段"做键的话，
+           后一条会被当成重复直接丢掉 —— 表现就是 2 号那三条回路在走廊里根本没有干线，
+           墙内的下引管从桥架那头顶不到任何东西，光点也就跑不过去。 */
+        const id = 'CD-' + wall.id + '-' + circ.id + '-' + kind + '-' + tag + '-' +
           Math.round(s0 * 100) + '-' + Math.round(s1 * 100);
         if (seen[id]) return;
         seen[id] = 1;
@@ -306,7 +337,7 @@
       if (Math.abs(zr - z) < 0.02) return;          // 洞口本身就比管高，不用绕
       const a = axis(wall);
       const tag = layer === 'corridor' ? 'C' : 'R';
-      const base = 'DT-' + wall.id + '-' + circ.kind + '-' + tag + '-' +
+      const base = 'DT-' + wall.id + '-' + circ.id + '-' + circ.kind + '-' + tag + '-' +
         Math.round(g.at0 * 100) + '-' + Math.round(g.at1 * 100);
       const lay = () => ({
         floor: wall.floor, wall: wall.id, kind: circ.kind, circuit: circ.id,
@@ -358,26 +389,51 @@
       const wAll = allWalls.filter(w => w.floor === L);
 
       const pid = 'AL-' + L;
-      /* 分路编号：用户嘴里说的是"2 楼第一回路"，不是"L2A 照明回路"。
-         每层三部箱子下面挂三路，编号在本层内从 1 起，类型只是它的属性。
-         no 给解析用，label 给回复用，name 给卡片标题用。 */
+      /* 分路编号：用户嘴里说的是"2 楼第一回路"，不是"L2A 照明回路"；
+         电工平时直接叫"空开 / 电闸 / 空气开关"，说的都是箱子里这排开关。
+         每层**六路**：照明 1/2、插座 1/2、动力 1/2，编号在本层内从 1 到 6。
+         为什么要拆成两条：一层十几间房全压在一路照明上不合规范，
+         实际也是一层分好几个照明回路、几个插座回路，按区域分开带。
+         sub 是同类里的第几条，kind_cn 是给人看的全名（照明1），
+         short 给气泡按钮用，label/name 给回复和卡片用。 */
       let seq = 0;
-      const mkCirc = (suffix, kind, name, rated) => {
+      const mkCirc = (suffix, kind, sub, cn, rated) => {
         seq++;
         const no = seq;
         return addC({
-          id: 'L' + L + suffix, panel: pid, floor: L, kind: kind, no: no,
+          id: 'L' + L + suffix, panel: pid, floor: L,
+          kind: kind, sub: sub, no: no, kind_cn: cn, short: cn,
           label: L + 'F 第' + no + '回路',
-          name: L + 'F 第' + no + '回路（' + name + '）', color: E.COLOR[kind],
+          name: L + 'F 第' + no + '回路（' + cn + '）',
+          color: E.COLOR[sub === 2 ? kind + '2' : kind] || E.COLOR[kind],
           rooms: [], conduits: [], rated: rated,
-          phase: suffix === 'A' ? 'L1' : (suffix === 'B' ? 'L2' : 'L3'),
+          /* 三相轮着接：1/4 接 L1，2/5 接 L2，3/6 接 L3，一层三相基本平衡 */
+          phase: 'L' + ((no - 1) % 3 + 1),
           on: true
         });
       };
-      const cA = mkCirc('A', 'light', '照明', 32);
-      const cB = mkCirc('B', 'socket', '插座', 32);
-      const cC = mkCirc('C', 'power', '动力', 63);
-      liveCircs.push({ L: L, cA: cA, cB: cB, cC: cC });
+      const cA = mkCirc('A', 'light', 1, '照明1', 32);
+      const cB = mkCirc('B', 'light', 2, '照明2', 32);
+      const cC = mkCirc('C', 'socket', 1, '插座1', 32);
+      const cD = mkCirc('D', 'socket', 2, '插座2', 32);
+      const cE = mkCirc('E', 'power', 1, '动力1', 63);
+      const cF = mkCirc('F', 'power', 2, '动力2', 63);
+      const myCircs = [cA, cB, cC, cD, cE, cF];
+      liveCircs.push({ L: L, list: myCircs });
+
+      /* 一间房归哪一条：照明和插座按区域分（南侧走 X1、北侧走 X2，
+         走廊和设备间是公共部分并到 1 号）—— 断一路影响的是连续一片。
+         动力不能这么分：一层只有一间空调机房，按南北分会让动力2 白跑一条回路。
+         实际做法是动力分两级——**动力1 供空调主机（机房），动力2 供各房间的空调末端**，
+         这样两条都带得上房间，语义也对。 */
+      const circOf = (room, kind) => {
+        const second = room.zone === 'north';
+        if (kind === 'light') return second ? cB : cA;
+        if (kind === 'socket') return second ? cD : cC;
+        return isPowerRoom(room) ? cE : cF;
+      };
+      const zM = (c) => E.zMain(c.kind, c.sub);
+      const zB = (c) => E.zBranch(c.kind, c.sub);
 
       /* ---- 配电箱：贴电气间的一面墙上，箱子中心标高 1.5 m ----
          挑墙的顺序：内墙且不朝走廊 > 不朝走廊 > 随便。
@@ -389,7 +445,7 @@
         if (!w) return;
         const sp = roomSpans(w).find(s => s.room.id === shaft.id);
         if (!sp) return;
-        if (sp.hi - sp.lo < 0.9) return;                       // 墙太短，0.7 m 的箱子挂不住
+        if (sp.hi - sp.lo < 1.05) return;                      // 墙太短，0.95 m 的箱子挂不住
         const onWall = (w.rooms || []).map(id => allRooms.find(r => r.id === id)).filter(Boolean);
         cand.push({ w: w, at: (sp.lo + sp.hi) / 2, corr: onWall.some(r => r.zone === 'corr') });
       });
@@ -400,11 +456,12 @@
       const panel = {
         id: pid, floor: L, room: shaft.id, roomNum: shaft.num,
         name: L + 'F 配电箱 ' + pid, wall: pick ? pick.w.id : null, at: pick ? pick.at : 0,
-        z: 1.5, w: 0.7, h: 0.9, d: 0.18,
-        /* 总开关（进线断路器）：一断，本层三条分路全部失电。
-           分路断路器（circuits 里那三个）只管自己那一路。 */
+        /* 六路分路比三路占地方，箱子加宽到 0.95 m，手柄才排得下一排 */
+        z: 1.5, w: 0.95, h: 0.9, d: 0.18,
+        /* 总开关（进线断路器）：一断，本层六条分路全部失电。
+           分路断路器（circuits 里那六个）只管自己那一路。 */
         mainOn: true,
-        circuits: [cA.id, cB.id, cC.id]
+        circuits: [cA.id, cB.id, cC.id, cD.id, cE.id, cF.id]
       };
       if (pick) {
         const a = axis(pick.w);
@@ -436,9 +493,11 @@
           const sp = roomSpans(w).find(s => s.room.id === cr.id);
           if (!sp) return;
           doneWall[w.id] = 1;
-          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'light', cA, MAIN_Z.light, MAIN_SEC.light, 'corridor', cr);
-          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'socket', cB, MAIN_Z.socket, MAIN_SEC.socket, 'corridor', cr);
-          runWall(w, sp.lo + 0.08, sp.hi - 0.08, 'power', cC, MAIN_Z.power, MAIN_SEC.power, 'corridor', cr);
+          /* 六条分路都在走廊桥架里横铺一圈，各自错开标高（3.00/3.10、2.80/2.90、2.60/2.70），
+             不然同类两条叠在一起，图上看着还是一条。 */
+          myCircs.forEach(c => {
+            runWall(w, sp.lo + 0.08, sp.hi - 0.08, c.kind, c, zM(c), MAIN_SEC[c.kind], 'corridor', cr);
+          });
         });
       });
 
@@ -446,37 +505,66 @@
       allRooms.filter(r => r.floor === L && r.zone !== 'corr').forEach(room => {
         const pw = isPowerRoom(room);
         const sides = room.sides || {};
-        let corrWall = null, corrSpan = null;
+        /* ① 先把这间房四面墙看清楚：每面墙上属于本房的那一段、以及这面墙贴不贴走廊。
+           以前是一边遍历一边铺，动力2 只能"遇到第一面非走廊墙就铺"，
+           结果经常铺到下引点对面的那面墙上 —— 下引管在走廊墙角落地，
+           支线在房间另一头，中间横跨整间房，两头都是悬空的断头管。 */
+        const info = [];
         ['south', 'north', 'east', 'west'].forEach(k => {
           const wall = wAll.find(x => x.id === sides[k]);
           if (!wall) return;
           const spans = roomSpans(wall);
           const sp = spans.find(s => s.room.id === room.id);
           if (!sp) return;
-          /* 铺到墙角（只留 2 cm 让位），不缩 15 cm —— 缩了以后相邻两面墙的管段
-             在墙角差出半米，图上就是"四面墙各画一段、角上断开"。贴到角上，
-             下面 ⑦ 的接头逻辑才能在墙角生成弯头，房间一圈才是通到底的。 */
-          const a = sp.lo + 0.02, b = sp.hi - 0.02;
           /* 这间房的这一段是不是贴着走廊。
              以前判的是"这面墙上有没有走廊房间"，长墙把走廊和房间串在一起时
              （比如西外墙同时挨着 101 和走廊 100），整面墙的插座全被跳过，
              墙角落里就断出一截。改成看**本房间那一段**跟走廊区段有没有重叠。 */
           const isCorr = spans.some(s => s.room.zone === 'corr'
             && s.hi > sp.lo + 0.05 && s.lo < sp.hi - 0.05);
+          info.push({ k: k, wall: wall, sp: sp, isCorr: isCorr });
+        });
+        const ci = info.find(x => x.isCorr) || null;
+        /* 下引点：贴走廊那面墙靠房间墙角 6 cm 处 */
+        let drop = null;
+        if (ci) {
+          const a0 = axis(ci.wall), atp = ci.sp.lo + 0.06;
+          drop = { x: a0.ax + a0.ux * atp, y: a0.ay + a0.uy * atp, wall: ci.wall };
+        }
+        /* ② 铺管 */
+        info.forEach(x => {
+          const wall = x.wall, sp = x.sp;
+          /* 铺到墙角（只留 2 cm 让位），不缩 15 cm —— 缩了以后相邻两面墙的管段
+             在墙角差出半米，图上就是"四面墙各画一段、角上断开"。贴到角上，
+             下面 ⑦ 的接头逻辑才能在墙角生成弯头，房间一圈才是通到底的。 */
+          const a = sp.lo + 0.02, b = sp.hi - 0.02;
           if (b - a >= 0.4) {
-            /* 照明走吊顶，哪面墙都得穿，满铺 */
-            runWall(wall, a, b, 'light', cA, BRANCH_Z.light, SEC.light, 'room', room);
+            /* 照明走吊顶，哪面墙都得穿，满铺。这间房归哪条照明回路由区域定，
+               不是六条都铺 —— 一间房一条照明回路，这才符合"分回路带"的实际做法。 */
+            const cl = circOf(room, 'light');
+            runWall(wall, a, b, 'light', cl, zB(cl), SEC.light, 'room', room);
             /* 插座和动力不布在走廊那面墙上 —— 真实做法也是这么干的：
                走廊侧全是门，插座开关在房间内侧墙上，设备更不会靠门摆。
                顺带一个好处：在走廊墙上开门不用每次都撞到贴地线管，
                而隔墙、外墙开门照样会撞，两种结果用户都能看到。 */
-            if (!isCorr) {
-              runWall(wall, a, b, 'socket', cB, BRANCH_Z.socket, SEC.socket, 'room', room);
-              if (pw) runWall(wall, a, b, 'power', cC, BRANCH_Z.power, SEC.power, 'room', room);
+            if (!x.isCorr) {
+              const cs = circOf(room, 'socket');
+              runWall(wall, a, b, 'socket', cs, zB(cs), SEC.socket, 'room', room);
+              /* 动力1（空调主机、机房）：房间非走廊墙满铺 */
+              if (pw) {
+                const cp = circOf(room, 'power');
+                runWall(wall, a, b, 'power', cp, zB(cp), SEC.power, 'room', room);
+              }
+            } else if (!pw && ci && wall.id === ci.wall.id) {
+              /* 动力2（各房间空调末端）：铺在**下引管所在的那面走廊墙**上。
+                 为什么不进房间：这一路走吊顶（2.25~2.35 m，在门顶之上），末端在
+                 吊顶里接线，不落地；铺在走廊墙上正好和下引管同一个墙角，两头接得住，
+                 也不会往房间那三面墙里再塞一根管 —— 那三面墙本来就要开门开窗，
+                 管子一多，改门改窗就动不动"撞管线"被拦下来。 */
+              const cp = circOf(room, 'power');
+              runWall(wall, a, b, 'power', cp, zB(cp), SEC.power, 'room', room);
             }
           }
-          /* 临走廊的那面墙记下来，一会儿在这里下引 */
-          if (!corrWall && isCorr) { corrWall = wall; corrSpan = sp; }
         });
 
         /* 从走廊干线引下来：在走廊墙靠房间墙角处立一根短管，
@@ -486,14 +574,54 @@
            管子到 0.32 m 就悬在半空，下面没有管可接 —— 图上就是一根断头管。
            贴到墙角，下引管的底端和支线端头重合，接头逻辑就把它接上了。
            照明支线 2.90 和干线 3.00 本来就挨着，不用单独下引。 */
-        if (corrWall && corrSpan) {
-          const a = axis(corrWall);
-          const atp = corrSpan.lo + 0.06;
-          const mx = a.ax + a.ux * atp, my = a.ay + a.uy * atp;
-          dropDown(corrWall, mx, my, L, BRANCH_Z.socket, MAIN_Z.socket, SEC.socket, cB, room);
-          if (pw) dropDown(corrWall, mx, my, L, BRANCH_Z.power, MAIN_Z.power, SEC.power, cC, room);
+        if (drop) {
+          const cs = circOf(room, 'socket'), cp = circOf(room, 'power');
+          dropDown(drop.wall, drop.x, drop.y, L, zB(cs), zM(cs), SEC.socket, cs, room);
+          /* 每间房都要把动力引下来（机房是主机、别的是末端），
+             不引的话动力2 在房里那一段就是根悬空的断头管 */
+          dropDown(drop.wall, drop.x, drop.y, L, zB(cp), zM(cp), SEC.power, cp, room);
         }
       });
+
+      /* ---- ④b 下引管落点对齐 ----
+         下引管理论上落在"房间墙角的支线端头"上，但那个墙角往往正好卡着门/窗洞口，
+         墙角到洞口之间的那一小截会被当成碎段去掉，或者端头差了几厘米 ——
+         结果就是一根从桥架垂下来、底下没接任何东西的短管。
+         这里统一兜一次底：把每根下引管的平面位置挪到**同回路、同标高、最近的那个
+         支线端头**上（最多挪 0.6 m，通常只有几厘米），保证下端一定接得住。
+         上端还在原来那面走廊墙上、也没挪出干线覆盖范围，所以不影响"从干线引下来"。 */
+      {
+        const roomEnds = D.conduits.filter(c => c.floor === L && c.layer === 'room' && !c.vert);
+        const kill = [];
+        D.conduits.filter(c => c.floor === L && c.layer === 'drop').forEach(d => {
+          const zLow = Math.min(d.z0, d.z1);
+          let best = null, bd = 1.2;
+          roomEnds.forEach(x => {
+            if (x.circuit !== d.circuit) return;
+            if (Math.abs(x.z - zLow) > 0.03) return;
+            const w = wAll.find(q => q.id === x.wall);
+            if (!w) return;
+            const a = axis(w);
+            [x.at0, x.at1].forEach(at => {
+              const px = a.ax + a.ux * at, py = a.ay + a.uy * at;
+              const dd = Math.hypot(px - d.x, py - d.y);
+              if (dd < bd) { bd = dd; best = { x: px, y: py }; }
+            });
+          });
+          /* 找不到任何可接的支线端头（比如那面墙后来被拆了、支线跟着没了）：
+             这根下引管就是纯粹的悬空短管，直接不画。 */
+          if (best) { d.x = best.x; d.y = best.y; } else kill.push(d);
+        });
+        kill.forEach(d => {
+          const i = D.conduits.indexOf(d);
+          if (i >= 0) D.conduits.splice(i, 1);
+          const circ = (D.circuits || []).find(c => c.id === d.circuit);
+          if (circ && circ.conduits) {
+            const j = circ.conduits.indexOf(d.id);
+            if (j >= 0) circ.conduits.splice(j, 1);
+          }
+        });
+      }
     });
 
     /* ---- ⑤ 主干立管：一条，从 1F 楼板下直通顶层楼板上 ----
@@ -503,7 +631,7 @@
     if (shafts.length) {
       floors.forEach((fl, i) => {
         const L = fl.level;
-        const circ = byId['L' + L + 'C'] || byId['L' + L + 'B'];
+        const circ = byId['L' + L + 'E'] || byId['L' + L + 'C'] || byId['L' + L + 'A'];
         if (!circ) return;
         const next = floors[i + 1];
         const thk = fl.height || 4.2;
@@ -524,7 +652,7 @@
        这一段没有墙可依附，是房间里明敷的桥架/母线，所以用自由段（free）：
        只给两端点，渲染时按两点连线建盒子。 */
     D.panels.forEach(p => {
-      const circ = byId['L' + p.floor + 'C'] || byId['L' + p.floor + 'B'];
+      const circ = byId['L' + p.floor + 'E'] || byId['L' + p.floor + 'C'] || byId['L' + p.floor + 'A'];
       if (!circ || !shafts.length) return;
       const nx = (p.n || [1, 0])[0], ny = (p.n || [1, 0])[1];
       const bx = p.x + nx * ((p.t || 0.2) / 2);      // 箱子贴墙那一面的中点
@@ -630,11 +758,15 @@
       });
     });
 
+    /* 带 0 间房的回路 = 备用空开。现场配电箱上留备用回路是常规做法，
+       但如果不说清楚，用户会以为是数据漏了 —— 标记出来，回复里按"预留"讲。 */
+    D.circuits.forEach(c => { c.spare = (c.rooms || []).length === 0; });
+
     /* 分路状态：重建时把原来的通断状态带过来。
        用户掐掉一路电以后再开个窗，电不能自己又合上。
        注意这里要带的是**断路器手柄位置**（c.on），不是"有没有电"：
-       总开关断掉时三路都是没电的，但手柄仍停在合位 —— 这两件事分开存，
-       否则总开关一断、重建一次，三个分路的手柄就会被悄悄按下去。 */
+       总开关断掉时六路都是没电的，但手柄仍停在合位 —— 这两件事分开存，
+       否则总开关一断、重建一次，六个分路的手柄就会被悄悄按下去。 */
     const prevC = {};
     ((E.data && E.data.circuits) || []).forEach(c => { prevC[c.id] = c.on; });
     const prevP = {};
@@ -648,7 +780,7 @@
 
   /* 由"开关位置"算出"这一路现在到底有没有电"：
        分路带电 = 本层总开关合着 且 这一路断路器合着
-     总开关（进线断路器）断掉时，下游三路全部失电，但三个分路手柄仍停在合位 ——
+     总开关（进线断路器）断掉时，下游六路全部失电，但六个分路手柄仍停在合位 ——
      这就是"总开关管全部、分路只管自己"在数据上的表达。 */
   function applyLive(D) {
     D.state = D.state || {};
@@ -779,9 +911,9 @@
   E.reroutes = () => Object.keys(ready().reroutes || {}).map(k => ready().reroutes[k]);
 
   /* ---------------- 分路控制 ----------------
-     两层控制，范围必须分清（用户的原话："总开关和3个分路断路器需要控制范围区分开来"）：
+     两层控制，范围必须分清（用户原话：总开关和各分路断路器的控制范围要分清楚）：
        · 分路断路器 E.toggle(circ)  —— 只管自己那一路；总开关合着的时候才有意义
-       · 总开关     E.togglePanel(层) —— 一断，本层三路全部失电，但三个分路手柄不动
+       · 总开关     E.togglePanel(层) —— 一断，本层六路全部失电，但六个分路手柄不动
      所以"有没有电"永远是 live = mainOn && on，别拿 on 当带电用。 */
   E.toggle = function (id, on) {
     const D = ready();
@@ -831,7 +963,7 @@
     return {
       panel: p, floor: floor, mainOn: p.mainOn !== false,
       circuits: mine, circuit_count: mine.length,
-      kinds: mine.map(c => E.KIND_CN[c.kind] || c.kind),
+      kinds: mine.map(c => c.kind_cn || E.KIND_CN[c.kind] || c.kind),
       rooms: powered, room_nums: powered.map(r => r.num),
       count: powered.length,
       /* 一整层全黑：总开关一断，照明也没了 */
@@ -853,27 +985,29 @@
   };
 
   /* 房间的供电状态。
-     注意：一层只有一条照明、一条插座、一条动力回路，"断了一条"不等于"这间房没电"，
-     而是"这间房失去了这一类功能"。所以这里按功能分开算，别拿 on.length 一概而论。 */
+     注意：一层有六条分路，但一间房每类只归其中一条（照明1 或 2、插座1 或 2、
+     动力1 或 2），"断了一条"不等于"这间房没电"，而是"这间房失去了这一类功能"。
+     所以这里按功能分开算，别拿 on.length 一概而论。 */
   E.roomPower = function (room) {
     const cs = E.roomsCircuits(room);
     /* 一律按 live（有没有电）分，不按 c.on（手柄位置）：
-       总开关一断，三个手柄都还合着，但这间房同样一点电都没有。 */
+       总开关一断，六个手柄都还合着，但这间房同样一点电都没有。 */
     const on = cs.filter(c => c.live !== false);
     const off = cs.filter(c => c.live === false);
+    const cnOf = c => c.kind_cn || E.KIND_CN[c.kind] || c.kind;
     const kindsAll = cs.map(c => c.kind);
     const kindsOff = off.map(c => c.kind);
-    const lost = kindsOff.map(k => E.KIND_CN[k] || k);
+    const lost = off.map(cnOf);
     const mains = {};
     cs.forEach(c => { mains[c.panel] = E.mainOn(c.floor); });
     const noMain = Object.keys(mains).filter(k => !mains[k]);
     return {
       circuits: cs, on: on, off: off,
-      main_off: noMain,                             // 总开关断着的配电箱（这时三路一起停）
+      main_off: noMain,                             // 总开关断着的配电箱（这时六路一起停）
       all_off: cs.length > 0 && on.length === 0,    // 一间房连一条通的都没有（含竖井未进）
       any_off: off.length > 0,
-      lost: lost,                                   // ['照明'] / ['插座','动力'] / 全三类
-      still: on.map(c => E.KIND_CN[c.kind] || c.kind),
+      lost: lost,                                   // ['照明1'] / ['插座1','动力1'] / 全三类
+      still: on.map(cnOf),
       has_light: kindsAll.indexOf('light') >= 0,
       dark: kindsOff.indexOf('light') >= 0,         // 照明断了 = 这间黑了
       no_socket: kindsOff.indexOf('socket') >= 0,   // 插座断了 = 插座没电
@@ -885,7 +1019,9 @@
   E.impact = function (id) {
     const c = E.circuit(id);
     if (!c) return null;
-    const kind = c.kind, cn = E.KIND_CN[kind] || kind;
+    const kind = c.kind;
+    /* 显示名带序号：断的是"照明1"，不是笼统的"照明" */
+    const cn = c.kind_cn || E.KIND_CN[kind] || kind;
     const rooms = E.circuitRooms(id);
     const rows = rooms.map(r => {
       const p = E.roomPower(r);
@@ -894,7 +1030,7 @@
         id: r.id, num: r.num, name: r.name, use: r.use, floor: r.floor,
         func: cn,                                    // 这条分路在这间房里管什么
         dark: kind === 'light',                      // 断照明就是这一间黑了
-        still: others.map(x => E.KIND_CN[x.kind] || x.kind),   // 这间房还剩下什么
+        still: others.map(x => x.kind_cn || E.KIND_CN[x.kind] || x.kind),   // 这间房还剩下什么
         fully_dark: p.all_off && kind === 'light'
       };
     });
@@ -942,7 +1078,8 @@
           return a;
         }, {});
         return {
-          id: c.id, no: c.no, label: c.label, name: c.name, kind: c.kind, kind_cn: E.KIND_CN[c.kind],
+          id: c.id, no: c.no, label: c.label, name: c.name, kind: c.kind,
+          kind_cn: c.kind_cn || E.KIND_CN[c.kind], sub: c.sub,
           panel: c.panel, phase: c.phase, rated: c.rated,
           on: c.live !== false,                  // 现在有没有电（含总开关）
           switch_on: c.on !== false,             // 分路断路器手柄
@@ -959,10 +1096,36 @@
     return list.find(c => c.no === no) || null;
   };
 
+  /* 按"哪一类 + 同类里第几条"找：照明2 → L{x}B，插座1 → L{x}C，动力2 → L{x}F。
+     用户说"把 2 楼照明 2 断电"走这条，说"第 2 个空开"走 circuitByNo。 */
+  E.circuitByKind = function (floor, kind, sub) {
+    const list = (ready().circuits || []).filter(c => c.floor === floor && c.kind === kind);
+    if (!list.length) return null;
+    if (sub == null) return list[0];
+    return list.find(c => (c.sub || 1) === sub) || null;
+  };
+
   /* 某条分路的接头/弯头（渲染和查询都用） */
   E.jointsOf = function (cid) {
     const all = ready().joints || [];
     return cid ? all.filter(j => j.circuit === cid) : all;
+  };
+
+  /* 一段线管的两端坐标（BIM 平面 x/y + 标高 z）。
+     流向动画要把光点撒在管子上，碰撞点定位也要用到它。 */
+  E.segEnds = function (c) {
+    if (!c) return null;
+    if (c.free && c.p1 && c.p2) {
+      return [{ x: c.p1[0], y: c.p1[1], z: c.p1[2] },
+              { x: c.p2[0], y: c.p2[1], z: c.p2[2] }];
+    }
+    if (c.vert) {
+      return [{ x: c.x, y: c.y, z: c.z0 }, { x: c.x, y: c.y, z: c.z1 }];
+    }
+    const w = (M().walls || []).find(q => q.id === c.wall);
+    if (!w) return null;
+    const a = axis(w);
+    return [c.at0, c.at1].map(at => ({ x: a.ax + a.ux * at, y: a.ay + a.uy * at, z: c.z }));
   };
 
   E.stats = function () {
@@ -983,8 +1146,9 @@
   };
 
   /* ---------------- 给校核和回复用的中文描述 ---------------- */
-  E.hitText = function (c) {
-    return E.KIND_CN[c.kind] + '回路的' + (E.LAYER_CN[c.layer] || '线管') +
+  E.hitText = function (c) {    const circ = c.circuit ? E.circuit(c.circuit) : null;
+    const nm = (circ && (circ.kind_cn || circ.short)) || E.KIND_CN[c.kind] || '电';
+    return nm + '回路的' + (E.LAYER_CN[c.layer] || '线管') +
       '（' + c.circuit + '，管中距地 ' + fmt(c.z) + ' m，截面 ' + fmt(c.s * 100) + ' cm）';
   };
   E.circuitText = function (c) {
