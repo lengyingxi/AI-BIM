@@ -36,20 +36,55 @@
   A.cfg.endpoint = normEndpoint(A.cfg.endpoint);
   A.cfg.model = String(A.cfg.model || '').trim();
   A.cfg.key = String(A.cfg.key || '').trim();
-  A.saveCfg = function (patch) {
+  /* opt.auto=true 表示"这条是服务器 /llm-config 自动接上的"，不是用户手填的。
+     区别很重要：自动接上的配置要跟着服务端走（服务端换模型就得跟过去），
+     用户手填的绝不能覆盖。以前没这条标记，自动接上之后 touched() 就永远为真，
+     服务端模型一换（qwen3.8-max 挂了回落到 27b），页面还死抱着旧模型名发请求，
+     每条都 500 do_request_failed，看着就像"大模型对接坏了"。 */
+  A.saveCfg = function (patch, opt) {
     Object.assign(A.cfg, patch || {});
     A.cfg.endpoint = normEndpoint(A.cfg.endpoint);
     A.cfg.model = String(A.cfg.model || '').trim();
     A.cfg.key = String(A.cfg.key || '').trim();
     // 同源转发时 Key 通常在服务器上，页面这一格可以留空
     A.cfg.on = !!(A.cfg.endpoint && A.cfg.model && (A.cfg.key || isRel(A.cfg.endpoint)));
-    try { localStorage.setItem(LS, JSON.stringify({ endpoint: A.cfg.endpoint, model: A.cfg.model, key: A.cfg.key, timeout: A.cfg.timeout })); } catch (e) { }
+    const auto = !!(opt && opt.auto);
+    try {
+      localStorage.setItem(LS, JSON.stringify({
+        endpoint: A.cfg.endpoint, model: A.cfg.model, key: A.cfg.key,
+        timeout: A.cfg.timeout, auto: auto
+      }));
+    } catch (e) { }
     return A.cfg;
   };
   A.cfg.on = !!(A.cfg.endpoint && A.cfg.model && (A.cfg.key || isRel(A.cfg.endpoint)));
   /* 用户自己动过这一页没有（含主动清空）：动过就不再被自动接管 */
   A.touched = function () {
-    try { return localStorage.getItem(LS) !== null; } catch (e) { return false; }
+    try {
+      const raw = localStorage.getItem(LS);
+      if (raw === null) return false;
+      const j = JSON.parse(raw || '{}');
+      if (typeof j.auto === 'boolean') return !j.auto;      // auto=true → 自动接上的，不算动过
+      /* 旧版记录没有 auto 字段：同源转发又没填 Key 的，一定是当初 autoConnect 写进去的；
+         用户手填的一般是绝对地址或带 Key。按自动接上处理，好让它跟着服务端升级。 */
+      return !(String(j.endpoint || '').charAt(0) === '/' && !String(j.key || '').trim());
+    } catch (e) { return false; }
+  };
+  /* 现在这条配置是不是"自动接上的"（写回时要把这个标记带上，不然一写就变回手填了） */
+  A.isAuto = function () {
+    try { const j = JSON.parse(localStorage.getItem(LS) || 'null'); return !!(j && j.auto); } catch (e) { return false; }
+  };
+  /* 这个地址是不是本机服务的网关（同源转发，或者就是 /llm-config 里那个上游域名）。
+     指向自己家网关的配置，地址/模型填错了可以替用户改；别人家的接口一律不碰。 */
+  A.isSelfGw = function (ep, target) {
+    const raw = String(ep || '').trim();
+    if (!raw) return false;
+    if (isRel(raw)) return true;
+    try {
+      const a = new URL(normEndpoint(raw));
+      const b = target ? new URL(String(target)) : null;
+      return !!b && a.host === b.host;
+    } catch (e) { return false; }
   };
   A.normEndpoint = normEndpoint;
   A.isRel = isRel;
@@ -631,7 +666,7 @@
     body.max_tokens = opt.maxTokens || 600;
 
     const t0 = Date.now();
-    let note = '', last = null, tries = 0;
+    let note = '', last = null, tries = 0, resynced = false;
 
     while (tries < 3) {
       tries++;
@@ -648,12 +683,27 @@
         break;
       }
       const low = String(last.text || '');
+      /* 500 / 404：八成是网关那边换过模型、或者地址/模型名填错了，
+         而页面还记着旧值。找服务端重新对一次（只动指向自家网关的配置），对上就白捡一次重试。 */
+      if (!resynced && A.resync && (last.status === 500 || last.status === 404)) {
+        resynced = true;
+        const ch = await A.resync();
+        if (ch && ch.changed) {
+          url = A.urlOf();
+          body.model = A.cfg.model;
+          tries--;
+          note = ch.was && ch.was !== A.cfg.model
+            ? ('网关模型从 ' + ch.was + ' 换成 ' + A.cfg.model + '，已自动跟过去重试')
+            : '配置已按网关修正，重试一次';
+          continue;
+        }
+      }
       // 404 且地址没写到 /v1 → 自动补一层再试（这是最容易被忽略的写法问题）
       if (last.status === 404 && !A.isAzure() && !A.isRel(A.cfg.endpoint)) {
         const base = normEndpoint(A.cfg.endpoint);
         if (!/\/v\d+$/i.test(base)) {
           A.cfg.endpoint = base + '/v1';
-          try { localStorage.setItem(LS, JSON.stringify({ endpoint: A.cfg.endpoint, model: A.cfg.model, key: A.cfg.key, timeout: A.cfg.timeout })); } catch (e) { }
+          A.saveCfg({}, { auto: A.isAuto() });      // 带上原来的 auto 标记，别一写就变成"用户手填"
           url = A.cfg.endpoint + '/chat/completions';
           note = '地址自动补了 /v1';
           continue;

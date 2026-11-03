@@ -42,6 +42,7 @@ WEB = os.path.join(ROOT, 'web')
 
 ARGS = None
 CFG = {'model': '', 'hasKey': False, 'target': DEFAULT_TARGET}
+MODEL_IDS = []          # 网关 /models 里真实存在的模型名（挑完模型后填充）
 
 
 # ---------------------------------------------------------------- 离线语音识别
@@ -368,19 +369,45 @@ MODEL_PREF = ['gpt-4o-mini', 'gpt-4o', 'deepseek-chat', 'deepseek', 'max', 'plus
 MODEL_BAD = ('seedream', 'dall-e', 'image', 'tts', 'whisper', 'embed', 'rerank', 'video', 'sora', 'kling', 'midjourney')
 
 
+TOOL_PROBE = [{
+    'type': 'function',
+    'function': {
+        'name': 'ping',
+        'description': '回一个 pong',
+        'parameters': {'type': 'object', 'properties': {'n': {'type': 'string'}}, 'required': ['n']},
+    },
+}]
+
+
 def _probe(model, key, target):
-    """发一个 1 token 的请求，确认这个模型真的能用（有的模型挂着但上游会报错）"""
-    body = json.dumps({'model': model, 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1}).encode()
+    """确认这个模型真的能用。返回 'ok'（能聊且支持工具调用）/ 'notools'（能聊但工具调用报错）/ False（用不了）"""
     headers = {'Content-Type': 'application/json'}
     if key:
         headers['Authorization'] = 'Bearer ' + key
-    req = urllib.request.Request(target.rstrip('/') + '/chat/completions', data=body, headers=headers, method='POST')
-    try:
+    url = target.rstrip('/') + '/chat/completions'
+
+    def post(body):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
             return r.status == 200
+
+    try:
+        if not post({'model': model, 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1}):
+            print('  模型 %s 不可用：探测请求没返回 200' % model, file=sys.stderr)
+            return False
     except Exception as e:
         print('  模型 %s 不可用：%s' % (model, e), file=sys.stderr)
         return False
+
+    # 光能聊不够 —— 这个项目全靠 function calling，工具调用不通的模型接上也干不了活
+    try:
+        ok = post({'model': model, 'messages': [{'role': 'user', 'content': '调用 ping 工具，n=1'}],
+                   'tools': TOOL_PROBE, 'tool_choice': 'auto', 'max_tokens': 64})
+        return 'ok' if ok else 'notools'
+    except Exception as e:
+        print('  模型 %s 能聊，但工具调用不通过：%s' % (model, e), file=sys.stderr)
+        return 'notools'
 
 
 def pick_model(key, target):
@@ -397,6 +424,7 @@ def pick_model(key, target):
     arr = j.get('data') or j.get('models') or []
     ids = [m.get('id') if isinstance(m, dict) else str(m) for m in arr]
     ids = [i for i in ids if i and not any(b in i.lower() for b in MODEL_BAD)]
+    MODEL_IDS[:] = ids                      # 给 /llm-config 用：网关真实可聊的模型名
 
     ordered, seen = [], set()
     for p in MODEL_PREF:
@@ -407,9 +435,17 @@ def pick_model(key, target):
         if i not in seen:
             ordered.append(i); seen.add(i)
 
-    for m in ordered[:4]:
-        if _probe(m, key, target):
+    # 先找"能聊 + 工具调用也能用"的；退一步找"至少能聊"的
+    soft = ''
+    for m in ordered[:6]:
+        r = _probe(m, key, target)
+        if r == 'ok':
             return m
+        if r == 'notools' and not soft:
+            soft = m
+    if soft:
+        print('  注意：只有 %s 能聊，但工具调用不通过，接上只能聊天、不能操作模型' % soft, file=sys.stderr)
+        return soft
     return ordered[0] if ordered else ''
 
 
@@ -498,7 +534,9 @@ class Handler(SimpleHTTPRequestHandler):
                 'endpoint': '/llm/v1',
                 'model': CFG['model'],
                 'hasKey': CFG['hasKey'],
-                'target': CFG['target']
+                'target': CFG['target'],
+                # 网关真实可用的模型名，页面拿它判断"用户存的模型名是不是个假的"
+                'models': CFG.get('models') or []
             }).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -614,6 +652,9 @@ def main():
     CFG['hasKey'] = bool(ARGS.key)
     CFG['target'] = ARGS.target
     CFG['model'] = ARGS.model or pick_model(ARGS.key, ARGS.target)
+    CFG['models'] = list(MODEL_IDS)
+    if CFG['model'] and CFG['model'] not in CFG['models']:
+        CFG['models'].insert(0, CFG['model'])
 
     srv = Srv((ARGS.host, ARGS.port), Handler)
     print('AIbim 演示已启动：http://%s:%d/' % (ARGS.host, ARGS.port))

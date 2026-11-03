@@ -894,21 +894,52 @@
     }
   }
 
-  /* 服务端（tools/serve.py）如果已经配好网关，页面启动就自动接上，什么都不用填 */
-  async function autoConnect() {
+  /* 服务端（tools/serve.py）如果已经配好网关，页面启动就自动接上，什么都不用填。
+     注意：以前只要 localStorage 里有记录就整个跳过，结果服务端换模型（比如
+     qwen3.8-max 上游挂了、自动回落到 qwen3.8-27b）页面就永远用旧名字发请求，
+     每条 500 看着像"对接坏了"。现在改成：自动接上的配置每次都跟服务端对齐，
+     只有用户自己手填过的才不碰。 */
+  async function autoConnect(force) {
     const A = window.BIM.agent;
-    if (A.cfg.endpoint && A.cfg.model) return;       // 用户自己配过就不动
-    if (A.touched && A.touched()) return;            // 用户主动清空过，也尊重，不再自动接管
+    let j = null;
     try {
       const r = await fetch('/llm-config', { cache: 'no-store' });
-      if (!r.ok) return;
-      const j = await r.json();
-      if (!j || !j.endpoint || !j.model) return;
-      A.saveCfg({ endpoint: j.endpoint, model: j.model, key: A.cfg.key || '', timeout: Math.max(A.cfg.timeout || 0, 60000) });
-      aiForm(); paintAI();
-      ai('已接上网关（' + j.model + '），直接说话就行。', null, false);
-    } catch (e) { /* 普通静态服务器没有这个接口，忽略 */ }
+      if (!r.ok) return { changed: false };
+      j = await r.json();
+    } catch (e) { return { changed: false }; }        // 普通静态服务器没有这个接口
+    if (!j || !j.endpoint || !j.model) return { changed: false };
+
+    const self = A.isSelfGw ? A.isSelfGw(A.cfg.endpoint, j.target) : A.isRel(A.cfg.endpoint);
+    const list = j.models || [];
+    const badModel = !!A.cfg.model && list.length > 0 && list.indexOf(A.cfg.model) < 0;
+    const same = A.cfg.on && A.cfg.endpoint === A.normEndpoint(j.endpoint) && A.cfg.model === j.model;
+    if (same) return { changed: false };
+
+    /* 什么情况下可以动用户存的配置：
+       ① 没手填过（是自动接上的）→ 跟着服务端走；
+       ② force（请求刚因为模型不可用失败）且指向自家网关；
+       ③ 指向自家网关、但存的模型名网关里根本没有（newapi_channel_conn 这种占位名），
+          或者地址里把网页上的相对路径 /llm/v1 当成绝对地址拼到域名后面了 —— 这就是填错了，替它改掉。 */
+    const mayFix = !(A.touched && A.touched()) || (self && force) || (self && badModel);
+    if (!mayFix) return { changed: false };
+
+    const was = A.cfg.model, wasEp = A.cfg.endpoint;
+    A.saveCfg({
+      endpoint: j.endpoint, model: j.model,
+      key: A.isRel(j.endpoint) ? '' : (A.cfg.key || ''),   // 同源转发用服务端的 Key
+      timeout: Math.max(A.cfg.timeout || 0, 60000)
+    }, { auto: true });
+    aiForm(); paintAI();
+    let why;
+    if (badModel) why = '「' + was + '」不是能聊天的模型名，已换成 ' + j.model;
+    else if (was && was !== j.model) why = '网关的模型换成 ' + j.model + ' 了（原来记的 ' + was + ' 已经不可用），已自动跟过去';
+    else why = '已接上网关（' + j.model + '）';
+    if (wasEp && wasEp !== A.normEndpoint(j.endpoint)) why += '，接口地址也改用 ' + A.normEndpoint(j.endpoint) + '（原来填的 ' + wasEp + ' 走不通）';
+    ai(why + '，直接说话就行。', null, false);
+    return { changed: true, model: j.model, was: was };
   }
+  /* 让 agent 在请求因模型不可用失败时，能反过来请求这里对一次配置 */
+  window.BIM.agent.resync = function () { return autoConnect(true); };
 
   /* ---------------- 三维回调 ---------------- */
   function onPick(hit, hits, ev) {
