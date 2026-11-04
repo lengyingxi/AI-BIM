@@ -5671,7 +5671,14 @@
     if (window.BIM.detail && window.BIM.detail.mergeLibrary) window.BIM.detail.mergeLibrary(M);
     // 墙里那些线管要先算出来：开窗/开门/拆墙的校核都要问它，晚一步就会漏判
     if (window.BIM.elec) {
-      try { window.BIM.elec.build(); } catch (e) { console.warn('elec build failed', e && e.message); }
+      try {
+        window.BIM.elec.build();
+        /* 配电箱是真装在墙上的设备，不是"电气视图的附属物" ——
+           以前只在 showConduits(true) 里才建，结果平时看楼层根本见不到箱子，
+           门洞压在它身上被拦下来时用户眼前什么都没有。
+           这里电气数据一算好就把它挂上去，之后只跟楼层聚焦走。 */
+        S.rebuildPanels();
+      } catch (e) { console.warn('elec build failed', e && e.message); }
     }
     S.onPick = onPick;
     TTS.init();
