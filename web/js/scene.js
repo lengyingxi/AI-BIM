@@ -537,23 +537,27 @@
 
   function applyBody() {
     const lv = S.focus || 0;
-    const allXray = !!S.xray && lv === 0;       // 全楼看管线：整栋 20%
-    /* 单层看管线 / 看分路 / 看回路影响：别层整层收起，只留本层半透明 */
-    const single = !!S.xray && lv !== 0;
+    /* 「只留这一层」有两种来源，楼体表现不一样，但"别层不画"是同一条：
+       · floorOnly（isolateFloor）  → 打通/开门/开窗这些"看清楚这一层"的视图，
+                                      透视关着时本层实心、别层收起；
+       · 透视 + 聚焦某层             → 看单层管线/分路/回路，本层半透明、别层收起。 */
+    const only = floorOnly || 0;
+    const hideOthers = !!only || (!!S.xray && lv !== 0);
+    const allXray = !!S.xray && lv === 0 && !only;
+    const key = only || lv;
     floorGroups.forEach(f => {
-      const on = lv !== 0 && f.level === lv;
+      const on = key !== 0 && f.level === key;
       let v, vis;
       if (allXray) { vis = true; v = .2; }
-      else if (lv === 0) { vis = true; v = 1; }
-      else if (on) { vis = true; v = single ? .5 : 1; }     // 本层：看管线时半透明，平时实心
-      else { vis = !single; v = .5; }                       // 别层：看管线时收起，普通聚焦时 50%
+      else if (key === 0) { vis = true; v = 1; }
+      else if (hideOthers) { vis = on; v = on ? (S.xray ? .5 : 1) : .5; }
+      else { vis = true; v = on ? 1 : .5; }                 // 普通聚焦：别层 50% 保留体量
       f.g.visible = vis;
       setBodyOpacity(f.mats, v);
     });
     /* 顶梁：全楼看管线时 20%；普通聚焦时 50%（整栋楼还在）；
-       单层看管线/分路时跟着别层一起收起 —— 屋顶本来就不属于当前这一层，
-       留着会在俯视时糊住整层，也违背"只显示当前楼层"。 */
-    setRoofOpacity(allXray ? .2 : (lv === 0 ? ROOF_BASE : .5), !single);
+       只留一层时跟着别层一起收起 —— 屋顶不属于当前这一层，留着会糊住整层。 */
+    setRoofOpacity(allXray ? .2 : (key === 0 ? ROOF_BASE : .5), !hideOthers);
   }
   S.applyBody = applyBody;
 
@@ -2540,7 +2544,11 @@
     if (!wall || !r.pts || !r.pts.length) return null;
 
     const a = E().axis(wall);
-    const TH = 0.10;                    // 画得比真管子粗，才在一片墙里看得见
+    /* 改线的管子粗细跟**真管子**一个量级（用户："开门涉及到的管线也要对应减小直径"）。
+       以前固定 0.10 m，比真管子粗两三倍，屏幕上像一根水管横穿墙里。
+       留 1.4 倍和下限 0.04 只是为了在整层视角下还看得见，不是另一套管径。 */
+    const sec = (r.c && r.c.s) || 0.04;
+    const TH = Math.max(0.04, Math.min(0.08, sec * 1.4));
     const it = [];
     const ptAt = p => ({ x: a.ax + a.ux * p.at, y: a.ay + a.uy * p.at, z: wall.base + p.z });
 
@@ -2554,13 +2562,19 @@
       const ang = Math.atan2(dz, dx);
       const m = frame(mx, my, wall.base + midZ, a.ux, a.uy);
       m.multiply(new THREE.Matrix4().makeRotationZ(ang));
-      it.push({ size: [len, TH, wall.t * 1.6], matrix: m });
+      it.push({ size: [len, TH, Math.max(TH, Math.min(wall.t * 1.2, TH * 1.8))], matrix: m });
     }
-    /* 每个转折点放一个弯头块：改线路径是"上翻—横穿—落回"，两个直角，
-       没有弯头块看着就是在墙里凭空折了一下 */
-    r.pts.forEach(p => {
+    /* 每个转折点放一个弯头：改线路径是"上翻—横穿—落回"，两个直角。
+       只在本该拐弯的点上放（首尾和一条直线上的中间点都不放），
+       否则看着像管子上长了一串疙瘩。 */
+    r.pts.forEach((p, i) => {
+      if (i === 0 || i === r.pts.length - 1) return;
+      const a0 = r.pts[i - 1], b0 = r.pts[i + 1];
+      const cross = (p.at - a0.at) * (b0.z - p.z) - (p.z - a0.z) * (b0.at - p.at);
+      if (Math.abs(cross) < 1e-6) return;                 // 共线，不是弯
       const w = ptAt(p);
-      it.push({ size: [TH * 1.7, TH * 1.7, wall.t * 1.7], matrix: frame(w.x, w.y, w.z, 1, 0) });
+      const k = TH * 1.9;
+      it.push({ size: [k, k, Math.max(TH, Math.min(wall.t * 1.25, TH * 1.9))], matrix: frame(w.x, w.y, w.z, 1, 0) });
     });
     if (!it.length) return null;
 
@@ -2577,6 +2591,9 @@
     ls.renderOrder = 11;
     if (!eReRoot) { eReRoot = new THREE.Group(); eReRoot.name = 'reroutes'; scene.add(eReRoot); }
     const g = new THREE.Group();
+    /* 自检用：这条改线画出来多粗、一共几个方头（管身 + 弯头）。
+       回归要断言"改线管径跟真管子同量级、转角有弯头"。 */
+    g.userData = { th: TH, sec: sec, boxes: it.length, pts: r.pts.length };
     g.add(mesh); g.add(ls);
     eReRoot.add(g);
     return g;

@@ -117,8 +117,12 @@ const H = t => { console.log('\n' + t); };
        看着就是断线。逐间逐面查。 */
     const room = E.conduitsOf({ floor: 1, layer: 'room', kind: 'light' });
     const miss = [];
+    /* 建筑外皮不走管（用户要求"去掉最外墙的管线"），所以只查内墙那几面。
+       以前四面墙都铺、在墙角闭成一圈；现在外墙那面不铺，支线到墙角自然收头。 */
     M.rooms.filter(r => r.floor === 1 && r.zone !== 'corr').forEach(r => {
       Object.keys(r.sides || {}).forEach(k => {
+        const w = M.walls.find(x => x.id === r.sides[k]);
+        if (!w || w.kind === 'ext') return;
         const n = room.filter(c => c.wall === r.sides[k]).length;
         if (!n) miss.push(r.num + ':' + k);
       });
@@ -130,7 +134,7 @@ const H = t => { console.log('\n' + t); };
   });
   P('走廊干线整段敷设（同一墙同一分路不被切碎）', dc.maxSplit <= 2,
     dc.corrN + ' 段，单墙最多 ' + dc.maxSplit + ' 段');
-  P('房间照明支线绕满四周（四面墙都铺到，不留半圈）', dc.miss.length === 0,
+  P('房间照明支线沿内墙铺满（外墙不走管，不留半圈）', dc.miss.length === 0,
     dc.roomN + ' 段' + (dc.miss.length ? '，缺：' + dc.miss.join(',') : ''));
 
   /* ---------- 2. 通用性：任意楼层任意房间都成立 ---------- */
@@ -341,9 +345,25 @@ const H = t => { console.log('\n' + t); };
       detEnds++;
       if (!covered(c.circuit, p)) { detBare++; detBad.push(c.id + '@' + (+p.z.toFixed(2))); }
     }));
+    /* 真正要卡的：有没有管段"横穿洞口"却没绕。
+       门都开在走廊墙、窗都开在外墙，而这两处按新口径不再走管，
+       所以现在绕行段本来就该是 0 —— 但要保证"该绕的一根都没漏"。 */
+    let through = 0;
+    D.conduits.forEach(c => {
+      if (c.vert || c.free || !c.wall || c.detour) return;
+      const w = M.walls.find(q => q.id === c.wall); if (!w) return;
+      (w.openings || []).forEach(o => {
+        const o0 = o.at - o.w / 2, o1 = o.at + o.w / 2;
+        const zLo = (o.sill || 0), zHi = zLo + (o.h || 2.1);
+        const zHit = (c.z + (c.s || 0) / 2 > zLo) && (c.z - (c.s || 0) / 2 < zHi);
+        const span = c.at0 < o1 - 0.02 && c.at1 > o0 + 0.02;
+        if (zHit && span) through++;
+      });
+    });
     const types = joints.reduce((a, j) => (a[j.type] = (a[j.type] || 0) + 1, a), {});
     return {
       conduits: D.conduits.length, joints: joints.length, types: types,
+      through: through,
       detour: det.length, detRooms: det.map(c => c.roomNum).filter(Boolean).slice(0, 4),
       detBare: detBare, detEnds: detEnds, detBad: detBad.slice(0, 6),
       dropBot: dropBot, dropBotBare: dropBotBare,
@@ -353,7 +373,8 @@ const H = t => { console.log('\n' + t); };
   });
   P('生成了弯头/接头', d9.joints > 100, d9.joints + ' 个（弯头 ' + (d9.types.elbow || 0) + ' / 三通 ' + (d9.types.tee || 0) + '）');
   P('接头进了统计（渲染和查询同一份数据）', d9.stat === d9.joints, 'stats.joints=' + d9.stat);
-  P('门窗洞处的管段做了绕行', d9.detour >= 3, d9.detour + ' 段绕行，房间 ' + d9.detRooms.join('/'));
+  P('没有管段横穿门窗洞（该绕的都绕了）', d9.through === 0,
+    d9.through + ' 处穿洞，' + d9.detour + ' 段绕行' + (d9.detRooms.length ? '（' + d9.detRooms.join('/') + '）' : ''));
   P('绕行段两端都接上了（不是断头管）',
     d9.detBare === 0, d9.detBare + ' / ' + d9.detEnds + ' 个端点悬空' + (d9.detBad && d9.detBad.length ? '：' + d9.detBad.join(' ') : ''));
   /* 分回路本身就会有"末端自由"的管子：一条支路铺到最后一个接线点就结束了，
@@ -361,8 +382,10 @@ const H = t => { console.log('\n' + t); };
      真正要卡死的是"下引管悬空"——那是接错了，不是末端。 */
   P('下引管下端全部落在支线上（没有吊在半空的短管）',
     d9.dropBotBare === 0, d9.dropBotBare + ' / ' + d9.dropBot + ' 根悬空');
-  P('全楼断头端点 < 20%（末端自由是正常的，断链不是）',
-    d9.barePct < 20, d9.bare + ' / ' + d9.total + ' = ' + d9.barePct + '%');
+  /* 外墙不再走管以后，房间支线到外墙那两个墙角就是自然的收头（以前是绕一圈闭合的），
+     每间房多两个自由端；门槛按新拓扑重定。真正接错的是下引管，单独卡在上面。 */
+  P('全楼断头端点 < 45%（末端自由是正常的，断链不是）',
+    d9.barePct < 45, d9.bare + ' / ' + d9.total + ' = ' + d9.barePct + '%');
 
   /* 接头几何真的进了场景：把 joints 清空重建，顶点数应该明显变少 */
   const d9b = await p.evaluate(() => {

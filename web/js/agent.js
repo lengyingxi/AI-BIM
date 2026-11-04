@@ -1209,8 +1209,17 @@
   A.ctxLine = function () {
     const c = A.mem.ctx;
     const bits = [];
-    if (c.room) bits.push(c.room.floor + '楼 ' + c.room.num);
-    else if (c.floor) bits.push(c.floor + '楼');
+    if (c.room) {
+      bits.push(c.room.floor + '楼 ' + c.room.num);
+      /* 打通以后这间房不再是"单独一间"：把合并关系写进上下文，
+         后面的"放一台""挪一下"才知道范围是整个连通块。 */
+      const C = window.BIM.calc;
+      const pl = (C && C.plateOf) ? C.plateOf(c.room) : null;
+      if (pl && pl.merged) {
+        const others = (pl.rooms || []).filter(r => r.id !== c.room.id).map(r => r.num);
+        if (others.length) bits.push('已与 ' + others.join('、') + ' 打通');
+      }
+    } else if (c.floor) bits.push(c.floor + '楼');
     if (c.device) bits.push(c.device);
     if (c.pref && window.BIM.nlp.PREF_CN[c.pref]) bits.push(window.BIM.nlp.PREF_CN[c.pref]);
     if (!bits.length && A.mem.lastPlaced) bits.push(A.mem.lastPlaced.name);

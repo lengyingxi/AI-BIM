@@ -32,9 +32,30 @@
     return !!S.markConflicts(ob.hits.map(h => (h.kind === 'box' ? { box: h.box } : { kind: h.kind, data: h.data })), 0xdd534f);
   }
 
-  /* 同房间、同楼层的已有设备 */
+  /* 同房间、同楼层的已有设备。打通以后"同一间"要按连通大板算 ——
+     合并空间上带着 ids（板上有哪几间）时，把那几台设备都算进来。 */
   function othersIn(room) {
-    return ST.placed.filter(e => e.room === room.id && e.floor === room.floor);
+    const ids = (room && room.ids) || (room ? [room.id] : []);
+    return ST.placed.filter(e => ids.indexOf(e.room) >= 0 && e.floor === room.floor);
+  }
+
+  /* 打通以后的"房间"：两块小板已经被中间那道墙连成一块大板，放设备时
+     可用的范围、默认的位置都该按合并后的板算，而不是还缩在原来那一间里。
+     用户原话："打通房间的时候如果后面在打通的房间内放置设备，应该默认放到两个打通的房间中间"。 */
+  function spaceOf(room) {
+    const pl = (window.BIM.calc && room) ? window.BIM.calc.plateOf(room) : null;
+    if (!pl || !pl.merged) return { space: room, plate: null };
+    const sp = Object.assign({}, room, {
+      x0: pl.x0, x1: pl.x1, y0: pl.y0, y1: pl.y1,
+      ids: pl.ids.slice(), plate: pl, merged: true
+    });
+    return { space: sp, plate: pl };
+  }
+  /* 合并空间里的一个点属于哪一间真房间（落位要记在真房间上，不能记在合成房间上） */
+  function roomAt(space, x, y) {
+    if (!space || !space.merged) return space;
+    const rs = (space.plate && space.plate.rooms) || [];
+    return rs.find(r => x >= r.x0 - 0.25 && x <= r.x1 + 0.25 && y >= r.y0 - 0.25 && y <= r.y1 + 0.25) || space;
   }
 
   /* ---------------- 消息 ---------------- */
@@ -1539,6 +1560,8 @@
     ST.pending = { room, side, wall, width: w, height: h, pref: p.pref || null };
     S.mode = 'door';
     focusSoft(room);
+    /* 点选开门时也只留这一层：上下层的半透明墙会挡在镜头前面，门洞看不清 */
+    S.isolateFloor && S.isolateFloor(room.floor);
     S.highlightWall(wall, 0x10a394);
     setMode('开门 · ' + room.num + ' ' + N.SIDE_CN[side] + '墙 · ' + w.toFixed(1) + 'm', cancelMode);
 
@@ -2329,15 +2352,23 @@
     const cont = !!step.cont;           // 「再放一台」：接着上文直接落位
     if (auto || step.pref || step.side || step.sideRel || n > 1 || cont) {
       const quietEach = auto || n > 1 || cont;
-      focusSoft(room);                  // 自动聚焦到这间房，别的楼层淡出
-      let last = null, okCount = 0;
+      /* 打通以后按合并的大板来放：可放范围是整个连通块，
+         没说放哪儿时默认就落在**两块板的中间**（也就是原来那道墙的位置）——
+         用户原话："在打通的房间内放置设备应该默认放到两个打通的房间中间"。 */
+      const sp0 = spaceOf(room);
+      const space = sp0.space;
+      const pref = step.pref || (sp0.plate ? 'center' : null);
+      focusSoft(space);                 // 自动聚焦到这块板，别的楼层淡出
+      let last = null, okCount = 0, hostRoom = room;
       const from0 = ST.placed.length;
-      const seed = seedForSide(room, step.side, step.sideRel);
+      const seed = seedForSide(space, step.side, step.sideRel);
       for (let i = 0; i < n; i++) {
-        const spot = bestSpotFor(room, dev, step.pref, i === 0 ? seed : null, !!seed);
+        const spot = bestSpotFor(space, dev, pref, i === 0 ? seed : null, !!seed);
         if (!spot) break;
         const dvi = spot.rot != null ? Object.assign({}, dev, { rot: spot.rot }) : dev;
-        last = commitPlaceAt(room, dvi, spot.x, spot.y, spot.ob, false, quietEach);
+        /* 落位点可能落在隔壁那间（合并后很正常），设备要记在真正包含它的那间房上 */
+        hostRoom = roomAt(space, spot.x, spot.y) || room;
+        last = commitPlaceAt(hostRoom, dvi, spot.x, spot.y, spot.ob, false, quietEach);
         okCount++;
       }
       if (!okCount) {
@@ -2366,8 +2397,16 @@
         if (hitEq) markClash(hitEq._ob);
         const lastMade = made0[made0.length - 1];
         const fTxt = lastMade ? faceTxt(faceInfo(room, lastMade)) : '';
-        ai((cont ? '接着又放了 ' : '好，' + room.num + ' 室' + prefTxt + '放好 ') + okCount +
-          ' 台「' + dev.name + '」。' + tail + (fTxt ? fTxt + '。' : '') +
+        /* 落位点可能在合并后的另一间里，报房号要报真实那一间 */
+        const hostNum = lastMade ? ((M.rooms.find(x => x.id === lastMade.room) || {}).num || room.num) : room.num;
+        /* 打通过的板：把"合并后的新承载"直接写进回执，别只丢一张卡片让用户自己去点计算书 */
+        const mgTxt = (lastMade && ST.last && ST.last.merged)
+          ? '这块板已经和 ' + ((ST.last.plate && ST.last.plate.rooms) || []).filter(x => x.id !== lastMade.room)
+            .map(x => x.num).join('、') + ' 打通，按合并后的大板 ' +
+            ST.last.lx.toFixed(2) + '×' + ST.last.ly.toFixed(2) + ' m 重新校核：安全系数 ' + C.fmt(ST.last.K) + '（' + ST.last.v.word + '）。'
+          : '';
+        ai((cont ? '接着又放了 ' : '好，' + hostNum + ' 室' + prefTxt + '放好 ') + okCount +
+          ' 台「' + dev.name + '」。' + tail + (fTxt ? fTxt + '。' : '') + mgTxt +
           (clashList.length ? '有 ' + clashList.length + ' 处和周边撞上了，都放进去了，位置列在下面。' : ''),
           card(ST.last) + (clashList.length
             ? '<div class="res bad" style="margin-top:8px"><div class="res-top"><span class="k">' + clashList.length +
@@ -2439,6 +2478,8 @@
     focusSoft(room);
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
+    /* 只留当前楼层，门洞别被上下层挡住 */
+    S.isolateFloor && S.isolateFloor(wall.floor);
     S.markDoorSpot(wall, dec.at, w, h, true);
     if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
     ST.lastDoor = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
@@ -2535,7 +2576,8 @@
         ? C.suggestPassageAt({ wall: wall, room: o.room, at: o.at, w: o.w, h: o.h, equipments: o.equipments, self: o.self, ignoreConduit: ignore })
         : C.suggestWindowAt({ wall: wall, room: o.room, at: o.at, w: o.w, h: o.h, sill: o.sill, equipments: o.equipments, self: o.self, ignoreConduit: ignore }));
 
-    const HARD = { structure: 1, size: 1, height: 1 };
+    /* panel（压在配电箱上）也算硬伤：箱子不是线管，挪不了的 */
+    const HARD = { structure: 1, size: 1, height: 1, panel: 1 };
     const split = c => ({
       hard: (c.blocks || []).filter(b => b.k !== 'conduit' && HARD[b.k]),
       soft: (c.blocks || []).filter(b => b.k !== 'conduit' && !HARD[b.k])
@@ -2662,6 +2704,8 @@
     const inWall = (E.conduitsOf({ wall: wall.id }) || []);
     S.showConduits(true);
     S.setXray(false);
+    /* 只留当前楼层：别层的墙和管会把这一层糊住（用户原话"打通房间的视角需要只显示当前楼层"） */
+    S.isolateFloor && S.isolateFloor(wall.floor);
     S.clearGhostWalls && S.clearGhostWalls();
     S.ghostWall(wall, true);
     S.clearConduitMarks();
@@ -2684,6 +2728,8 @@
        否则一屋子全是虚影，根本分不清打通以后是什么样。
        所以这里**无条件**关透视：之前哪怕正在看分路透视，进了打通视图也一律回到实墙。 */
     S.setXray(false);
+    /* 只留当前楼层：开门的视角以前被上下层的半透明墙挡住，看不清门洞和管线 */
+    S.isolateFloor && S.isolateFloor(wall.floor);
     S.clearGhostWalls && S.clearGhostWalls();
     S.ghostWall(wall, true);
     S.clearConduitMarks();
@@ -2761,6 +2807,8 @@
     focusSoft(room);
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
+    /* 只留当前楼层，门洞别被上下层挡住 */
+    S.isolateFloor && S.isolateFloor(wall.floor);
     S.markDoorSpot(wall, dec.at, w, h, true);
     if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
     ST.lastWin = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
@@ -3957,6 +4005,7 @@
     ST.pending = { room: room, side: side, wall: wall, width: p.width || 1.5, winH: p.winH || 1.5, sill: p.sill == null ? .9 : p.sill, pref: p.pref || null };
     S.mode = 'window';
     focusSoft(room);
+    S.isolateFloor && S.isolateFloor(room.floor);
     S.highlightWall(wall, 0x10a394);
     setMode('开窗 · ' + room.num + ' ' + N.SIDE_CN[side] + '墙 · ' + (p.width || 1.5).toFixed(1) + '×' + (p.winH || 1.5).toFixed(1), cancelMode);
     ai(room.num + ' ' + N.SIDE_CN[side] + '边这面墙亮出来了，点一下要开窗的位置。');

@@ -304,7 +304,18 @@
            墙内的下引管从桥架那头顶不到任何东西，光点也就跑不过去。 */
         const id = 'CD-' + wall.id + '-' + circ.id + '-' + kind + '-' + tag + '-' +
           Math.round(s0 * 100) + '-' + Math.round(s1 * 100);
-        if (seen[id]) return;
+        if (seen[id]) {
+          /* 同一面墙、同一条回路、同一段：两间房共用这面墙的两侧，物理上就是同一根管。
+             不重复画（两根完全重合的盒子只会互相 z-fighting），但要把这间房
+             记进这根管和这条回路 —— 否则这间房的插座/照明在拓扑里是断的。 */
+          const ex = D.conduits.find(c => c.id === id);
+          if (ex && room) {
+            ex.rooms = ex.rooms || (ex.room ? [ex.room] : []);
+            if (ex.rooms.indexOf(room.id) < 0) ex.rooms.push(room.id);
+            if (circ.rooms.indexOf(room.id) < 0) circ.rooms.push(room.id);
+          }
+          return;
+        }
         seen[id] = 1;
         const c = {
           id: id, floor: wall.floor, wall: wall.id, kind: kind, circuit: circ.id,
@@ -525,6 +536,10 @@
           info.push({ k: k, wall: wall, sp: sp, isCorr: isCorr });
         });
         const ci = info.find(x => x.isCorr) || null;
+        /* 去掉外墙以后，有的房间（比如 205）除了走廊墙就只剩外墙了 ——
+           这时候插座支线没处铺，墙上那根下引管下面就是空的。
+           这种房间把插座也铺到走廊墙上（和下引管同一个墙角，两头接得住）。 */
+        const onlyCorrWall = !info.some(x => x.wall.kind !== 'ext' && !x.isCorr);
         /* 下引点：贴走廊那面墙靠房间墙角 6 cm 处 */
         let drop = null;
         if (ci) {
@@ -534,6 +549,11 @@
         /* ② 铺管 */
         info.forEach(x => {
           const wall = x.wall, sp = x.sp;
+          /* 建筑外皮（最外墙）不走管 —— 外墙是保温 + 防水构造，线管埋进去既不合做法，
+             凿墙还会破防水；图上绕着一圈外立面跑管子也不像真的。
+             用户明确要求："优化管线，去掉最外墙的管线"。
+             只去掉分支（room 层）：走廊干线和竖井主干本来就不上外皮。 */
+          if (wall.kind === 'ext') return;
           /* 铺到墙角（只留 2 cm 让位），不缩 15 cm —— 缩了以后相邻两面墙的管段
              在墙角差出半米，图上就是"四面墙各画一段、角上断开"。贴到角上，
              下面 ⑦ 的接头逻辑才能在墙角生成弯头，房间一圈才是通到底的。 */
@@ -563,6 +583,15 @@
                  管子一多，改门改窗就动不动"撞管线"被拦下来。 */
               const cp = circOf(room, 'power');
               runWall(wall, a, b, 'power', cp, zB(cp), SEC.power, 'room', room);
+              /* 除了走廊墙只剩外墙的房间：插座也只能铺这儿了 */
+              if (onlyCorrWall) {
+                const cs = circOf(room, 'socket');
+                runWall(wall, a, b, 'socket', cs, zB(cs), SEC.socket, 'room', room);
+              }
+            } else if (onlyCorrWall && ci && wall.id === ci.wall.id) {
+              /* 机房这种不走上面那条分支（pw=true），但同样可能只剩走廊墙 */
+              const cs = circOf(room, 'socket');
+              runWall(wall, a, b, 'socket', cs, zB(cs), SEC.socket, 'room', room);
             }
           }
         });
@@ -1059,7 +1088,8 @@
     opt = opt || {};
     return (ready().conduits || []).filter(c => {
       if (opt.floor != null && c.floor !== opt.floor) return false;
-      if (opt.room && c.room !== opt.room && c.roomNum !== opt.room) return false;
+      if (opt.room && c.room !== opt.room && c.roomNum !== opt.room &&
+        !(c.rooms && c.rooms.indexOf(opt.room) >= 0)) return false;
       if (opt.circuit && c.circuit !== opt.circuit) return false;
       if (opt.kind && c.kind !== opt.kind) return false;
       if (opt.layer && c.layer !== opt.layer) return false;

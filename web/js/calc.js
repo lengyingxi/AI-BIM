@@ -659,9 +659,29 @@
       }
     });
 
+    /* 配电箱：箱体是挂在墙上的一台真设备（0.95 宽 × 0.9 高，凸出墙面 0.09 m，中心 1.5 m）。
+       以前只查柱、风管、设备和线管，**漏了配电箱** —— 门会直接开在箱子上，
+       现场就是"门一开撞着配电箱的门"，还得把整只箱子挪走。
+       箱子沿墙占 p.at ± p.w/2，竖直方向 1.05~1.95 m，和门洞必然重叠。 */
+    const panels = (window.BIM.elec && window.BIM.elec.data && window.BIM.elec.data.panels) || [];
+    panels.filter(p => p && p.floor === wall.floor && p.wall === wall.id && p.at != null).forEach(p => {
+      const pw = p.w || 0.95;
+      const pa0 = p.at - pw / 2, pa1 = p.at + pw / 2;
+      const ov = Math.min(pa1, at + half) - Math.max(pa0, at - half);     // 沿墙重叠长度
+      if (ov > 0.02) {
+        blocks.push({
+          t: '门洞正好压在 ' + (p.name || (p.floor + 'F 配电箱 ' + p.id)) + ' 上（箱体 ' +
+            fmt(pw, 2) + ' m 宽，中心在墙上 ' + fmt(p.at, 2) + ' m 处）',
+          k: 'panel'
+        });
+      } else if (ov > -0.15) {
+        const gap = -ov;
+        warns.push('离 ' + (p.name || ('配电箱 ' + p.id)) + ' 只有 ' + fmt(gap, 2) + ' m，箱门打开会贴着门框');
+      }
+    });
+
     // 已放设备挡门（门扇要能开 0.9 m）
-    (o.equipments || []).forEach(eq => {
-      const fe = foot(eq);
+    (o.equipments || []).forEach(eq => {      const fe = foot(eq);
       const ex0 = eq.x - fe.w / 2 - 0.9, ex1 = eq.x + fe.w / 2 + 0.9;
       const ey0 = eq.y - fe.d / 2 - 0.9, ey1 = eq.y + fe.d / 2 + 0.9;
       if (doorRect.x0 < ex1 && doorRect.x1 > ex0 && doorRect.y0 < ey1 && doorRect.y1 > ey0) {

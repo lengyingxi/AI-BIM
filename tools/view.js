@@ -68,7 +68,12 @@ const H = t => console.log('\n' + t);
   H('【2】查看楼层（不看管线）：墙体不隐藏，50% 半透明，顶梁也 50%');
   /* 上一步"关闭空开"走的是回路控制，会把透视打开（那是"看管线"的档位）。
      这里验的是**普通聚焦楼层**，先把透视关掉，否则别层是收起的，口径不一样。 */
-  await p.evaluate(() => { window.BIM.scene.showConduits(false); window.BIM.scene.setXray(false); });
+  await p.evaluate(() => {
+    window.BIM.scene.showConduits(false);
+    window.BIM.scene.setXray(false);
+    /* 断电那一步会进"只留本层"的视图，验普通聚焦前要退回来 */
+    window.BIM.scene.isolateFloor(0);
+  });
   await sleep(300);
   await p.evaluate(() => window.BIM.scene.setFocus(3, false));
   await sleep(700);
