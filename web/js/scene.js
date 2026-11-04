@@ -431,6 +431,10 @@
     const grid = new THREE.GridHelper(240, 120, 0xd0d9e3, 0xe3e9f0);
     grid.position.y = -.38; grid.material.transparent = true; grid.material.opacity = .5; scene.add(grid);
 
+    /* 先把门窗编号理顺：同规格的模型门窗本来就重名，
+       不先编号的话"点中哪一扇"和"改哪一扇"分不开。 */
+    S.tagOpenings();
+
     M.floors.forEach(fl => floorGroups.push(buildFloor(fl)));
     S.floors = floorGroups;
 
@@ -661,21 +665,35 @@
   }
   S.clearHighlight = disposeHl;
 
-  S.highlightRoom = function (room, color) {
+  /* 房间高亮。
+     默认**只描一圈边**，不铺色块、不画光柱 —— 用户原话"去掉房间打通后的绿色区块"：
+     打通之后两块楼板本来就该一眼看到底，中间糊一块薄荷绿的板子反而把墙洞、
+     改过的管线全挡住了。真正需要"这一块是它"的时候（看计算书）另外调 highlightRooms。
+     opt.fill 给了才铺色（0~1），opt.beam 给了才画那根光柱；
+     撞上东西这种必须显眼的情况由调用方显式传 fill。 */
+  S.highlightRoom = function (room, color, opt) {
     disposeHl();
+    const o = opt || {};
     const c = new THREE.Color(color || 0x10a394);
     const g = new THREE.Group();
     const geo = new THREE.BoxGeometry((room.x1 - room.x0) * .96, .05, (room.y1 - room.y0) * .96);
-    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .3, depthWrite: false }));
-    m.position.set((room.x0 + room.x1) / 2, room.elev + .04, -(room.y0 + room.y1) / 2);
-    g.add(m);
+    let m = null;
+    if (o.fill > 0) {
+      m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: o.fill, depthWrite: false }));
+      m.position.set((room.x0 + room.x1) / 2, room.elev + .04, -(room.y0 + room.y1) / 2);
+      g.add(m);
+    }
     const line = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: .95 }));
-    line.position.copy(m.position); g.add(line);
-    const beam = new THREE.Mesh(new THREE.CylinderGeometry(.05, .05, 2.4, 6, 1, true),
-      new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .3, depthWrite: false, side: THREE.DoubleSide }));
-    beam.position.set((room.x0 + room.x1) / 2, room.elev + 1.2, -(room.y0 + room.y1) / 2);
-    g.add(beam);
-    g.userData = { m, line, beam };
+    line.position.set((room.x0 + room.x1) / 2, room.elev + .04, -(room.y0 + room.y1) / 2);
+    g.add(line);
+    let beam = null;
+    if (o.beam) {
+      beam = new THREE.Mesh(new THREE.CylinderGeometry(.05, .05, 2.4, 6, 1, true),
+        new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .3, depthWrite: false, side: THREE.DoubleSide }));
+      beam.position.set((room.x0 + room.x1) / 2, room.elev + 1.2, -(room.y0 + room.y1) / 2);
+      g.add(beam);
+    }
+    g.userData = { m, line, beam, fill: o.fill || 0 };
     scene.add(g); hl = g;
   };
 
@@ -870,6 +888,7 @@
     };
     M.doors.push(d);
     op.ref = d.id;                 // 反查：改这扇门时 C.door 要跳过它自己
+    d.code = uniqueCode(d.name, M.doors, d);
     const fg = floorGroups.find(f => f.level === wall.floor);
     const mesh = buildDoorMesh(d, fg.mats);
     fg.g.add(mesh);
@@ -939,6 +958,7 @@
     };
     M.windows.push(d);
     op.ref = d.id;
+    d.code = uniqueCode(d.name, M.windows, d);
     const fg = floorGroups.find(f => f.level === wall.floor);
     const wg = (D() && D().windowMesh) ? D().windowMesh(d, fg.mats) : buildWindowMesh(d, fg.mats);
     wg.name = 'win-' + d.id;
@@ -961,7 +981,7 @@
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) return false;
     const at = S.windowAt(d, wall);
-    const i = wall.openings.findIndex(o => o.kind === 'window' && Math.abs(o.at - at) < 0.06 && Math.abs(o.w - d.w) < 0.05);
+    const i = findOpening(wall.openings, d, wall, at);
     if (i < 0) return false;
     wall.openings.splice(i, 1);
     S.rebuildWall(wall);
@@ -991,9 +1011,14 @@
     const h = (opt && opt.h) || d.h;
     const sill = (opt && opt.sill != null) ? opt.sill : d.sill;
     const keepRoom = d.room;
+    const keepCode = d.code, keepAdded = d.added;
     if (!S.removeWindow(d)) return null;
     const nd = S.addWindowOpening(wall, at, w, h, sill);
-    if (nd && keepRoom) nd.room = keepRoom;
+    if (nd) {
+      if (keepRoom) nd.room = keepRoom;
+      if (keepCode) nd.code = keepCode;
+      if (keepAdded) nd.added = true;
+    }
     return nd;
   };
 
@@ -1013,6 +1038,9 @@
       old.geometry.dispose();
       reg.wall = reg.wall.filter(m => m !== old);
     }
+    /* 这面墙本来就是半透明的（打通视图里），换过网格以后要重新压一次，
+       不然重建一下就"自己变实"了。 */
+    if (ghosted.indexOf(wall.id) >= 0) S.ghostWall(wall, true);
   };
 
   /* 门在墙上的位置参数（沿墙长度方向，从 p1 起算） */
@@ -1025,10 +1053,49 @@
     return (d.pos[0] - ax) * ux + (d.pos[1] - ay) * uy;
   };
 
+  /* 门窗编号去重。
+     模型里 5 楼有 45 扇门全都叫 M1021 —— 名字是按"宽×高"编出来的，
+     同规格的门天然重名。于是"点中的那一扇"和"实际改的那一扇"经常不是同一扇
+     （用户原话："点击的是上面方框的门，实际执行的不是点击的门"）。
+     这里给每一扇补一个唯一代号：重名的按楼层/墙/位置排个序，叫 M1021-01、M1021-02…。
+     之后回执、查询、改尺寸一律认代号（或者更硬的 id），重名那坨就分得开了。 */
+  function uniqueCode(base, list, self) {
+    const used = {};
+    (list || []).forEach(x => { if (x !== self && x && x.code) used[x.code] = 1; });
+    if (!used[base]) return base;
+    for (let i = 2; i < 999; i++) {
+      const c = base + '-' + String(i).padStart(2, '0');
+      if (!used[c]) return c;
+    }
+    return base + '-' + (Date.now() % 10000);
+  }
+  S.uniqueCode = uniqueCode;
+
+  S.tagOpenings = function () {
+    const tag = list => {
+      const cnt = {};
+      (list || []).forEach(d => { if (d) cnt[d.name] = (cnt[d.name] || 0) + 1; });
+      const seq = {};
+      (list || []).slice().sort((a, b) =>
+        (a.floor - b.floor) ||
+        String(a.wall).localeCompare(String(b.wall)) ||
+        ((a.pos ? a.pos[0] : 0) - (b.pos ? b.pos[0] : 0)) ||
+        ((a.pos ? a.pos[1] : 0) - (b.pos ? b.pos[1] : 0))
+      ).forEach(d => {
+        if (!d) return;
+        if ((cnt[d.name] || 0) < 2) { d.code = d.name; return; }
+        seq[d.name] = (seq[d.name] || 0) + 1;
+        d.code = d.name + '-' + String(seq[d.name]).padStart(2, '0');
+      });
+    };
+    tag(M.doors);
+    tag(M.windows);
+  };
+  S.openingCode = d => (d && (d.code || d.name || d.id)) || '';
+
   S.wallLen = function (wall) {
     return Math.hypot(wall.p2[0] - wall.p1[0], wall.p2[1] - wall.p1[1]) || 1;
   };
-
   /* 沿墙单位向量：门"往左/往右挪"要投影到这个方向上 */
   S.wallAxis = function (wall) {
     const L = S.wallLen(wall);
@@ -1036,12 +1103,26 @@
   };
 
   /* 删掉一扇（自己开的）门：墙体洞口一起拆掉，墙按原来的样子重建 */
+  /* 找"这扇门对应的那个洞口"。以前只按 |at-at'|<0.06 且 |w-w'|<0.05 找，
+     同规格的两扇门挨得近就会拆错人（用户："点的是这扇，拆的是那扇"）。
+     现在先认反查号 op.ref === d.id，认不到才退回按位置找最近的那个。 */
+  function findOpening(list, d, wall, at) {
+    let i = list.findIndex(o => o.ref && d && o.ref === d.id);
+    if (i >= 0) return i;
+    let best = -1, bd = 0.06;
+    list.forEach((o, k) => {
+      if (!o || o.kind !== d.kind) return;
+      const dd = Math.abs(o.at - at);
+      if (dd < bd && Math.abs((o.w || 0) - (d.w || 0)) < 0.05) { bd = dd; best = k; }
+    });
+    return best;
+  }
   S.removeDoor = function (d) {
     if (!d) return false;
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) return false;
     const at = S.doorAt(d, wall);
-    const i = wall.openings.findIndex(o => o.kind === 'door' && Math.abs(o.at - at) < 0.06 && Math.abs(o.w - d.w) < 0.05);
+    const i = findOpening(wall.openings, d, wall, at);
     if (i < 0) return false;
     wall.openings.splice(i, 1);
     S.rebuildWall(wall);
@@ -1065,9 +1146,17 @@
     const w = (opt && opt.w) || d.w;
     const h = (opt && opt.h) || d.h;
     const keepRoom = d.room;          // 记住"当初是为哪间房开的"，长墙上尤其重要
+    const keepCode = d.code, keepAdded = d.added, keepAte = d._ate;
     if (!S.removeDoor(d)) return null;
     const nd = S.addDoorOpening(wall, at, w, h);
-    if (nd && keepRoom) nd.room = keepRoom;
+    if (nd) {
+      if (keepRoom) nd.room = keepRoom;
+      /* 改个头不改名字：代号、是不是自己开的、当初吃掉了什么，都得跟着走，
+         不然改完尺寸再说"撤掉这扇门"就找不着它了 */
+      if (keepCode) nd.code = keepCode;
+      if (keepAdded) nd.added = true;
+      if (keepAte) nd._ate = keepAte;
+    }
     return nd;
   };
 
@@ -1546,11 +1635,14 @@
       controls.target.lerpVectors(anim.q0, anim.q1, e);
       if (k >= 1) anim = null;
     }
+    /* 房间高亮"呼吸"：只有真的铺了色块才脉动。
+       fill=0 的时候 userData.m / userData.beam 都是 null，这里必须判空 ——
+       不然每一帧都会抛 "Cannot read properties of null (reading 'material')"。 */
     if (hl && hl.userData.m) {
       const s = .5 + .5 * Math.sin(t / 420);
       hl.userData.m.material.opacity = .16 + .18 * s;
-      hl.userData.line.material.opacity = .6 + .4 * s;
-      hl.userData.beam.material.opacity = .14 + .16 * s;
+      if (hl.userData.line) hl.userData.line.material.opacity = .6 + .4 * s;
+      if (hl.userData.beam) hl.userData.beam.material.opacity = .14 + .16 * s;
     }
     controls.update();
     scaleLabels();
@@ -2809,23 +2901,26 @@
   const GHOST_OPACITY = 0.30;
   S.ghostWall = function (wall, on) {
     const mesh = wallMeshById[wall.id];
-    if (!mesh) return;
+    const gi = ghosted.indexOf(wall.id);
     if (on) {
+      if (!mesh) return;
       if (mesh.userData.solidMat) return;
       mesh.userData.solidMat = mesh.material;
       const m = mesh.material.clone();
       m.transparent = true; m.opacity = GHOST_OPACITY; m.depthWrite = false;
       m.side = THREE.DoubleSide;
       mesh.material = m;
-      ghosted.push(wall.id);
+      if (gi < 0) ghosted.push(wall.id);
     } else {
-      if (!mesh.userData.solidMat) return;
+      /* 先把名单里的这一条摘掉，再看他还原得回不还原得回去。
+         以前是"没有 solidMat 就直接 return"，于是墙被 rebuildWall 换过以后，
+         这条记录永远挂在名单上 —— 后面自检会看到一面"半透明的墙"其实早就不在了。 */
+      if (gi >= 0) ghosted.splice(gi, 1);
+      if (!mesh || !mesh.userData.solidMat) return;
       const m = mesh.material;
       mesh.material = mesh.userData.solidMat;
       delete mesh.userData.solidMat;
       if (m && m.dispose) m.dispose();
-      const i = ghosted.indexOf(wall.id);
-      if (i >= 0) ghosted.splice(i, 1);
     }
   };
   S.ghostWalls = function (walls, on) { (walls || []).forEach(w => S.ghostWall(w, on)); };

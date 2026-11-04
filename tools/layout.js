@@ -399,6 +399,164 @@ const H = t => console.log('\n' + t);
   });
   P('选中的那扇门被真的拓宽了', widened.length > 0 && widened.some(d => d.w >= 1.3), JSON.stringify(widened));
 
+  /* ---------- ⑫ 第十二阶段：绿色区块 / 计算书亮板 / 撤门复原 / 改尺寸不误判 / 只开内墙 / 点哪扇改哪扇 ---------- */
+  H('【12】去掉绿块 · 计算书亮两块板 · 撤门复原 · 改尺寸不误判 · 只开内墙 · 点哪扇改哪扇');
+
+  /* ① 平时不再铺绿色区块：房间高亮只剩描边 */
+  const hlState = await p.evaluate(() => {
+    const M = window.BIM_MODEL, S = window.BIM.scene;
+    const r = M.rooms.find(x => x.num === '505' && x.floor === 5);
+    S.highlightRoom(r, 0x10a394);          // 平时那条路径：只给颜色，不给填充
+    const grp = S.root().children.filter(o => o.userData && o.userData.line && 'fill' in o.userData);
+    const g = grp[grp.length - 1];
+    return { fill: g ? g.userData.fill : null, mesh: g ? !!g.userData.m : null, beam: g ? !!g.userData.beam : null };
+  });
+  P('放置后房间里不再铺绿色色块（只剩描边、没有光柱）',
+    hlState.fill === 0 && hlState.mesh === false && hlState.beam === false, JSON.stringify(hlState));
+
+  /* ② 看计算书时才亮，而且是打通后的两块板 */
+  const lit = await p.evaluate(() => {
+    const r = window.BIM.agent.mem.lastResult;
+    return r ? window.BIM.showCalcPlate(r) : null;
+  });
+  P('看计算书时高亮对应的板（打通时是两块）',
+    !!lit && lit.merged && lit.rooms.length === 2 && lit.rooms.indexOf('505') >= 0 && lit.rooms.indexOf('504') >= 0,
+    JSON.stringify(lit));
+
+  /* ③ 门窗编号唯一：模型里 45 扇门都叫 M1021，必须分得开 */
+  const codes = await p.evaluate(() => {
+    const M = window.BIM_MODEL, c = {};
+    (M.doors || []).forEach(d => { c[d.code] = (c[d.code] || 0) + 1; });
+    return { n: M.doors.length, dup: Object.keys(c).filter(k => c[k] > 1).length,
+      sample: (M.doors || []).filter(d => d.name === 'M1021').slice(0, 3).map(d => d.code) };
+  });
+  P('每扇门都有唯一代号（重名的自动编号）', codes.dup === 0 && codes.sample.every(c => /-\d\d$/.test(c || '')),
+    codes.n + ' 扇，重码 ' + codes.dup + '，例：' + codes.sample.join(' '));
+
+  /* ④ 点哪扇就是哪扇：选中一扇重名的门，说改尺寸时不许乱认 */
+  const pickOne = await p.evaluate(() => {
+    const M = window.BIM_MODEL;
+    const d = (M.doors || []).find(x => x.floor === 5 && x.name === 'M1021');
+    window.BIM.selectOpening({ kind: 'door', data: d }, true);
+    return { id: d.id, code: d.code, w: d.w };
+  });
+  const rd = await call('resize_door', { door: 'M1021', width: +(pickOne.w + 0.15).toFixed(2) });
+  await sleep(2000);
+  P('重名的门被点中后，改的就是点中的那一扇',
+    !!(rd && rd.data && rd.data.door_id === pickOne.id), JSON.stringify(rd && rd.data));
+
+  /* ⑤ 随便说"开个门"不许开到外墙 */
+  const extOpen = await call('open_door', { room: '510', width: 1.0, height: 2.1 });
+  await sleep(2400);
+  const extKind = await p.evaluate(s => {
+    const M = window.BIM_MODEL, r = M.rooms.find(x => x.num === '510' && x.floor === 5);
+    const w = M.walls.find(y => y.id === (r.sides || {})[s]);
+    return w && w.kind;
+  }, extOpen && extOpen.data && extOpen.data.side);
+  P('说"开个门"不会开在外墙上（走廊墙/内墙优先）', !!extKind && extKind !== 'ext',
+    '开在 ' + (extOpen && extOpen.data && extOpen.data.side) + '(' + extKind + ')');
+
+  /* ⑥ 改尺寸时只剩线管挡着 → 判"能改，再牵一次线"，不是"碰撞" */
+  const wp = await p.evaluate(() => {
+    const M = window.BIM_MODEL, C = window.BIM.calc;
+    for (const room of M.rooms.filter(x => x.floor === 5 && x.zone !== 'corr')) {
+      for (const side of ['north', 'south', 'west', 'east']) {
+        const wall = M.walls.find(w => w.id === (room.sides || {})[side]);
+        if (!wall || wall.kind === 'ext') continue;
+        const L = Math.hypot(wall.p2[0] - wall.p1[0], wall.p2[1] - wall.p1[1]);
+        for (let at = 1.0; at <= L - 1.0; at += 0.05) {
+          const chk = C.door({ wall: wall, at: at, w: 1.0, h: 2.1, room: room });
+          const bl = chk.blocks || [];
+          if (bl.length === 1 && bl[0].k === 'conduit') {
+            const plan = C.widenPlan({ wall: wall, at: at, w: 1.0, h: 2.1, need: 1.35, room: room, equipments: [] });
+            return { room: room.num, side: side, conduits: (chk.conduits || []).length,
+              pass: !!(plan.best && plan.best.pass), rr: plan.best ? (plan.best.reroutes || []).length : 0,
+              need: !!(plan.best && plan.best.needReroute), blocked: (plan.blocked || []).map(b => b.t) };
+          }
+        }
+      }
+    }
+    return null;
+  });
+  P('只被墙里线管挡着时，拓门判"能拓（要再牵一次线）"，不再判碰撞',
+    !!wp && wp.pass && wp.need && wp.rr > 0, JSON.stringify(wp));
+
+  /* ⑦ 撤门恢复原装：改道的线管放回原走法 */
+  const undoTest = await p.evaluate(() => {
+    const M = window.BIM_MODEL, C = window.BIM.calc, S = window.BIM.scene;
+    /* 找一处"只被线管挡着"的门位（点了就得牵线才开得成） */
+    let room = null, side = null, at = null;
+    outer:
+    for (const rm of M.rooms.filter(x => x.floor === 5 && x.zone !== 'corr')) {
+      for (const sd of ['north', 'south', 'west', 'east']) {
+        const w = M.walls.find(x => x.id === (rm.sides || {})[sd]);
+        if (!w || w.kind === 'ext') continue;
+        const L = Math.hypot(w.p2[0] - w.p1[0], w.p2[1] - w.p1[1]);
+        for (let a = 1.0; a <= L - 1.0; a += 0.05) {
+          const chk = C.door({ wall: w, at: a, w: 1.0, h: 2.1, room: rm });
+          const bl = chk.blocks || [];
+          if (bl.length === 1 && bl[0].k === 'conduit') { room = rm; side = sd; at = +a.toFixed(2); break outer; }
+        }
+      }
+    }
+    if (!room) return { none: true };
+    const rr0 = Object.keys(window.BIM.elec.data.reroutes || {}).length;
+    const o = window.BIM.doorDbg.openAt(room, side, at, 1.0, 2.1);
+    const rr1 = Object.keys(window.BIM.elec.data.reroutes || {}).length;
+    const u = window.BIM.doorDbg.undo();
+    const rr2 = Object.keys(window.BIM.elec.data.reroutes || {}).length;
+    return { at: at, opened: !!o && o.ok, rerouted: o && o.rerouted, rr0: rr0, rr1: rr1, rr2: rr2,
+      restored: u ? u.conduitsRestored : null, hl: S.openingHighlightOf() };
+  });
+  P('点在有管线的位置开门：自动牵线', !!undoTest.opened && undoTest.rerouted > 0, JSON.stringify(undoTest));
+  P('撤掉这扇门 → 改道的线管退回原走法（恢复原装）',
+    undoTest.rr1 > undoTest.rr0 && undoTest.rr2 === undoTest.rr0 && (undoTest.restored || 0) > 0,
+    'reroutes ' + undoTest.rr0 + '→' + undoTest.rr1 + '→' + undoTest.rr2 + '，退回 ' + undoTest.restored + ' 根');
+
+  /* ⑧ 点门窗不再每次都飞镜头（只按洞口周围判断在不在画面里） */
+  const cam = await p.evaluate(() => {
+    const M = window.BIM_MODEL, S = window.BIM.scene;
+    window.__fly = 0;
+    const old = S.focusDoor;
+    S.focusDoor = function () { window.__fly++; return old.apply(this, arguments); };
+    const r = M.rooms.find(x => x.num === '505' && x.floor === 5);
+    /* 必须挑"真的开在 505 这一段墙上"的那扇门。
+       注意 d.rooms 是**整面墙上的所有房间**，同一面 33 米长的墙挂着 501~505 的门，
+       只按 rooms 过滤会挑到别人家的门，镜头当然框不到。 */
+    const d = (M.doors || []).filter(x => !x.added && x.floor === 5 && (x.rooms || []).indexOf(r.id) >= 0)
+      .find(x => {
+        const wall = M.walls.find(w => w.id === x.wall);
+        if (!wall) return false;
+        const L = Math.hypot(wall.p2[0] - wall.p1[0], wall.p2[1] - wall.p1[1]) || 1;
+        const ux = (wall.p2[0] - wall.p1[0]) / L, uy = (wall.p2[1] - wall.p1[1]) / L;
+        const at = S.doorAt(x, wall);
+        const ts = [[r.x0, r.y0], [r.x1, r.y0], [r.x0, r.y1], [r.x1, r.y1]]
+          .map(([px, py]) => (px - wall.p1[0]) * ux + (py - wall.p1[1]) * uy);
+        return at > Math.min.apply(null, ts) + 0.2 && at < Math.max.apply(null, ts) - 0.2;
+      });
+    if (!d) return { none: true };
+    S.setFocus(5, false);
+    S.frameBounds(5, r.x0 - 4, r.y0 - 4, r.x1 + 4, r.y1 + 4, false, 0.9);
+    return { id: d.id };
+  });
+  await sleep(1200);
+  const cam2 = await p.evaluate(id => {
+    const M = window.BIM_MODEL;
+    const d = (M.doors || []).find(x => x.id === id);
+    window.BIM.selectOpening({ kind: 'door', data: d }, true);   // 先让它把镜头摆到门上
+    return { w: window.__fly };
+  }, cam.id);
+  await sleep(1400);
+  const cam3 = await p.evaluate(id => {
+    const M = window.BIM_MODEL;
+    const d = (M.doors || []).find(x => x.id === id);
+    window.__fly = 0;
+    for (let i = 0; i < 3; i++) window.BIM.selectOpening({ kind: 'door', data: d }, true);
+    return { fly: window.__fly };
+  }, cam.id);
+  P('门窗已经在画面里时，再点它不动镜头', cam3.fly === 0,
+    '把镜头对准它时飞了 ' + cam2.w + ' 次，之后再点 3 次飞 ' + cam3.fly + ' 次');
+
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));
   console.log(fail ? '\n❌ 失败 ' + fail + ' 项' : '\n✅ 全部通过');

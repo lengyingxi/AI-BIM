@@ -73,6 +73,31 @@
     }
   };
 
+  /* 自检用（门窗）：把"用户点在哪 → 洞口怎么定 → 撤门退回什么"这条链拆给回归看。
+     openAt 走的是和鼠标点选完全同一套 holeDecision（noMove=true，点了就不许自己挪），
+     只是省掉了射线求交那一步 —— 回归里没法真的去点像素。 */
+  window.BIM.doorDbg = {
+    last: () => (ST.lastDoor && ST.lastDoor.d) || null,
+    undo: d => undoDoor(d || (ST.lastDoor && ST.lastDoor.d), true),
+    openAt: (room, side, at, w, h) => {
+      if (!room) return null;
+      const wall = M.walls.find(x => x.id === (room.sides || {})[side]);
+      if (!wall) return { ok: false, why: '没有这面墙' };
+      if (wall.kind === 'ext') return { ok: false, why: '外墙不开门', ext: true };
+      const W = w || 1.0, H = h || 2.1;
+      const eqs = ST.placed.filter(e => e.floor === wall.floor);
+      const dec = holeDecision(wall, { at: at, w: W, h: H, sill: 0, room: room, equipments: eqs, kind: 'door', noMove: true });
+      if (!dec.ok) return { ok: false, why: dec.why, blocks: (dec.blocks || []).map(b => b.t) };
+      const ids = [];
+      const n = dec.needReroute ? applyReroutes(dec, ids) : 0;
+      const d = S.addDoorOpening(wall, dec.at, W, H);
+      d.room = room.id;
+      if (ids.length) d._reroutes = ids;
+      ST.lastDoor = { wall: wall, at: dec.at, w: W, d: d, chk: dec.chk, room: room };
+      return { ok: true, id: d.id, code: d.code, at: +dec.at.toFixed(2), rerouted: n, moved: !!dec.moved };
+    }
+  };
+
   /* ---------------- 消息 ---------------- */
   function scrollBottom() {
     chat.scrollTop = chat.scrollHeight;
@@ -997,11 +1022,15 @@
     ST.selOpening = { kind: kind, id: d.id, name: d.name, w: d.w, h: d.h, sill: d.sill || 0, wall: d.wall, floor: d.floor };
     const A = window.BIM.agent;
     if (A && A.mem && A.mem.ctx) A.mem.ctx.selOpening = ST.selOpening;
-    /* 选门/选窗时把镜头摆正一点：不然选中框可能只有几十个像素，用户以为没反应 */
+    /* 选门/选窗时把镜头摆正一点：不然选中框可能只有几十个像素，用户以为没反应。
+       ⚠ 只按"洞口周围两米"判断在不在画面里 —— 以前按整面墙算，
+       5F 一道墙 33 米长，正常情况下永远判"不在画面里"，
+       于是每点一次门窗镜头就飞一次（用户："改完尺寸后再次点击的视角会有点问题"）。 */
     const wall = M.walls.find(w => w.id === d.wall);
     if (wall) {
       const at = kind === 'door' ? S.doorAt(d, wall) : S.windowAt(d, wall);
-      if (at != null && (!S.inView || !S.inView(wall.floor, wall.p1[0], wall.p1[1], wall.p2[0], wall.p2[1], 0.05, 0.1))) {
+      if (at != null && (!S.inView || !S.inView(wall.floor,
+        d.pos[0] - 1.6, d.pos[1] - 1.6, d.pos[0] + 1.6, d.pos[1] + 1.6, 0.05, 0.02))) {
         S.focusDoor(wall, at, (M.rooms.find(r => (d.rooms || []).indexOf(r.id) >= 0)) || null);
       }
     }
@@ -1453,8 +1482,13 @@
     finishMode();
 
     const clash = !!(ob && ob.blocks && ob.blocks.length);
-    // 撞到的东西直接框成红的：别让人凭一句话猜"哪儿撞了"
-    if (!markClash(ob)) S.highlightRoom(room, clash ? 0xdd534f : (r.verdict === 'bad' ? 0xdd534f : (r.verdict === 'warn' ? 0xdd9a2c : 0x10a394)));
+    // 撞到的东西直接框成红的：别让人凭一句话猜"哪儿撞了"。
+    // 只有"放不下 / 快到头"才铺色块，正常放好只描一圈边 —— 不铺那块绿板。
+    if (!markClash(ob)) {
+      const bad = clash || r.verdict === 'bad';
+      S.highlightRoom(room, bad ? 0xdd534f : (r.verdict === 'warn' ? 0xdd9a2c : 0x10a394),
+        { fill: bad ? .22 : (r.verdict === 'warn' ? .12 : 0) });
+    }
 
     if (quiet) return eq;
 
@@ -1622,29 +1656,44 @@
     return { x: cx, y: room.y0 + pad };
   }
 
+  /* 这间房某一面墙是什么性质：ext 外墙 / corr 走廊墙 / int·part 内隔墙 */
+  function sideKind(room, k) {
+    if (!room || !k) return null;
+    const w = M.walls.find(x => x.id === (room.sides || {})[k]);
+    return w ? w.kind : null;
+  }
+
+  /* 开门只能开在**走廊墙和内墙**上。
+     用户原话："随便说开个门的时候不能开在外墙！只能是走廊和内墙"。
+     以前这里按 west→east→south→north 硬取第一面，5F 的南墙正好是外墙，于是
+     "开个门"十次有八次开到外立面上去了。现在先把外墙剔掉，再按
+     走廊墙 > 内墙 > 隔墙 排序；四面全是外墙就返回 null，由上层如实说开不了。 */
   function pickDoorSide(room, p) {
     const sides = room.sides || {};
     const rel = p.sideRel || (REL_SIDES.indexOf(p.side) >= 0 ? p.side : null);
     const byView = viewSide(rel);
-    // 「靠走廊」→ 找朝走廊的那面墙
+    const usable = k => !!sides[k] && sideKind(room, k) !== 'ext';
+    const rank = k => { const t = sideKind(room, k); return t === 'corr' ? 0 : (t === 'int' ? 1 : (t === 'part' ? 2 : 3)); };
+    const all = ['south', 'north', 'west', 'east'].filter(usable).sort((a, b) => rank(a) - rank(b));
+    if (!all.length) return null;
+
+    // 「靠走廊」→ 直接找走廊那面
     if (p.pref === 'corridor') {
-      for (const k of ['south', 'north', 'west', 'east']) {
-        const w = M.walls.find(x => x.id === sides[k]);
-        if (w && w.kind === 'corr') return k;
-      }
-      const corr = M.rooms.find(r => r.zone === 'corr' && r.floor === room.floor);
-      if (corr) {
-        const ccx = (corr.x0 + corr.x1) / 2, ccy = (corr.y0 + corr.y1) / 2;
-        const cx = (room.x0 + room.x1) / 2, cy = (room.y0 + room.y1) / 2;
-        const dx = ccx - cx, dy = ccy - cy;
-        const k = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'east' : 'west') : (dy > 0 ? 'north' : 'south');
-        if (sides[k]) return k;
-      }
+      const c = all.find(k => sideKind(room, k) === 'corr');
+      if (c) return c;
     }
-    if (byView && sides[byView]) return byView;
-    if (p.side && sides[p.side]) return p.side;
-    for (const k of ['west', 'east', 'south', 'north']) if (sides[k]) return k;
-    return byView || p.side || 'west';
+    // 用户/镜头指的那一面能用就用它（指到外墙则往下走）
+    if (byView && usable(byView)) return byView;
+    if (p.side && usable(p.side)) return p.side;
+    return all[0];
+  }
+
+  /* 用户点名的那一面被跳过了（是外墙），得在回执里说清楚换成了哪一面 */
+  function doorSideNote(room, want, chosen) {
+    if (!want || !chosen || want === chosen) return '';
+    const t = sideKind(room, want);
+    if (t !== 'ext') return '';
+    return '你说的' + N.SIDE_CN[want] + '面是外墙，不能开门，我换成了' + N.SIDE_CN[chosen] + '面';
   }
 
   /* 记住这次开门，接着说话时能引用 */
@@ -1655,19 +1704,97 @@
     AM.lastDoor = { room: room, side: side, w: w, h: h };
   }
 
+  /* 把一扇门撤掉，墙恢复成"开门之前"的样子。
+     用户原话："撤掉这扇门也需要回复原装，目前没有"。
+     "原装"不只是洞口补上，还有两件事要一起退回：
+      ① 开门时为让位置而改道的线管 —— 放回原来的走法，不然图上一直挂着一截绿线；
+      ② 开门时被顶掉 / 吃掉的原有门窗 —— 按记下的参数装回去。
+     顺手把选中态、门洞标记、上下文一起清掉，别让下一次操作还对着一扇不存在的门。 */
+  function undoDoor(d, quiet) {
+    if (!d) return null;
+    const wall = M.walls.find(w => w.id === d.wall);
+    const at = wall ? S.doorAt(d, wall) : null;
+    const snap = {
+      id: d.id, name: d.code || d.name || d.id, w: d.w, h: d.h, at: at,
+      room: d.room, added: !!d.added, wall: wall ? wall.id : null
+    };
+    const E = window.BIM.elec;
+    let condBack = 0;
+    (d._reroutes || []).forEach(cid => {
+      if (E && E.undoReroute && E.undoReroute(cid)) condBack++;
+    });
+    let ok = S.removeDoor(d);
+    if (!ok && wall) {
+      /* 洞口和门记录对不上时兜底：按反查号、再按最近位置硬摘一个洞口，然后把墙重建 */
+      const i = wall.openings.findIndex(o => o.kind === 'door' &&
+        (o.ref === d.id || (at != null && Math.abs(o.at - at) < 0.35)));
+      if (i >= 0) {
+        wall.openings.splice(i, 1);
+        S.rebuildWall(wall);
+        if (d._mesh && d._mesh.parent) d._mesh.parent.remove(d._mesh);
+        M.doors = (M.doors || []).filter(x => x !== d);
+        ok = true;
+      }
+    }
+    if (!ok) return null;
+    /* 开门时被吃掉的原有门窗装回去 */
+    const ate = d._ate || [];
+    let openBack = 0;
+    ate.forEach(e => {
+      if (!e || !e.obj || !wall) return;
+      const nd = e.kind === 'door'
+        ? S.addDoorOpening(wall, e.at, e.w, e.h)
+        : S.addWindowOpening(wall, e.at, e.w, e.h, e.sill || 0);
+      if (nd) {
+        if (e.room) nd.room = e.room;
+        if (e.name) nd.name = e.name;
+        if (e.added) nd.added = true;
+        openBack++;
+      }
+    });
+    if (openBack && wall) S.rebuildWall(wall);
+    S.markDoorSpotClear && S.markDoorSpotClear();
+    S.clearOpeningHighlight && S.clearOpeningHighlight();
+    if (ST.lastDoor && ST.lastDoor.d === d) ST.lastDoor = null;
+    if (ST.selOpening && ST.selOpening.id === d.id) {
+      ST.selOpening = null;
+      const AM = window.BIM.agent && window.BIM.agent.mem;
+      if (AM && AM.ctx) AM.ctx.selOpening = null;
+    }
+    snap.conduitsRestored = condBack;
+    snap.openingsRestored = openBack;
+    if (!quiet) {
+      ai('把「' + snap.name + '」撤掉了，墙上恢复成没有洞口的样子' +
+        (condBack ? '；开门时为它改道的那 ' + condBack + ' 根线管也放回原来的走法了' : '') +
+        (openBack ? '；原来被让开的 ' + openBack + ' 处门窗装回去了' : '') + '。');
+    }
+    lastData = { removed: snap.name, width: snap.w, height: snap.h, restored: { conduits: condBack, openings: openBack } };
+    return snap;
+  }
+
   /* 每条开门回执都挂一个"我自己点位置"：
      用户经常觉得系统挑的位置不合意（要偏一点、要对着设备），点一下自己定，
      定完照样走 holeDecision 那套校核 + 改线规划，不是"想放哪就放哪"。
      用户原话："每次开门的时候回复都要加一个按钮提供给用户自己点击位置，
-     并进行后续的改线规划。" */
+     并进行后续的改线规划。"
+     ★ 点之前必须先把刚才自动开的那一扇撤掉 —— 否则墙上会多出一扇没人要的门，
+     用户原话："对应的按钮我自己点位置需要撤掉之前对应自动生成的，重新开"。 */
   function doorPointChips(room, side, w, h, firstLabel) {
     if (!room) return;
+    const last = (ST.lastDoor && ST.lastDoor.d && (M.doors || []).indexOf(ST.lastDoor.d) >= 0)
+      ? ST.lastDoor.d : null;
     const one = {
       label: firstLabel || '我自己点位置',
-      fn: () => startDoor({ room: room, side: side, width: w, doorH: h })
+      fn: () => {
+        if (last) {
+          undoDoor(last, true);
+          toast('刚才自动开的那扇已经撤掉了，在墙上点一下你要的位置');
+        }
+        startDoor({ room: room, side: side, width: w, doorH: h });
+      }
     };
-    const undo = ST.lastDoor && ST.lastDoor.d
-      ? { label: '撤掉这扇门', fn: () => send('把刚才的门拆掉') }
+    const undo = last
+      ? { label: '撤掉这扇门', fn: () => { const r = undoDoor(last); if (!r) ai('这扇门已经不在墙上了。'); } }
       : null;
     chips(undo ? [one, undo] : [one]);
   }
@@ -1676,15 +1803,26 @@
     const room = p.room;
     if (!room) { ai('要在哪一间开？说个房间号，比如「3 楼 306」。'); return; }
     const side = pickDoorSide(room, p);
+    if (!side) {
+      /* 四面全是外墙：开门这条路对用户就没意义，说清楚并给两条别的路 */
+      ai(room.num + ' 四面都是外墙，不能在上面开门（外墙兼承重，还要管防水）。' +
+        '要连通只能往内墙方向想办法 —— 要么换一间挨着走廊的房，要么把它和隔壁打通。');
+      chips([
+        { label: '和隔壁打通', fn: () => send('把' + room.num + '和隔壁打通') },
+        { label: '换一间房', fn: () => send('换一间房开门') }
+      ]);
+      return;
+    }
     const wid = (room.sides || {})[side];
     const wall = M.walls.find(w => w.id === wid);
     if (!wall) { ai('这间房找不到对应的墙。'); return; }
+    const swap = doorSideNote(room, p.sideRel || p.side, side);
 
     const w = p.width || 1.0, h = p.doorH || 2.1;
     ST.mode = 'door';
     ST.pending = { room, side, wall, width: w, height: h, pref: p.pref || null };
     S.mode = 'door';
-    focusSoft(room);
+    focusSoft(room, { color: false });
     /* 点选开门时也只留这一层：上下层的半透明墙会挡在镜头前面，门洞看不清 */
     S.isolateFloor && S.isolateFloor(room.floor);
     S.highlightWall(wall, 0x10a394);
@@ -1693,6 +1831,7 @@
     let t = room.num + ' ' + N.SIDE_CN[side] + '边这面墙亮出来了，点一下要开的位置。';
     if (p.pref === 'corridor') t = '按你说的靠走廊，我选了' + N.SIDE_CN[side] + '边这面墙。点一下开门的位置。';
     if (w > 1.05 || Math.abs(w - 1.0) > 1e-6) t = '门宽按你说的 ' + w.toFixed(2) + ' 米、高 ' + h.toFixed(2) + ' 米。' + t;
+    if (swap) t = swap + '。' + t;
     ai(t);
   }
 
@@ -1719,6 +1858,16 @@
     const [ax, ay] = wall.p1, [bx, by] = wall.p2;
     const L = Math.hypot(bx - ax, by - ay);
     at = clamp(at, 0, L);
+
+    /* 外墙不许开：用户原话"随便说开个门的时候不能开在外墙！只能是走廊和内墙"。
+       手点的位置也一样 —— 点到外墙上就当场说清，别偷偷把门开到外立面上去。 */
+    if (wall.kind === 'ext') {
+      S.highlightWall(wall, 0xdd534f);
+      toast('外墙不能开门：外墙兼承重，还要管防水');
+      ai('这面是外墙，不能在上面开门 —— 外墙兼承重，还得管防水和保温。' +
+        '门只能开在走廊墙或者内隔墙上，往屋里那一侧点一下就行。');
+      return;
+    }
 
     // 一面长墙可能挨着好几个房间，把落点收进本房间对应的那一段
     const ux = (bx - ax) / L, uy = (by - ay) / L;
@@ -1755,8 +1904,11 @@
     }
 
     if (ready) {
-      const rerouted = (dec && dec.needReroute) ? applyReroutes(dec) : 0;
+      const rIds = [];
+      const rerouted = (dec && dec.needReroute) ? applyReroutes(dec, rIds) : 0;
       const d = S.addDoorOpening(wall, at, p.width, p.height);
+      d.room = room.id;
+      if (rIds.length) d._reroutes = rIds;     // 撤门时把改道的线管放回原样
       ST.lastDoor = { wall, at, w: p.width, d, chk, room };
       rememberDoor(room, sideOfWall(room, wall) || p.side, p.width, p.height);
       ST.mode = 'idle'; S.mode = 'idle';
@@ -2021,7 +2173,17 @@
     if (S.hideTip) S.hideTip();
     RIGHT_PANELS.forEach(x => { if (x !== id) $(x).hidden = true; });
     if (id !== 'pTopo') endFlowVisual();
+    /* 切到别的面板就别再亮着计算书那块板：门、窗、设备都改完了还挂两块蓝板，
+       看着像"还在算这一块"，实际早就不关了。 */
+    if (id !== 'pCalc') endCalcPlate();
     $(id).hidden = false;
+  }
+
+  /* "计算书算的是这块板"的蓝色高亮：只在计算书面板开着的时候亮 */
+  function endCalcPlate() {
+    if (!ST.calcLit) return;
+    ST.calcLit = false;
+    S.clearHighlight && S.clearHighlight();
   }
 
   /* 流向/路由高亮只在「问某个阀门影响哪些房间」的时候亮，
@@ -2146,11 +2308,37 @@
   }
 
   /* ---------------- 计算书 ---------------- */
+  /* 看计算书时才亮"算的是哪块板"：打通了两间就两块板一起亮。
+     用户原话："点开查看计算书的时候需要高亮对应的区块，如果是打通的计算书 应该是对应俩块板"。
+     强调"只在看计算书这一刻亮" —— 平时不亮，否则就是一路盖着的那块绿色区块。 */
+  function showCalcPlate(r) {
+    if (!r || !r.room) return null;
+    const pl = r.plate || null;
+    const rooms = (pl && pl.merged && pl.rooms && pl.rooms.length) ? pl.rooms.slice() : [r.room];
+    S.highlightRooms(rooms, 0x2f7df6);
+    ST.calcLit = true;
+    const floor = r.room.floor;
+    const b = rooms.reduce((a, x) => ({
+      x0: Math.min(a.x0, x.x0), y0: Math.min(a.y0, x.y0),
+      x1: Math.max(a.x1, x.x1), y1: Math.max(a.y1, x.y1)
+    }), { x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 });
+    S.setFocus(floor, false);
+    /* 板子只剩屏幕角落一小块的时候，计算书上的数字对不上画面，得把镜头摆过去 */
+    if (!S.inView || !S.inView(floor, b.x0, b.y0, b.x1, b.y1, 0.12, 0.2)) {
+      S.frameBounds(floor, b.x0 - 0.8, b.y0 - 0.8, b.x1 + 0.8, b.y1 + 0.8, true, 0.8);
+    }
+    return { rooms: rooms.map(x => x.num), merged: !!(pl && pl.merged) };
+  }
+  window.BIM.showCalcPlate = showCalcPlate;
+
   function openCalc() {
     if (!ST.last) { toast('先放一台设备再来看计算书'); return; }
     $('calcBody').innerHTML = C.book(ST.last);
     openPanel('pCalc');
+    const lit = showCalcPlate(ST.last);
+    if (lit) lastData = Object.assign({}, lastData, { calc_plate: lit.rooms, calc_merged: lit.merged });
   }
+  window.BIM.openCalc = openCalc;      // 回归/自检要能直接开这一屏
 
   function downloadCalc() {
     if (!ST.last) return;
@@ -2611,6 +2799,16 @@
     if (!auto) { startDoor(p); A.commit(step, { room: room }); return true; }
 
     const side = pickDoorSide(room, p);
+    if (!side) {
+      ai(room.num + ' 四面都是外墙，不能在上面开门（外墙兼承重，还要管防水）。' +
+        '要连通只能往内墙方向想办法 —— 要么换一间挨着走廊的房，要么把它和隔壁打通。');
+      chips([
+        { label: '和隔壁打通', fn: () => send('把' + room.num + '和隔壁打通') },
+        { label: '换一间房', fn: () => send('换一间房开门') }
+      ]);
+      return false;
+    }
+    const sideSwap = doorSideNote(room, step.sideRel || step.side, side);
     const wall = M.walls.find(x => x.id === (room.sides || {})[side]);
     if (!wall) { ai(room.num + ' 这间房找不到对应的墙。'); return false; }
     const L = Math.hypot(wall.p2[0] - wall.p1[0], wall.p2[1] - wall.p1[1]);
@@ -2638,10 +2836,14 @@
       return false;
     }
 
-    const rerouted = dec.needReroute ? applyReroutes(dec) : 0;
+    const reroutedIds = [];
+    const rerouted = dec.needReroute ? applyReroutes(dec, reroutedIds) : 0;
     const d = S.addDoorOpening(wall, dec.at, w, h);
     d.room = room.id;                 // 记住"为哪间房开的"，长墙上才分得清
-    focusSoft(room);
+    /* 这扇门为了腾位置让哪几根线管改了道，记在门身上：
+       撤门时按这份名单把管子放回原来的走法（"回复原装"）。 */
+    if (reroutedIds.length) d._reroutes = reroutedIds;
+    focusSoft(room, { color: false });
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
     /* 只留当前楼层，门洞别被上下层挡住 */
@@ -2650,33 +2852,33 @@
     if (dec.needReroute || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
     ST.lastDoor = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
     rememberDoor(room, side, w, h);
-    pushUndo('把刚开的 ' + d.name + ' 拆掉', () => { S.removeDoor(d); S.markDoorSpotClear && S.markDoorSpotClear(); ST.lastDoor = null; });
+    pushUndo('把刚开的 ' + (d.code || d.name) + ' 拆掉', () => { undoDoor(d, true); ST.lastDoor = null; });
     const card2 = (dec.needReroute || dec.moved) ? conduitCard(dec.hits, dec.reroutes, dec)
       : '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
       '<div class="res-grid"><div><i>门宽</i><b>' + w.toFixed(2) + ' m</b></div>' +
       '<div><i>门高</i><b>' + h.toFixed(2) + ' m</b></div></div></div>';
+    const head2 = (sideSwap ? sideSwap + '。' : '') + '在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' +
+      w.toFixed(2) + ' 米宽、' + h.toFixed(2) + ' 米高的门';
     if (dec.needReroute) {
-      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
-        ' 米高的门。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
+      ai(head2 + '。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
         '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
         '。红色是原来的管线位置，绿色是改完的新走向。', card2);
     } else if (dec.moved) {
-      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
-        ' 米高的门。' + dec.moveNote + '。', card2);
+      ai(head2 + '。' + dec.moveNote + '。', card2);
     } else {
-      ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
-        ' 米高的门。', card2);
+      ai(head2 + '。', card2);
     }
     /* 三个成功分支（牵线 / 挪位 / 直接开）都挂上"我自己点位置"：
        用户要的是"每次开门回复都能自己点"。放在分支之后，省得漏。 */
     doorPointChips(room, side, w, h);
     lastData = {
-      door: d.name, room: room.num, side: side, width: w, height: h,
+      door: d.code || d.name, door_id: d.id, room: room.num, side: side, width: w, height: h,
       at: +dec.at.toFixed(2),
       moved: dec.moved ? +dec.movedBy.toFixed(2) : 0,
       rerouted: rerouted,
       reroute_add_m: rerouted ? +dec.reroutes.reduce((s, p) => s + p.addLen, 0).toFixed(2) : 0,
-      conduit_hit: (dec.hits || []).map(c => c.circuit)
+      conduit_hit: (dec.hits || []).map(c => c.circuit),
+      side_from: sideSwap ? (step.sideRel || step.side) : null
     };
     A.commit(step, { room: room, side: side });
     return true;
@@ -2850,12 +3052,18 @@
 
   /* 真的把线改掉：写进 elec 的 reroutes，之后这根管在这个洞口就不再算冲突。
      注意这是"改设计"，所以只在校核确认洞能开（结构没问题）之后才落地。 */
-  function applyReroutes(dec) {
+  /* 真把线管改道落到数据里。out 传进来就把"改了哪几根"记进去 ——
+     撤门的时候要按这份名单撤回（E.undoReroute），否则管子会一直保持着
+     "为这扇门绕行"的走法，墙明明恢复原样了，图上还挂着一截绿线。 */
+  function applyReroutes(dec, out) {
     const E = window.BIM.elec;
     if (!E || !dec || !dec.reroutes || !dec.reroutes.length) return 0;
     let n = 0;
     dec.reroutes.forEach(p => {
-      if (p && p.ok && p.c) { E.applyReroute(p.c, p.hole, p); n++; }
+      if (p && p.ok && p.c) {
+        E.applyReroute(p.c, p.hole, p); n++;
+        if (out && p.c.id) out.push(p.c.id);
+      }
     });
     return n;
   }
@@ -4042,20 +4250,25 @@
 
   /* 找"要挪的那扇窗"：明确点名 > 刚开的那扇 > 这间房最近的一扇 */
   function resolveWindow(step) {
-    /* 用户用鼠标点过的那一扇优先 —— "把这扇窗加宽到 2 米"里的"这扇"就是它 */
-    if (!step.window && ST.selOpening && ST.selOpening.kind === 'window') {
-      const s = M.windows.find(x => x.id === ST.selOpening.id);
-      if (s) return s;
-    }
+    /* 顺序同门：先认"刚点的那一扇"，再认 id/代号，名字重名不瞎猜 */
+    const all = M.windows || [];
+    const sel = (ST.selOpening && ST.selOpening.kind === 'window')
+      ? (all.find(x => x.id === ST.selOpening.id) || null) : null;
     if (step.window) {
-      const d = M.windows.find(x => x.id === step.window || x.name === step.window);
-      if (d) return d;
+      const h = openingBy(all, step.window);
+      if (h && h.d) return h.d;
+      if (h && h.amb) {
+        if (sel && h.amb.some(x => x.id === sel.id)) return sel;
+        ST.openingAmb = { kind: 'window', list: h.amb };
+        return null;
+      }
     }
+    if (sel) return sel;
     if (ST.lastWin && ST.lastWin.d) return ST.lastWin.d;
     const A = window.BIM.agent;
     const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
     if (room) {
-      const c = M.windows.filter(x => (x.rooms || []).indexOf(room.id) >= 0);
+      const c = all.filter(x => (x.rooms || []).indexOf(room.id) >= 0);
       const added = c.filter(x => x.added);
       if (added.length) return added[added.length - 1];
       if (c.length) return c[c.length - 1];
@@ -4214,7 +4427,15 @@
      尺寸走这里；两个都是"改这一扇"，不是"再开一扇"。 */
   async function stepWindowSize(step) {
     const d = resolveWindow(step);
-    if (!d) { ai('没有选中的窗。先用鼠标点一下那扇窗，或者说是哪一间的窗。'); return false; }
+    if (!d) {
+      if (ST.openingAmb && ST.openingAmb.kind === 'window') {
+        const L = ST.openingAmb.list;
+        ai('同名的窗有 ' + L.length + ' 扇，要改哪一扇？选一个，我接着按原话改：');
+        askWhichOpening('window', L, dd => stepWindowSize(Object.assign({}, step, { window: dd.id })));
+        return false;
+      }
+      ai('没有选中的窗。先用鼠标点一下那扇窗，或者说是哪一间的窗。'); return false;
+    }
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) { ai('找不到这扇窗挂在哪面墙上了。'); return false; }
     const at0w = S.windowAt(d, wall);
@@ -4552,21 +4773,58 @@
   }
 
   /* 取"这扇门"：编号 → 最近的 → 这间房最近开的那扇 */
+  /* 按"用户说的那串字符"认门窗：id 最硬，其次唯一代号，最后才按名字。
+     名字重名时**不猜** —— 返回 { amb } 让上层去做成一排按钮，
+     否则就会"点的是上面那扇，改的是下面那扇"（用户截图里的那个 bug）。 */
+  function openingBy(list, x) {
+    if (x == null || x === '') return null;
+    const all = list || [];
+    const byId = all.find(d => d.id === x);
+    if (byId) return { d: byId };
+    const byCode = all.filter(d => d.code === x);
+    if (byCode.length === 1) return { d: byCode[0] };
+    const byName = all.filter(d => d.name === x);
+    if (byName.length === 1) return { d: byName[0] };
+    if (byName.length > 1) return { amb: byName };
+    return null;
+  }
+
+  /* 重名的时候把候选摆成一排：选哪个就选中哪个，然后按原话再跑一遍 */
+  function askWhichOpening(kind, list, again) {
+    const cn = kind === 'door' ? '门' : '窗';
+    chips(list.slice(0, 4).map(d => ({
+      label: S.openingCode(d) + (d.floor ? ' · ' + d.floor + 'F' : ''),
+      fn: () => {
+        selectOpening({ kind: kind, data: d }, true);
+        S.highlightDoor && kind === 'door' && S.highlightDoor(d);
+        S.highlightWindow && kind === 'window' && S.highlightWindow(d);
+        if (again) again(d);
+      }
+    })));
+    return cn;
+  }
+
   function resolveDoor(step) {
     /* 点中过哪扇就改哪扇：用户原话"点击门…然后通过对话的方式对门进行尺寸以及位置的设置"。
-       以前这里只认 d.added（自己新建的门），模型里原有的门点中以后照样改不了。 */
-    if (!(step && step.door) && ST.selOpening && ST.selOpening.kind === 'door') {
-      const s = (M.doors || []).find(d => d.id === ST.selOpening.id);
-      if (s) return s;
-    }
+       顺序很要紧 —— 先认 id，再认"刚点的那一扇"，最后才轮到名字。
+       以前名字排在点选前面，而同规格的门全叫一个名（5 楼 45 扇 M1021），
+       于是经常改到别的那一扇上去。 */
     const all = (M.doors || []);
-    const doors = all.filter(d => d.added);
+    const sel = (ST.selOpening && ST.selOpening.kind === 'door')
+      ? (all.find(d => d.id === ST.selOpening.id) || null) : null;
     const want = step && step.door;
     if (want) {
-      const hit = all.find(d => d.name === want || d.id === want);
-      if (hit) return hit;
+      const h = openingBy(all, want);
+      if (h && h.d) return h.d;
+      if (h && h.amb) {
+        if (sel && h.amb.some(d => d.id === sel.id)) return sel;   // 选中的正是重名里的一个
+        ST.openingAmb = { kind: 'door', list: h.amb };
+        return null;
+      }
     }
-    if (ST.lastDoor && ST.lastDoor.d && (M.doors || []).indexOf(ST.lastDoor.d) >= 0) return ST.lastDoor.d;
+    if (sel) return sel;
+    const doors = all.filter(d => d.added);
+    if (ST.lastDoor && ST.lastDoor.d && all.indexOf(ST.lastDoor.d) >= 0) return ST.lastDoor.d;
     if (step && (step.room || step.roomRef)) {
       const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null);
       if (room) {
@@ -4578,7 +4836,10 @@
   }
 
   /* 聚焦但不打断用户视角：已经在画面里、而且占屏够大就只调显隐/高亮；
-     不在画面里、或者远得只剩一小块，才动相机（保持原观察方向） */
+     不在画面里、或者远得只剩一小块，才动相机（保持原观察方向）。
+     ⚠ 默认**不铺色块**：以前这里的 highlightRoom 会在房间里糊一块薄荷绿的板，
+     打通之后正好盖住两块楼板和墙洞，用户原话"去掉房间打通后的绿色区块"。
+     要"这块就是它"的强提示（撞上东西）由调用方显式传 fill。 */
   function focusSoft(room, opts) {
     if (!room) return;
     const o = opts || {};
@@ -4589,7 +4850,8 @@
     if (o.tight || !S.inView || !S.inView(room.floor, room.x0, room.y0, room.x1, room.y1, 0.06, 0.12)) {
       S.frameBounds(room.floor, room.x0 - 0.6, room.y0 - 0.6, room.x1 + 0.6, room.y1 + 0.6, true, 0.86);
     }
-    if (o.color !== false) S.highlightRoom(room, o.color || 0x10a394);
+    if (o.color === false) return;
+    if (o.color || o.fill > 0) S.highlightRoom(room, o.color || 0x10a394, { fill: o.fill || 0, beam: o.beam });
   }
 
 
@@ -4887,7 +5149,8 @@
     ST.last = r; ST.sel = eq;
     const A = window.BIM.agent;
     A.mem.lastResult = r; A.mem.lastPlaced = eq;
-    S.highlightRoom(room, r.verdict === 'bad' ? 0xdd534f : (r.verdict === 'warn' ? 0xdd9a2c : 0x10a394));
+    S.highlightRoom(room, r.verdict === 'bad' ? 0xdd534f : (r.verdict === 'warn' ? 0xdd9a2c : 0x10a394),
+      { fill: r.verdict === 'bad' ? .22 : (r.verdict === 'warn' ? .12 : 0) });
   }
 
   /* 换型号：位置尽量不动；新尺寸原地放不下才在这间房里让一让 */
@@ -5176,31 +5439,49 @@
 
   async function stepDoorOff(step) {
     const d = resolveDoor(step);
-    if (!d) { ai('现在没有可以拆的门。'); return false; }
-    if (!d.added) {
-      ai('「' + d.name + '」是模型里原有的门，拆不了。只说我新建的门才能拆。');
+    if (!d) {
+      if (ST.openingAmb && ST.openingAmb.kind === 'door') {
+        const L = ST.openingAmb.list;
+        ai('重名的门有 ' + L.length + ' 扇，要撤哪一扇？选一个，我立刻撤：');
+        askWhichOpening('door', L, dd => stepDoorOff(Object.assign({}, step, { door: dd.id })));
+        return false;
+      }
+      ai('现在没有可以撤的门。先用鼠标点一下那扇门，或者说是哪一间。');
       return false;
     }
-    const wall = M.walls.find(w => w.id === d.wall);
-    if (!wall) return false;
-    const at = S.doorAt(d, wall);
-    const snap = { at: at, w: d.w, h: d.h, room: doorRoom(d), name: d.name };
-    S.removeDoor(d);
-    S.markDoorSpotClear && S.markDoorSpotClear();
-    if (ST.lastDoor && ST.lastDoor.d === d) ST.lastDoor = null;
+    const wasModel = !d.added;
+    const snap = undoDoor(d, true);
+    if (!snap) { ai('这扇门在墙上找不到对应的洞口，没敢动它。'); return false; }
+    /* 以前这里对模型原有的门一律拒绝（"只说我新建的门才能拆"）。
+       但用户是**点中了它、又明说要撤**，那就得撤 —— 只是要知道
+       这一扇是原设计的，拆了以后图纸上少一道门。 */
+    ai('把「' + snap.name + '」撤掉了，墙上恢复成没有洞口的样子' +
+      (snap.conduitsRestored ? '；开门时为它改道的那 ' + snap.conduitsRestored + ' 根线管也放回原来的走法了' : '') +
+      (snap.openingsRestored ? '；原来被让开的 ' + snap.openingsRestored + ' 处门窗装回去了' : '') + '。' +
+      (wasModel ? '这一扇是原设计里就有的门，拆掉以后图纸上会少一道，记得补图。' : ''));
+    const wall = M.walls.find(w => w.id === snap.wall);
     pushUndo('把「' + snap.name + '」重新开回去', () => {
+      if (!wall) return;
       const nd = S.addDoorOpening(wall, snap.at, snap.w, snap.h);
-      if (snap.room) rememberDoor(snap.room, null, snap.w, snap.h);
-      ST.lastDoor = { wall: wall, at: snap.at, w: snap.w, d: nd, room: snap.room };
+      if (!nd) return;
+      if (snap.room) nd.room = snap.room;
+      if (snap.added) nd.added = true;
+      ST.lastDoor = { wall: wall, at: snap.at, w: snap.w, d: nd, room: doorRoom(nd) };
     });
-    ai('把 ' + snap.name + ' 拆了，墙上恢复成没有洞口的样子。要说撤回也行。');
-    lastData = { removed: snap.name, width: snap.w, height: snap.h };
     return true;
   }
 
   async function stepDoorMove(step) {
     const d = resolveDoor(step);
-    if (!d) { ai('现在没有可挪的门。'); return false; }
+    if (!d) {
+      if (ST.openingAmb && ST.openingAmb.kind === 'door') {
+        const L = ST.openingAmb.list;
+        ai('重名的门有 ' + L.length + ' 扇，要挪哪一扇？选一个，我接着按原话挪：');
+        askWhichOpening('door', L, dd => stepDoorMove(Object.assign({}, step, { door: dd.id })));
+        return false;
+      }
+      ai('现在没有可挪的门。'); return false;
+    }
     const wall0 = M.walls.find(w => w.id === d.wall);
     if (!wall0) return false;
     const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
@@ -5244,16 +5525,30 @@
     at = clamp(at, loA, Math.max(loA, hiA));
 
     const eqs = ST.placed.filter(e => e.floor === wall.floor);
-    const chk = C.door({ wall: wall, at: at, w: d.w, h: d.h, equipments: eqs, room: room, self: d });
+    let chk = C.door({ wall: wall, at: at, w: d.w, h: d.h, equipments: eqs, room: room, self: d });
     const before = { wall: wall0, at: S.doorAt(d, wall0), w: d.w, h: d.h };
     let finalAt = at, note = '';
+    let moveReroutes = null;
 
     if (!chk.pass) {
-      const sug = C.suggestDoorAt({ wall: wall, room: room, at: at, w: d.w, h: d.h, equipments: eqs, self: d });
-      if (sug && sug.check && sug.check.pass && Math.abs(sug.at - at) < 2.0) {
+      /* 只剩墙里线管挡着 ≠ 挪不过去：挪过去再牵一次线就行（跟开门同一套规矩） */
+      const bl = chk.blocks || [];
+      if (bl.length === 1 && bl[0].k === 'conduit' && C.rerouteForConduits) {
+        const pl = C.rerouteForConduits(chk.conduits || [], at, d.w, d.h, 0);
+        if (pl) { moveReroutes = pl; chk = Object.assign({}, chk, { pass: true, blocks: [] }); }
+      }
+    }
+    if (!chk.pass) {
+      const sug = C.suggestDoorAt({ wall: wall, room: room, at: at, w: d.w, h: d.h, equipments: eqs, self: d, ignoreConduit: true });
+      if (sug && sug.check && (sug.check.pass || (sug.check.blocks || []).every(b => b.k === 'conduit')) && Math.abs(sug.at - at) < 2.0) {
         finalAt = sug.at;
+        chk = sug.check;
         note = (chk.blocks[0] ? chk.blocks[0].t : '那边有东西挡着') +
           '，我顺着墙让了 ' + Math.abs(sug.at - at).toFixed(2) + ' 米。';
+        if (!chk.pass && (chk.blocks || []).every(b => b.k === 'conduit') && C.rerouteForConduits) {
+          const pl = C.rerouteForConduits(chk.conduits || [], finalAt, d.w, d.h, 0);
+          if (pl) { moveReroutes = pl; chk = Object.assign({}, chk, { pass: true, blocks: [] }); }
+        }
       } else {
         S.highlightWall(wall, 0xdd534f);
         ai('这个位置挪不过去：' + chk.blocks.map(b => b.t).join('；') + '。要不换个方向，或者换一面墙？');
@@ -5269,10 +5564,20 @@
     if (!nd) { ai('这扇门挪不过去，可能墙上的洞口找不到了。'); return false; }
     const rm = room || doorRoom(nd);
     ST.lastDoor = { wall: wall, at: finalAt, w: d.w, d: nd, chk: chk, room: rm };
+    if (moveReroutes) {
+      const E = window.BIM.elec;
+      (d._reroutes || []).forEach(cid => { if (E && E.undoReroute) E.undoReroute(cid); });
+      const ids = [];
+      moveReroutes.forEach(p => { if (p && p.ok && p.c && E) { E.applyReroute(p.c, p.hole, p); ids.push(p.c.id); } });
+      if (ids.length) nd._reroutes = ids;
+      showHoleConflict(wall, moveReroutes.map(p => p.c), moveReroutes);
+    } else if (d._reroutes) {
+      nd._reroutes = d._reroutes;
+    }
     if (rm) rememberDoor(rm, wantSide || null, d.w, d.h);
     const sp = doorSpot(wall, finalAt);
     S.markDoorSpot(wall, finalAt, d.w, d.h, true);
-    if (rm) focusSoft(rm);
+    if (rm) focusSoft(rm, { color: false });
     if (!S.inView(wall.floor, sp.x - 1.6, sp.y - 1.6, sp.x + 1.6, sp.y + 1.6)) S.focusDoor(wall, finalAt, rm);
 
     pushUndo('把门挪回原来的位置', () => {
@@ -5284,14 +5589,25 @@
     const head = changedWall
       ? '门换到' + (room ? N.SIDE_CN[wantSide] + '墙' : '新的一面墙') + '上了，'
       : (moved < 0.05 ? '门还在原来那儿，' : '门沿墙挪了 ' + moved.toFixed(2) + ' 米，');
-    ai('挪好了：' + head + (note ? note : (chk.warns && chk.warns.length ? chk.warns[0] + '。' : '通道还够宽。')));
-    lastData = { width: d.w, height: d.h, moved_m: +moved.toFixed(2), changedWall: changedWall, at: +finalAt.toFixed(2) };
+    ai('挪好了：' + head + (note ? note : (chk.warns && chk.warns.length ? chk.warns[0] + '。' : '通道还够宽。')) +
+      (moveReroutes ? '墙里那 ' + moveReroutes.length + ' 根线管按新位置重新绕了一次，绿色是改完的走向。' : ''));
+    lastData = { width: d.w, height: d.h, moved_m: +moved.toFixed(2), changedWall: changedWall,
+                 at: +finalAt.toFixed(2), rerouted: moveReroutes ? moveReroutes.length : 0 };
     return true;
   }
 
   async function stepDoorSize(step) {
     const d = resolveDoor(step);
-    if (!d) { ai('现在没有可改的门。'); return false; }
+    if (!d) {
+      if (ST.openingAmb && ST.openingAmb.kind === 'door') {
+        const L = ST.openingAmb.list;
+        ai('「' + (step.door || '') + '」这个名字底下有 ' + L.length + ' 扇门，得先认准哪一扇。选一个，我接着按原话改：');
+        askWhichOpening('door', L, dd => stepDoorSize(Object.assign({}, step, { door: dd.id })));
+        return false;
+      }
+      ai('现在没有可改的门。先用鼠标点一下那扇门，或者说是哪一间。');
+      return false;
+    }
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) return false;
     const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
@@ -5333,10 +5649,26 @@
     const nd = S.replaceDoor(d, { at: best.at, w: best.w, h: nh });
     if (!nd) { ai('洞口改不回来，先撤回再试。'); return false; }
     const chk = best.chk;
+    /* 洞口宽了，原来为这扇门改道的线管要按**新洞口**重新绕一次：
+       绕行折线的两条"竖腿"落在洞口两侧，洞口变宽它们就落进洞里了。
+       先把旧的改线记录撤掉，再按新洞口重牵，最后挂到新门身上（撤门时还要用）。 */
+    const E = window.BIM.elec;
+    let reRouted = 0;
+    if (best.needReroute && best.reroutes) {
+      (d._reroutes || []).forEach(cid => { if (E && E.undoReroute) E.undoReroute(cid); });
+      const ids = [];
+      best.reroutes.forEach(p => {
+        if (p && p.ok && p.c && E) { E.applyReroute(p.c, p.hole, p); ids.push(p.c.id); }
+      });
+      if (ids.length) { nd._reroutes = ids; reRouted = ids.length; }
+      showHoleConflict(wall, best.reroutes.map(p => p.c), best.reroutes);
+    } else if (d._reroutes) {
+      nd._reroutes = d._reroutes;      // 这次没动到那几根，原来的改线记录原样带着走
+    }
     ST.lastDoor = { wall: wall, at: best.at, w: best.w, d: nd, chk: chk, room: room };
     if (room) rememberDoor(room, null, best.w, nh);
     S.markDoorSpot(wall, best.at, best.w, nh, true);
-    if (room) focusSoft(room);
+    if (room) focusSoft(room, { color: false });
     pushUndo('把门改回 ' + before.w.toFixed(2) + '×' + before.h.toFixed(2) + ' 米', () => {
       const bak = S.replaceDoor(nd, { at: best.at, w: before.w, h: before.h });
       if (bak) ST.lastDoor = { wall: wall, at: best.at, w: before.w, d: bak, room: room };
@@ -5361,9 +5693,11 @@
         ? '原位放不下，' + (best.why || '顺墙让了 ' + moved.toFixed(2) + ' 米') + '，左侧扩 ' + growL.toFixed(2) + ' m、右侧扩 ' + growR.toFixed(2) + ' m'
         : (best.why || '两侧各扩一半') + '，左侧扩 ' + growL.toFixed(2) + ' m、右侧扩 ' + growR.toFixed(2) + ' m');
     ai('门改成 ' + best.w.toFixed(2) + ' 米宽、' + nh.toFixed(2) + ' 米高：' + note + '。开门校核通过。' +
+      (reRouted ? '墙里那 ' + reRouted + ' 根线管跟着新洞口重新绕了一次（绿色是改完的走向），不是不能改。' : '') +
       (r2 ? '这间房里的「' + eq.name + '」顺势重算了一遍，最终安全系数 ' + C.fmt(r2.K) + '（' + r2.v.word + '）。' : ''),
       (r2 ? card(r2) : '') +
-      '<div class="res ok" style="margin-top:8px"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
+      '<div class="res ok" style="margin-top:8px"><div class="res-top"><span class="k">可以开</span><span class="tag">' +
+      (reRouted ? '已改线' : '无碰撞') + '</span></div>' +
       '<div class="res-grid"><div><i>门宽</i><b>' + best.w.toFixed(2) + ' m</b></div>' +
       '<div><i>门高</i><b>' + nh.toFixed(2) + ' m</b></div>' +
       '<div><i>左侧扩</i><b>' + growL.toFixed(2) + ' m</b></div>' +
@@ -5372,7 +5706,8 @@
     if (r2) cs.push({ label: '看计算书', fn: () => openCalc() });
     cs.push({ label: '看看这扇门', fn: () => stepDoorInfo({}) });
     chips(cs);
-    lastData = { width: best.w, height: nh, moved: +moved.toFixed(2),
+    lastData = { door: nd.code || nd.name, door_id: nd.id, width: best.w, height: nh,
+                 moved: +moved.toFixed(2), rerouted: reRouted,
                  grow: [+growL.toFixed(2), +growR.toFixed(2)], k: r2 ? +C.fmt(r2.K) : null };
     return true;
   }
@@ -6248,6 +6583,7 @@
       const id = b.dataset.close;
       $(id).hidden = true;
       if (id === 'pTopo') endFlowVisual();                 // 影响面板一关，流向跟着收
+      if (id === 'pCalc') endCalcPlate();                  // 计算书一关，那块蓝板也收掉
       if (id === 'pTree') { const tb = document.querySelector('#toolbar button[data-k="tree"]'); if (tb) tb.classList.remove('on'); }
     });
     $('fileEquip').onchange = e => {

@@ -1093,6 +1093,22 @@
     };
   };
 
+  /* 门能不能拓，"卡在墙里有线管"这件事要单独看：
+     线管是**能处理**的 —— 上翻/下翻绕过去就行（E.planReroute 会给方案）。
+     真正拓不动的只有结构性问题：墙角墙垛、框架柱、顶到梁、原有门窗、配电箱。
+     以前这里一把梭，只要 C.door 报 block 就当"拓不了"，于是
+     "开门时已经牵过线、过一会儿想再改宽"会被判成碰撞 ——
+     用户原话："开门后如果再改尺寸，会判断成不能改，涉及到了碰撞，实际上并没有"。
+     现在：只剩线管挡着、而且每根都绕得过去，就算过，只是要**再牵一次线**。 */
+  function rerouteForConduits(conduits, at, w, h, sill) {
+    const E = window.BIM && window.BIM.elec;
+    if (!E || !E.planReroute || !conduits || !conduits.length) return null;
+    const hole = { at0: at - w / 2, at1: at + w / 2, z0: sill || 0, z1: (sill || 0) + h };
+    const plans = conduits.map(c => E.planReroute(c, hole));
+    return plans.every(p => p && p.ok) ? plans : null;
+  }
+  C.rerouteForConduits = rerouteForConduits;
+
   /* 拓门方案：按「两侧各半 → 只扩余量大的一侧 → 顺墙平移 → 退而求其次的宽度」依次试，
      每个方案都过 C.door。返回第一个能过的，以及两侧余量（回执里要报给用户）。 */
   C.widenPlan = function (o) {
@@ -1102,11 +1118,26 @@
     const side = C.doorRoom({ wall: wall, at: at, w: w, room: o.room, self: o.self });
     const equipments = o.equipments || [];
     const cands = [];
-    const add = (mode, at2, w2, why) => {
+
+    /* 一处位置的完整判定：结构上过不去才算不过；只剩线管挡着就再牵一次线 */
+    const evalAt = (at2, w2) => {
       const chk = C.door({ wall: wall, at: at2, w: w2, h: h, room: o.room,
                            equipments: equipments, self: o.self });
+      if (chk.pass) return { chk: chk, pass: true, reroutes: null, needReroute: false };
+      const bl = chk.blocks || [];
+      const onlyCond = bl.length === 1 && bl[0].k === 'conduit';
+      if (onlyCond) {
+        const pl = rerouteForConduits(chk.conduits || [], at2, w2, h, 0);
+        if (pl) return { chk: chk, pass: true, reroutes: pl, needReroute: true };
+      }
+      return { chk: chk, pass: false, reroutes: null, needReroute: false };
+    };
+
+    const add = (mode, at2, w2, why) => {
+      const r = evalAt(at2, w2);
       cands.push({ mode: mode, at: +at2.toFixed(3), w: +w2.toFixed(3), h: h,
-                   chk: chk, pass: chk.pass, why: why || '' });
+                   chk: r.chk, pass: r.pass, why: why || '',
+                   reroutes: r.reroutes, needReroute: r.needReroute });
     };
 
     if (D <= 1e-6) add('sym', at, w);                       // 只改高度
@@ -1125,13 +1156,19 @@
     // 原位三个方案都不行 → 顺墙平移（但别让门跑到墙的另一头去，最多让 2 m）
     let slide = null;
     if (!cands.some(c => c.pass)) {
+      /* ignoreConduit：先只解决"位置"，线管照样由 evalAt 里的绕行方案兜住 ——
+         不然一段墙里只要有管子，suggestDoorAt 就永远给不出落点 */
       const sug = C.suggestDoorAt({ wall: wall, room: o.room, at: at, w: need, h: h,
-                                    equipments: equipments, self: o.self });
-      if (sug && sug.check && sug.check.pass && Math.abs(sug.at - at) <= 2.0) {
-        slide = { mode: 'slide', at: +sug.at.toFixed(3), w: need, h: h,
-                  chk: sug.check, pass: true, why: '顺墙让 ' + Math.abs(sug.at - at).toFixed(2) + ' 米',
-                  shift: +(sug.at - at).toFixed(3) };
-        cands.push(slide);
+                                    equipments: equipments, self: o.self, ignoreConduit: true });
+      if (sug && sug.at != null && Math.abs(sug.at - at) <= 2.0) {
+        const r = evalAt(sug.at, need);
+        if (r.pass) {
+          slide = { mode: 'slide', at: +sug.at.toFixed(3), w: need, h: h,
+                    chk: r.chk, pass: true, why: '顺墙让 ' + Math.abs(sug.at - at).toFixed(2) + ' 米',
+                    shift: +(sug.at - at).toFixed(3),
+                    reroutes: r.reroutes, needReroute: r.needReroute };
+          cands.push(slide);
+        }
       }
     }
 
@@ -1145,10 +1182,10 @@
         const tries = [[at, 'sym'], [at - d2 / 2, 'left'], [at + d2 / 2, 'right']];
         let hit = null;
         for (const [at2, mode] of tries) {
-          const chk = C.door({ wall: wall, at: at2, w: w2, h: h, room: o.room,
-                               equipments: equipments, self: o.self });
-          if (chk.pass) {
-            hit = { mode: mode, at: +at2.toFixed(3), w: w2, h: h, chk: chk, pass: true, why: '' };
+          const r = evalAt(at2, w2);
+          if (r.pass) {
+            hit = { mode: mode, at: +at2.toFixed(3), w: w2, h: h, chk: r.chk, pass: true, why: '',
+                    reroutes: r.reroutes, needReroute: r.needReroute };
             break;
           }
         }
