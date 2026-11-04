@@ -292,6 +292,113 @@ const H = t => console.log('\n' + t);
   P('净距按合并后的大板量（不再把中间那道墙当墙）', !!eq2 && Math.min(eq2.west, eq2.east) > 3,
     '左 ' + (eq2 && eq2.west) + ' / 右 ' + (eq2 && eq2.east));
 
+  /* ---------- ⑧ 打通视图：墙 30% / 牵涉分路 50% / 随墙作废的管留在原位 ---------- */
+  H('【8】打通 505+504：墙 30% 半透明、牵涉的管 50%、随墙作废那几根留在原位');
+  const rp3 = await call('open_passage', { room: '505', to: '504' });
+  await sleep(2600);
+  const hits3 = (rp3 && rp3.data && rp3.data.conduit_hit) || [];
+  const v8 = await p.evaluate(hits => {
+    const S = window.BIM.scene;
+    const g = S.ghostStat();
+    const alpha = {};
+    hits.forEach(h => { alpha[h] = +S.conduitAlphaValue(h).toFixed(2); });
+    return {
+      ghost: g, alpha: alpha, base: +S.conduitAlphaValue().toFixed(2),
+      dead: S.removedConduitStat(), on: S.conduitsOn(), floor: S.floorIsolated()
+    };
+  }, hits3);
+  P('打通成功并切到本层打通视图', !!(rp3 && rp3.data && rp3.data.passage) && v8.on && v8.floor === 5,
+    'floor=' + v8.floor + ' on=' + v8.on);
+  P('被拆的那面墙 30% 半透明', v8.ghost.length === 1 && Math.abs(v8.ghost[0].opacity - 0.30) < 0.02,
+    JSON.stringify(v8.ghost));
+  P('牵涉到的分路 50% 半透明，其余压暗到 30% 以下',
+    hits3.length > 0 && hits3.every(h => v8.alpha[h] > 0.45) && v8.base <= 0.32,
+    '牵涉 ' + JSON.stringify(v8.alpha) + ' / 其余 ' + v8.base);
+  P('随墙作废的那几段线管按 50% 留在原位（不是直接消失）',
+    !!v8.dead && v8.dead.n > 0 && Math.abs(v8.dead.alpha - 0.5) < 0.02, JSON.stringify(v8.dead));
+
+  /* ---------- ⑨ 合并板上按当前视角的前后左右放设备 ---------- */
+  H('【9】合并大板上按"当前视角的前后左右"放设备');
+  /* 镜头放在 504 西侧朝东看：屏幕右 = 南（y 小），屏幕左 = 北（y 大） */
+  await p.evaluate(() => window.BIM.scene.setCam(20.5, 18.0, -3.3, 33, 17.2, -3.3));
+  await sleep(1000);
+  const rr9 = await call('place_equipment', { room: '505和504', device: '空气压缩机', side: 'right' });
+  await sleep(2000);
+  const rl9 = await call('place_equipment', { room: '505和504', device: '空气压缩机', side: 'left' });
+  await sleep(2000);
+  const pr = (rr9 && rr9.data && rr9.data.positions && rr9.data.positions[0]) || null;
+  const pl2 = (rl9 && rl9.data && rl9.data.positions && rl9.data.positions[0]) || null;
+  P('说"放右边"就落在合并板的南半边（不再是永远回中间）', !!pr && pr[1] < 2.2, JSON.stringify(pr));
+  P('说"放左边"就落在合并板的北半边', !!pl2 && pl2[1] > 4.2, JSON.stringify(pl2));
+  P('两次落位方向相反、确实按视角分开了', !!pr && !!pl2 && (pl2[1] - pr[1]) > 3,
+    '右 ' + (pr && pr[1]) + ' / 左 ' + (pl2 && pl2[1]));
+  P('合并板上的承载按整块大板给（不是单间小板）',
+    !!(rr9 && rr9.data && rr9.data.plate && rr9.data.plate.merged) && Math.abs(rr9.data.plate.size_m[0] - 13.2) < .05,
+    JSON.stringify(rr9 && rr9.data && rr9.data.plate));
+
+  /* ---------- ⑩ 点门窗高亮 + 对话改这扇的尺寸 ---------- */
+  H('【10】点门/点窗高亮，并可按"这一扇"改尺寸');
+  const doorId = await p.evaluate(() => {
+    const M = window.BIM_MODEL, S = window.BIM.scene;
+    const wall = M.walls.find(w => w.id === (M.rooms.find(r => r.num === '501') || {}).sides.north);
+    const ds = M.doors.filter(d => d.floor === 5 && d.wall === wall.id)
+      .map(d => ({ id: d.id, at: S.doorAt(d, wall) })).sort((a, b) => a.at - b.at);
+    return ds.length ? ds[0].id : null;
+  });
+  const selD = await call('select_opening', { kind: 'door', name: doorId });
+  await sleep(1500);
+  const hlD = await p.evaluate(() => window.BIM.scene.openingHighlightOf());
+  P('选中一扇门就在场景里出高亮框', !!(selD && selD.data) && !!hlD && hlD.tag === 'door',
+    JSON.stringify(hlD));
+  const szD = await call('resize_door', { width: 1.15 });
+  await sleep(1800);
+  P('不报门名，直接改的是"刚点中的那一扇"',
+    !!(szD && szD.ok !== false && szD.data && Math.abs(szD.data.width - 1.15) < 0.01),
+    JSON.stringify(szD && szD.data));
+  const selW = await call('select_opening', { kind: 'window', room: '505', floor: 5 });
+  await sleep(1400);
+  const hlW = await p.evaluate(() => window.BIM.scene.openingHighlightOf());
+  P('选中一扇窗也出高亮框', !!(selW && selW.data) && !!hlW && hlW.tag === 'window', JSON.stringify(hlW));
+  const szW = await call('resize_window', { width: 2.0 });
+  await sleep(1800);
+  P('窗也能按"这一扇"改尺寸（不用先重新开一扇）',
+    !!(szW && szW.data && Math.abs(szW.data.size.w - 2.0) < 0.01), JSON.stringify(szW && szW.data));
+
+  /* ---------- ⑪ 搬不进门：把这块板上每一扇门都列出来，任选一扇拓 ---------- */
+  H('【11】放不进门时，打通的两间各一扇门都列出来，任选一扇拓');
+  const dp = await p.evaluate(() => {
+    const ST = window.BIM.state, C = window.BIM.calc, M = window.BIM_MODEL;
+    const e = ST.placed.filter(x => x.floor === 5).slice(-1)[0];
+    const pd = C.passDoor({ room: M.rooms.find(r => r.num === '505'), equip: e });
+    return {
+      ok: pd.ok, needW: pd.needW,
+      doors: (pd.candidates || []).map(c => ({ n: c.name, r: c.roomNum, w: c.w, fit: c.fit }))
+    };
+  });
+  P('候选门覆盖打通的两间（不是只看设备所在那一间）',
+    !!dp.doors && dp.doors.length >= 2 && dp.doors.some(d => d.r === '505') && dp.doors.some(d => d.r === '504'),
+    JSON.stringify(dp.doors));
+  const wchips = await p.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#chat .chips'));
+    const last = rows.filter(r => /拓/.test(r.textContent)).slice(-1)[0];
+    return last ? Array.from(last.querySelectorAll('button')).map(b => b.textContent) : [];
+  });
+  P('回执里给出"拓哪一扇"的按钮', wchips.some(t => /拓/.test(t)) && wchips.length >= 2, wchips.join(' / '));
+  /* 点那颗真能拓的，门要真的变宽 */
+  await p.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#chat .chips')).filter(r => /拓/.test(r.textContent));
+    const last = rows[rows.length - 1];
+    const bs = Array.from(last.querySelectorAll('button')).filter(b => /^拓 /.test(b.textContent.trim()));
+    if (bs.length) bs[0].click();
+  });
+  await sleep(3200);
+  const widened = await p.evaluate(() => {
+    const M = window.BIM_MODEL;
+    const hit = M.doors.filter(d => d.floor === 5 && d.w > 1.2).map(d => ({ n: d.name, w: +d.w.toFixed(2) }));
+    return hit;
+  });
+  P('选中的那扇门被真的拓宽了', widened.length > 0 && widened.some(d => d.w >= 1.3), JSON.stringify(widened));
+
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));
   console.log(fail ? '\n❌ 失败 ' + fail + ' 项' : '\n✅ 全部通过');

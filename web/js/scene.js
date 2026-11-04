@@ -1585,6 +1585,83 @@
     scene.add(g); doorMark = g;
   };
 
+  /* ---------------- 选中的门/窗高亮 ----------------
+     用户原话："当我的鼠标点击门或者点击窗的时候 高亮，这个时候我可以通过对话的方式
+     对门、窗进行尺寸以及位置的设置"。
+     所以这里画的是"**你选中的就是这一扇**"，跟 markDoorSpot 那个红/绿门洞框
+     （表示这里能不能开）不是一回事：那个是校核结果，这个是选中态。
+     做法：洞口位置铺一块很淡的色块 + 亮边，四角再加短角标，
+     远看是一圈描边、近看能看出厚度，不会把门扇本身糊住。 */
+  let selOpenG = null, selOpenInfo = null;
+  S.clearOpeningHighlight = function () {
+    if (selOpenG) { eDispose(selOpenG); selOpenG = null; }
+    selOpenInfo = null;
+  };
+  S.openingHighlightOf = () => selOpenInfo;
+  S.highlightOpening = function (wall, at, w, h, sill, color, tag) {
+    S.clearOpeningHighlight();
+    if (!wall || at == null) return null;
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1;
+    const ux = (bx - ax) / L, uy = (by - ay) / L;
+    const c = new THREE.Color(color == null ? 0x2f7df6 : color);
+    const z0 = sill == null ? 0 : sill;
+    const pad = 0.05, th = wall.t + 0.08;
+    const cx = ax + ux * at, cy = ay + uy * at, cz = wall.base + z0 + h / 2;
+    const g = new THREE.Group();
+    g.name = 'opening-hl';
+    /* 淡色块：整扇门窗的"面" */
+    const geo = boxGeo([{ size: [w + pad * 2, h + pad * 2, th], matrix: frame(cx, cy, cz, ux, uy) }]);
+    const m = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .18, depthWrite: false, side: THREE.DoubleSide });
+    m.userData.ownMat = true;
+    const mesh = new THREE.Mesh(geo, m);
+    mesh.renderOrder = 7;
+    g.add(mesh);
+    /* 亮边：整圈的轮廓线 */
+    const lm = new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: .95, depthTest: false });
+    lm.userData.ownMat = true;
+    const ls = new THREE.LineSegments(new THREE.EdgesGeometry(geo), lm);
+    ls.renderOrder = 8;
+    g.add(ls);
+    /* 四角角标：在两个立面上各画四个短角，像取景框一样"锁住"这一扇 */
+    const tick = Math.min(0.28, Math.min(w, h) * 0.22);
+    const items = [];
+    for (let side = -1; side <= 1; side += 2) {
+      const off = (th / 2 + 0.03) * side;
+      [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sy]) => {
+        const px = cx + ux * (sx * w / 2) + (-uy) * off;
+        const py = cy + uy * (sx * w / 2) + (ux) * off;
+        const pz = cz + sy * h / 2;
+        /* 横短边 */
+        items.push({ size: [tick, 0.035, 0.035], matrix: frame(px + ux * (-sx * tick / 2), py + uy * (-sx * tick / 2), pz, ux, uy) });
+        /* 竖短边 */
+        items.push({ size: [0.035, tick, 0.035], matrix: frame(px, py, pz + (-sy * tick / 2), ux, uy) });
+      });
+    }
+    const tg = boxGeo(items);
+    const tm = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .95, depthTest: false });
+    tm.userData.ownMat = true;
+    const tickMesh = new THREE.Mesh(tg, tm);
+    tickMesh.renderOrder = 9;
+    g.add(tickMesh);
+    scene.add(g); selOpenG = g;
+    selOpenInfo = { wall: wall.id, at: at, w: w, h: h, sill: z0, tag: tag || null };
+    return g;
+  };
+  /* 门：sill 恒为 0；窗：sill 用窗台高 */
+  S.highlightDoor = function (d, color) {
+    const wall = M.walls.find(w => w.id === d.wall);
+    if (!wall) return null;
+    const at = S.doorAt(d, wall);
+    return S.highlightOpening(wall, at, d.w, d.h, 0, color, 'door');
+  };
+  S.highlightWindow = function (d, color) {
+    const wall = M.walls.find(w => w.id === d.wall);
+    if (!wall) return null;
+    const at = S.windowAt(d, wall);
+    return S.highlightOpening(wall, at, d.w, d.h, d.sill || 0, color, 'window');
+  };
+
   /* ---------------- 四周净距的虚框标注 ----------------
      问"这台设备旁边还有多少空间"时，在楼板上画出四块虚框色带：
      设备轮廓（蓝虚线）+ 四条从设备边铺到墙的余量带（带宽就是净距）+
@@ -2562,29 +2639,92 @@
   S.clearConduitMarks = function () {
     if (eHitG) { eDispose(eHitG); eHitG = null; }
     S.clearReroute();
+    S.clearRemovedConduits();
     S.clearIsolate();
   };
 
+  /* 随墙作废的旧线管（整面墙拆掉时那几根）。
+     ★ 这里修的是"打通后墙体区域的管线看不到"的根因：
+       demolish 之后 elec.rebuild() 会按新墙形重新生成线管 —— 墙没了，
+       埋在墙里的那几段自然也就不再生成，屏幕上"这堵墙原来串了哪几路"彻底消失。
+       所以把拆除**之前**抓下来的那几段按 50% 半透明留在原位，
+       再描一圈虚线，读作"这几根已经作废，但原来就走在这儿"。 */
+  let eDeadG = null;
+  S.clearRemovedConduits = function () {
+    if (eDeadG) { eDispose(eDeadG); eDeadG = null; }
+  };
+  S.showRemovedConduits = function (list, alpha) {
+    S.clearRemovedConduits();
+    if (!list || !list.length) return null;
+    const D = E() && E().data;
+    if (!D) return null;
+    const a = alpha == null ? 0.5 : alpha;
+    const per = {};
+    list.forEach(c => {
+      const one = eItemOf(c, { grow: 1.2 });
+      if (!one) return;
+      (per[c.circuit] = per[c.circuit] || []).push(one);
+    });
+    const g = new THREE.Group();
+    g.name = 'elec-dead';
+    Object.keys(per).forEach(cid => {
+      const circ = D.circuits.find(x => x.id === cid) || {};
+      const col = new THREE.Color(circColor(circ));
+      const geo = boxGeo(per[cid]);
+      const mat = new THREE.MeshBasicMaterial({
+        color: col, transparent: true, opacity: a, depthWrite: false, side: THREE.DoubleSide
+      });
+      mat.userData.ownMat = true;
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.renderOrder = 4;
+      g.add(mesh);
+      const lm = new THREE.LineDashedMaterial({
+        color: 0xffffff, transparent: true, opacity: .5, dashSize: .14, gapSize: .11
+      });
+      lm.userData.ownMat = true;
+      const ls = new THREE.LineSegments(new THREE.EdgesGeometry(geo), lm);
+      ls.computeLineDistances();
+      ls.renderOrder = 5;
+      g.add(ls);
+    });
+    if (!g.children.length) return null;
+    /* 自检用：作废管画了几段、按多大透明度 */
+    g.userData = { n: list.length, alpha: a, circs: Object.keys(per) };
+    scene.add(g); eDeadG = g;
+    return g;
+  };
+  S.removedConduitStat = () => (eDeadG ? eDeadG.userData : null);
+
   /* 让整批线管半透明：打通/拆墙的时候，用户要的是"看得见哪几根要改道"，
      而不是只留那几根、其它全消失 —— 只留几根时根本判断不出这堵墙在电气系统里的位置。
-     a=1 恢复原样；a<1 时同时把穿透光罩关掉（半透明的管子再罩一层会糊成一片）。 */
+     a=1 恢复原样；a<1 时同时把穿透光罩关掉（半透明的管子再罩一层会糊成一片）。
+
+     per 是"按分路单独给透明度"：{L5A:0.5, L5C:0.5}。
+     用户的原话是"涉及到的管线显示 50% 半透明"—— 被这面墙打断的那几路才是 50%，
+     其余分路压到 28% 当背景。整层一律 50% 的话，满屏都是同样亮的管子，
+     反而看不出"到底哪几根要改道"。 */
   let eAlpha = 1;
-  S.conduitAlpha = function (a) {
+  S.conduitAlpha = function (a, per) {
     eAlpha = (a == null ? 1 : Math.max(0.12, Math.min(1, a)));
     Object.keys(eByCirc).forEach(id => {
       const it = eByCirc[id];
+      const v = (per && per[id] != null) ? Math.max(0.12, Math.min(1, per[id])) : eAlpha;
       it.mat.transparent = true;
-      it.mat.opacity = eAlpha;
-      it.mat.depthWrite = eAlpha > 0.9;
+      it.mat.opacity = v;
+      it.mat.depthWrite = v > 0.9;
       it.mat.needsUpdate = true;
-      if (it.glow && eAlpha < 0.95) it.glow.material.opacity = 0;
+      if (it.glow) it.glow.material.opacity = (v < 0.95 || eAlpha < 0.95) ? 0 : it.glow.material.opacity;
     });
     if (eIsoG) eIsoG.children.forEach(m => {
       if (m.material) { m.material.transparent = true; m.material.opacity = eAlpha; m.material.needsUpdate = true; }
     });
     return eAlpha;
   };
-  S.conduitAlphaValue = () => eAlpha;
+  /* 自检用：不传 = 整批默认值；传分路 = 这一路现在多透明 */
+  S.conduitAlphaValue = cid => {
+    if (cid && eByCirc[cid]) return eByCirc[cid].mat.opacity;
+    return eAlpha;
+  };
   S.conduitsOn = () => eOn;
 
   /* 改线后的新走向：沿墙面画一条折线，穿透显示。
@@ -2662,8 +2802,11 @@
     return g;
   };
 
-  /* 单面墙临时半透明（开洞前看墙里有什么），可批量 */
+  /* 单面墙临时半透明（开洞前看墙里有什么），可批量。
+     30% 是用户点名的口径："中间墙 30% 半透明" —— 既要看清墙里的管子，
+     又要还能认出这面墙在哪儿、有多长（14% 时墙几乎消失，看着像已经拆完了）。 */
   const ghosted = [];
+  const GHOST_OPACITY = 0.30;
   S.ghostWall = function (wall, on) {
     const mesh = wallMeshById[wall.id];
     if (!mesh) return;
@@ -2671,7 +2814,7 @@
       if (mesh.userData.solidMat) return;
       mesh.userData.solidMat = mesh.material;
       const m = mesh.material.clone();
-      m.transparent = true; m.opacity = .14; m.depthWrite = false;
+      m.transparent = true; m.opacity = GHOST_OPACITY; m.depthWrite = false;
       m.side = THREE.DoubleSide;
       mesh.material = m;
       ghosted.push(wall.id);
@@ -2686,6 +2829,14 @@
     }
   };
   S.ghostWalls = function (walls, on) { (walls || []).forEach(w => S.ghostWall(w, on)); };
+  /* 自检用：现在哪几面墙被压成半透明、各自多少透明度。
+     回归要断言"打通/开门/开窗时这面墙是 30%"，不能只靠截图看。 */
+  S.ghostStat = function () {
+    return ghosted.map(id => {
+      const m = wallMeshById[id];
+      return { id: id, opacity: (m && m.material) ? m.material.opacity : null };
+    });
+  };
   S.clearGhostWalls = function () {
     ghosted.slice().forEach(id => {
       const w = M.walls.find(x => x.id === id);

@@ -851,6 +851,17 @@
       width: a.width || 1.5, height: a.height || 1.5, sill: a.sill == null ? .9 : a.sill, pref: a.pref || null
     }),
     remove_window: a => ({ act: 'windowoff', window: a.window || null, room: a.room || null, floor: a.floor || null }),
+    query_window: a => ({ act: 'wininfo', window: a.window || null, room: a.room || null, floor: a.floor || null }),
+    resize_window: a => ({
+      act: 'winsize', window: a.window || null, room: a.room || null, floor: a.floor || null,
+      width: a.width != null ? +a.width : null,
+      height: a.height != null ? +a.height : null,
+      sill: a.sill != null ? +a.sill : null
+    }),
+    select_opening: a => ({
+      act: 'opening', kind: a.kind || null, name: a.name || null,
+      room: a.room || null, side: a.side || null, floor: a.floor || null
+    }),
     move_window: a => ({
       act: 'winmove', window: a.window || null, room: a.room || null, floor: a.floor || null,
       dir: a.direction || null, dist: a.distance != null ? Math.abs(+a.distance) : null

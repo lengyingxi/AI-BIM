@@ -28,8 +28,8 @@
   T.guide = [
     '【能力范围】你能对模型做的全部操作都在工具里，分三类：',
     '· 设备：增 place_equipment｜删 remove_equipment｜改 resize_equipment｜替换 replace_equipment｜移动 move_equipment｜查 query_equipment、query_clearance、list_devices｜找房 find_rooms_for_equipment｜引导 suggest_positions',
-    '· 门：增 open_door｜删 remove_door｜改 resize_door｜移动 move_door｜查 query_door、list_doors',
-    '· 窗：增 open_window｜删 remove_window｜移动 move_window（挪位置/改窗台高）',
+    '· 门：增 open_door｜删 remove_door｜改尺寸 resize_door｜移动 move_door｜查 query_door、list_doors｜选中 select_opening(kind=door)',
+    '· 窗：增 open_window｜删 remove_window｜改尺寸 resize_window｜移动 move_window｜查 query_window｜选中 select_opening(kind=window)',
     '· 墙：打通/拆墙 open_passage（mode=cut 打一个洞，mode=demolish 整段拆）｜查墙里埋了什么 query_conduits',
     '· 电：查分路 query_circuits（main_switch=true 报总开关）｜断/合分路 toggle_circuit（main_switch=true 操总开关）',
     '· 视图与拓扑：整体聚焦 focus_floor｜聚焦房间/设备 focus_view｜看管线 show_conduits｜看回路走向 view_circuit｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
@@ -39,6 +39,10 @@
     '  · "往左/往右""沿着墙挪""挪到墙中间" → move_window(direction=left/right/center)，沿着墙滑；',
     '  · 用户转过镜头之后，"往左"永远是他在屏幕上看到的左——你只传 left，不要自己算成 east/west。',
     '  · 挪不动（压墙角、贴到别的门窗、顶到梁）时系统会返回原因，照实说，并给"往反方向挪 / 抬低一点 / 把窗做矮"这类可选动作，不要硬试。',
+    '【门窗可以被"选中"，然后只改这一扇】用户在场景里用鼠标点门或点窗，系统会自动把它选中并高亮（青色取景框）；也可以调 select_opening 主动选中。',
+    '  · 选中之后用户说"这扇门/这扇窗"，指的就是它：改尺寸走 resize_door / resize_window，挪位置走 move_door / move_window，**都不传 door/window 编号**，系统会作用在当前选中的那一扇上；',
+    '  · 改尺寸 = 洞口原地变大变小（resize_window 传 width/height/sill），挪位置 = 整扇平移（move_window），这两件事别混着做；',
+    '  · 用户说"太窄了搬不进去"→ 先 resize_door 拓到设备需要的宽度，不要说"这扇门改不了"；拓不动会返回两侧余量和卡在哪。',
     '【墙里埋着线管——开洞前必须先想到这一层】建筑图不画预埋线管，但现场是实打实埋在墙里的。开窗、开门、打穿都会先自动查一遍：',
     '  · 结果里如果出现 conduit_hit（撞到的分路号）、rerouted>0（已改线）、moved>0（顺墙挪位），说明这个洞不是"想开就开"的；',
     '  · 回答时讲清三件事：撞的是哪一路（照明/插座/动力）、怎么处理了（改道多走几米 / 顺墙挪了几米）、备选是什么；',
@@ -49,6 +53,11 @@
     '  · 外墙在这栋楼里同时是承重墙，系统会直接拒绝，照实说"承重墙不能拆"，并建议改内隔墙或只开个门，不要反复试；',
     '  · 挖洞（cut）时系统保证上方留过梁（不能挖到顶），above_m 就是留了多少；整面拆（demolish）时 above_m=0，返回里 demolish=true，别再说"上面留了过梁"；',
     '  · 回复里要带上"连通到哪一间"和"还要补什么"（过梁/构造柱/消防分区/隔声），这些都在返回的 warns 里。',
+    '【打通以后：两块楼板合并成一块，设备按合并板放、按合并板算】这不是"还在两间房里各放各的"：',
+    '  · 打通后 system 会自动把连通的两间当成**一块整板**（中间那道墙不再当支座，跨度按整块板算）。放设备时 room 传任意一间都行，也可以直接说"放这两间中间"，落位默认为合并板正中；',
+    '  · 承重返回里会出现 plate：{merged:true, size_m:[长,宽], rooms:[房号…], K, verdict}，这就是**按合并板重新校核**的结果。回复时必须讲"按合并后的 X×Y 米大板校验，安全系数 K"，不要说成单间小板；',
+    '  · 用户说"放左边/右边/靠镜头这边"→ 照样传 side（left/right/front/back），系统按**合并后这块大板**的前后左右算，不要说"合并后没有方向感"；',
+    '  · 设备放进去但搬不进门时，返回里有 door_pass：{need_w, doors:[{door, id, room, w, h, fit}…]}，列出这块板上**每一间各一扇**的门。把这些门和各自需要的宽度说清楚，让用户自己挑一扇拓（用户原话"可以任意选择一个打通房间其中一个走廊的门进行建议拓宽"），挑定了就把那扇门的 id 传给 resize_door 的 door 参数；不要只盯着设备所在那一间的门。',
     '【配电拓扑——不是"每间房顶上一根照明管"，是四级配电】颜色固定：照明黄 / 插座蓝 / 动力红。',
     '  · 走向：主干立管（电气竖井里，从楼下直通楼上，一条不断）→ 层进线到每层配电箱 AL-层号（贴墙挂在电气间）→ 箱顶六路引上、水平搭到本层桥架 → 走廊干线（吊顶桥架里，沿走廊两侧整段横铺，比支线粗、三条分路分层敷设）→ 房间支线（从走廊在墙里竖向下引，进房间后沿四周墙走一圈）。',
     '  · 所以吊顶里的干线（2.6~3.0 m）普通门洞根本够不着，真正会被开洞撞的是房间支线：贴地的插座管 0.32 m、动力支线 2.35 m；讲冲突时要把这个区别说清楚，别让用户以为"这面墙动不得"。',
@@ -105,7 +114,7 @@
       type: 'function',
       function: {
         name: 'place_equipment',
-        description: '【设备·增】把设备放到房间楼板上并做承重校核。用户说"放/摆/安装/搬进来/加一台"时用。返回放置结果、安全系数、还能不能再加。',
+        description: '【设备·增】把设备放到房间楼板上并做承重校核。用户说"放/摆/安装/搬进来/加一台"时用。返回放置结果、安全系数、还能不能再加。★ 房间已经被打通时（两块板连成一块），承重按**合并后的大板**校核，返回里带 plate:{merged,size_m,rooms,K,verdict}；用户说"放到这两间中间"就传任意一间或把两间房号一起写进 room，落位默认为合并板正中；说"放左边/右边/靠镜头这边"照常传 side，系统按合并大板换算。放得下但搬不进门时返回 door_pass，里面列出这块板上每一间各一扇的门，让用户挑一扇拓。',
         parameters: {
           type: 'object',
           properties: {
@@ -355,6 +364,57 @@
     {
       type: 'function',
       function: {
+        name: 'query_window',
+        description: '【窗·查】查某间房或某扇窗的现状：编号、洞口宽高、窗台高、离墙角还剩多少、所在墙与楼层。用户问"这扇窗多大/窗台多高/还有多少余地"时用。只查不改。',
+        parameters: {
+          type: 'object',
+          properties: {
+            window: { type: 'string', description: '窗编号；省略则按 room 查' },
+            room: { type: 'string', description: '房号' },
+            floor: { type: 'integer', description: '楼层' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'resize_window',
+        description: '【窗·改尺寸】把**已经存在的某一扇窗**改宽/改高/改窗台高，洞口原地不动。用户说"把这扇窗加宽到2米""窗高改成1.2米""窗台抬到1.1米""这个窗太大了缩小点"时用。★ 改位置走 move_window，改尺寸走这个，两者不要混。省略 window 时作用于**用户刚用鼠标点中的那一扇**（点了窗会高亮）。会自动校核压墙角、撞柱、撞梁、贴上别的门窗和管线；开不了会返回卡在哪、并给出能开的尺寸。',
+        parameters: {
+          type: 'object',
+          properties: {
+            window: { type: 'string', description: '窗编号；省略=当前点中的那一扇 / 最近操作的那扇' },
+            width: { type: 'number', description: '改完的窗宽（米），不改就不传' },
+            height: { type: 'number', description: '改完的窗高（米），不改就不传' },
+            sill: { type: 'number', description: '改完的窗台高（米），不改就不传' },
+            room: { type: 'string', description: '房号，可选' },
+            floor: { type: 'integer', description: '楼层，可选' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'select_opening',
+        description: '【门窗·选中】把某一扇门或窗选中并高亮，之后说"这扇门/这扇窗"就都指它。用户在场景里点了门或窗（已经自动选中）、或者用户说"选中 306 的门""把 505 那扇窗选出来"时用。返回这扇门/窗的编号、洞口尺寸、窗台高、所在房间。选中之后紧接着可以调 resize_door / move_door / resize_window / move_window，不传门名也会作用在它身上。',
+        parameters: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['door', 'window'], description: '选门还是选窗' },
+            name: { type: 'string', description: '门/窗编号，如 M1021；省略则按 room + side 找' },
+            room: { type: 'string', description: '房号' },
+            side: { type: 'string', enum: sideEnum, description: '哪面墙上的一扇，可用 left/right/front/back 表示屏幕方向' },
+            floor: { type: 'integer', description: '楼层' }
+          },
+          required: ['kind']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'remove_door',
         description: '【门·删】拆掉一扇自己开的门（原有门只能说明不能拆）。用户说"把这个门撤了/封起来/不要这个门"时用。',
         parameters: {
@@ -526,7 +586,7 @@
       type: 'function',
       function: {
         name: 'open_passage',
-        description: '【墙·拆/穿】把两间房打通。"打通"= 把这面墙整段去掉（mode=demolish，默认），不是墙上开个小洞；只有用户明说"打个洞/开个口子/挖个洞"才是 mode=cut。会自动判承重（外墙一律拒绝）、查墙内线管；挖洞时线管能改道就改道，整面拆时墙里的线管随墙作废（返回 conduit_hit 里列出，需从吊顶重新敷设）。返回拆除/洞口尺寸、above_m、连通到哪一间、demolish 是否为 true。★ 用户点明了隔壁房间号（"和 202 打通""这两间连起来"）就传 to、**不要传 side** —— 系统自己取两间共用的那面墙；只有用户指着某一个方向说"这面墙拆了"才传 side。两个都传时 side 会被忽略。',
+        description: '【墙·拆/穿】把两间房打通。"打通"= 把这面墙整段去掉（mode=demolish，默认），不是墙上开个小洞；只有用户明说"打个洞/开个口子/挖个洞"才是 mode=cut。会自动判承重（外墙一律拒绝）、查墙内线管；挖洞时线管能改道就改道，整面拆时墙里的线管随墙作废（返回 conduit_hit 里列出，需从吊顶重新敷设）。执行后场景会切到打通视图：被拆的墙 30% 半透明、这块板上被牵涉的分路 50% 半透明（其余分路压暗）、随墙作废的那几段线管按 50% 留在原位并描虚线，两块楼板按一块整板算。返回拆除/洞口尺寸、above_m、连通到哪一间、demolish 是否为 true。★ 用户点明了隔壁房间号（"和 202 打通""这两间连起来"）就传 to、**不要传 side** —— 系统自己取两间共用的那面墙；只有用户指着某一个方向说"这面墙拆了"才传 side。两个都传时 side 会被忽略。',
         parameters: {
           type: 'object',
           properties: {

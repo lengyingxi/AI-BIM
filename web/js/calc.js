@@ -485,24 +485,48 @@
     const M = window.BIM_MODEL;
     const room = o.room, eq = o.equip;
     if (!room || !eq) return { ok: true, door: null, needW: 0, needH: 0 };
-    let doors = (M.doors || []).filter(d => d.floor === room.floor && (d.rooms || []).indexOf(room.id) >= 0);
+    /* 打通以后，隔壁那间靠走廊的门也是这间房的入口 ——
+       设备最终落在一块板上，从哪扇门搬进来都算数。
+       以前只查 room 自己的门：505+504 打通后，504 那扇大门明明能过，
+       还判"搬不进"，然后只肯拓 505 自己那扇 1.0 m 的小门。 */
+    const pl = C.plateOf(room);
+    const rs = (pl && pl.merged) ? (pl.rooms || []).slice() : [];
+    if (!rs.some(r => r.id === room.id)) rs.push(room);
+    const ids = rs.map(r => r.id);
+    let doors = (M.doors || []).filter(d => d.floor === room.floor && (d.rooms || []).some(id => ids.indexOf(id) >= 0));
     // 先用"门确实在这段墙上"筛；一条都没有时才退回原列表（宁可量错也别当成没门）
-    const exact = doors.filter(d => doorInRoom(d, room));
+    const exact = doors.filter(d => rs.some(r => doorInRoom(d, r)));
     if (exact.length) doors = exact;
     const packW = Math.min(eq.w, eq.d);
     const needW = +(Math.ceil((packW + 0.12) * 20) / 20).toFixed(2);   // 取 5 cm 整数档
     const needH = +(Math.ceil((eq.h + 0.08) * 20) / 20).toFixed(2);
+    /* 每扇候选门都标出"它是哪间房的门"：用户点选拓哪一扇时才说得清 */
+    const cands = doors.map(d => {
+      const via = rs.find(r => doorInRoom(d, r)) || null;
+      return {
+        door: d, id: d.id, name: d.name, w: d.w, h: d.h,
+        wall: d.wall, room: via ? via.id : null, roomNum: via ? via.num : null,
+        fit: d.w + 1e-6 >= needW && d.h + 1e-6 >= needH
+      };
+    });
     if (!doors.length) {
-      return { ok: false, why: 'no-door', door: null, needW: needW, needH: needH, packW: packW };
+      return {
+        ok: false, why: 'no-door', door: null, needW: needW, needH: needH, packW: packW,
+        candidates: [], plate: (pl && pl.merged) ? pl : null
+      };
     }
-    // 多扇门时按"最宽的那扇"当搬运通道（真实搬运也是挑大门走）
-    const door = doors.slice().sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];
+    /* 有能过的就挑"能过里面最窄的那扇"（动得最少）；
+       一扇都不够，才拿最宽的那扇出来量怎么拓 —— 真实搬运也是挑大门走。 */
+    const fit = cands.filter(c => c.fit).sort((a, b) => a.w - b.w);
+    const door = fit.length ? fit[0].door
+      : doors.slice().sort((a, b) => (b.w * b.h) - (a.w * a.h))[0];
     const okW = door.w + 1e-6 >= needW;
     const okH = door.h + 1e-6 >= needH;
     return {
       ok: okW && okH, why: okW ? (okH ? 'ok' : 'height') : 'width',
       door: door, doorW: door.w, doorH: door.h,
-      needW: needW, needH: needH, packW: packW, count: doors.length
+      needW: needW, needH: needH, packW: packW, count: doors.length,
+      candidates: cands, plate: (pl && pl.merged) ? pl : null
     };
   };
 
