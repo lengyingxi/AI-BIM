@@ -661,8 +661,14 @@
     } else if (opt.json !== false) {
       body.response_format = { type: 'json_object' };
     }
-    // 默认不要思维链：推理型模型（qwen3-max 这类）光想就要十几秒到两分钟
-    if (opt.think !== true) body.enable_thinking = false;
+    /* 默认不要思维链。qwen3.8 / qwen3-max 这类推理模型**只认 chat_template_kwargs 里的开关**，
+       顶层的 enable_thinking 会被直接忽略 —— 结果预算全花在"想"上：
+       finish_reason=length、content 是空的、tool_calls 也没有，屏幕上就是"模型不回话"。
+       两个都发：认哪个用哪个，认不了的会在 400 分支里被摘掉。 */
+    if (opt.think !== true) {
+      body.enable_thinking = false;
+      body.chat_template_kwargs = { enable_thinking: false };
+    }
     body.max_tokens = opt.maxTokens || 600;
 
     const t0 = Date.now();
@@ -722,6 +728,9 @@
           opt.tools = null; delete body.tools; delete body.tool_choice; delete body.parallel_tool_calls;
           if (opt.json !== false) body.response_format = { type: 'json_object' };
           note = '这个模型不认 tools，改用结构化步骤'; continue;
+        }
+        if (body.chat_template_kwargs && /chat_template_kwargs|enable_thinking|unrecognized|unknown|not supported|extra|invalid/i.test(low)) {
+          delete body.chat_template_kwargs; note = '这个服务不认 chat_template_kwargs，已去掉'; continue;
         }
         if (body.enable_thinking !== undefined && /enable_thinking|thinking|unrecognized|unknown|not supported|extra|invalid/i.test(low)) {
           delete body.enable_thinking; note = '这个服务不认 enable_thinking，已去掉'; continue;

@@ -761,6 +761,7 @@
       resize_door: '改门尺寸', query_door: '查门', list_doors: '列门',
       open_window: '开窗', remove_window: '拆窗', move_window: '挪窗',
       focus_view: '聚焦看图', show_all: '显示全部', set_view: '切楼层', list_scene: '读场景',
+      focus_floor: '整体聚焦', view_circuit: '看回路走向', show_conduits: '看管线',
       toggle_valve: '开关阀门', query_impact: '查阀影响', undo_last: '撤回一步'
     };
     list.innerHTML = tools.map(t => {
@@ -2121,6 +2122,23 @@
       catch (e) { loopRes = { ok: false, err: String((e && e.message) || e) }; }
       loopQuiet = false;
 
+      /* ── "说了要动手、模型却只查了一下" ──
+         用户的原话："关闭空开这个模糊指令跟回路控制得到的结果不一致，关闭空开是没有关闭"。
+         本地说得清清楚楚是"关电"（circuitset），模型却没调 toggle_circuit，
+         回头列了一屏分路 —— 屏幕上就是"什么都没关"。
+         碰到这种情况以本地解析为准：同一句话按同一个执行器跑，结果才一致。 */
+      if (loopRes && loopRes.ok && loopRes.calls > 0 && A.local) {
+        const lp0 = A.local(text);
+        const wantAct = (lp0.steps || []).some(s => s.act === 'circuitset' || s.act === 'valve');
+        const onlyQuery = (loopRes.trace || []).length > 0
+          && loopRes.trace.every(t => /^(query_|list_)/.test(t.name));
+        if (wantAct && onlyQuery) {
+          sayBuf = []; chipQ = []; lastSay = ''; lastHtml = '';   // 模型"只查"的那一屏不再重复展示
+          loopRes = null;
+          plan = lp0;                                            // 直接按本地解析执行，不再问模型第二遍
+        }
+      }
+
       if (loopRes && loopRes.ok && loopRes.calls > 0) {
         stopTyping(typing); busy = false;
         window.BIM._lastPlan = {
@@ -2275,6 +2293,9 @@
     showall: async () => stepShowAll(),
     undo: async () => stepUndo(),
     view: async step => stepView(step),
+    floorview: async step => stepFocusFloor(step),
+    conduitsview: async step => stepShowConduits(step),
+    circview: async step => stepCircuitView(step),
     info: async step => stepInfo(step),
     ask: async step => stepAsk(step),
     impact: async step => stepImpact(step),
@@ -3216,36 +3237,23 @@
     return true;
   }
 
-  async function stepToggleCircuit(step) {
+  /* 从一句话/一组参数里定位到某一条分路。断电路、看回路走向两条路径共用，
+     免得"关空开"和"看空开"对同一句话找出两个不同的回路来。 */
+  function resolveCircuit(step, floor, room, txt) {
     const E = window.BIM.elec;
-    if (!E) { ai('电路这一层没加载起来。'); return false; }
-    const A = window.BIM.agent;
-    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
-    const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
-    const wantOff = step.power === 'off' || step.action === 'close' || step.action === 'off';
-    const txt = step.text || '';
-
-    /* ── 总开关分支 ──
-       总开关（进线断路器）管整层六路，分路只管自己那一路，这是两层控制，不能混。
-       不加这道拦截，说"把 2 楼总闸拉下来"会掉进下面按分路找路的逻辑 ——
-       结果只断了随机某一路，用户以为整层黑了，其实只停了一类。 */
-    const isMain = step.mainSwitch === true
-      || (!step.circuit && !step.circuitNo && !step.kind
-        && /总开关|总闸|总断路|总电源|进线开关|进线断路|整层断电|整层停|全层断电|这一层全停|一层全停/.test(txt));
-    if (isMain) return await stepMainSwitch(step, floor);
-
-    /* 找路：给了 id 用 id；说了"第几回路"按编号找；否则按房间 + 类型匹配。
-       现场是按编号叫的（"2 楼第一个回路"），不是按 L2A 叫的。 */
+    if (!E) return null;
+    txt = txt || '';
     let circ = null;
     if (step.circuit) circ = E.circuit(step.circuit) || E.circuit(String(step.circuit).toUpperCase());
+    if (!circ && step.circuitNo) circ = E.circuitByNo(floor, step.circuitNo);
     if (!circ) {
-      const no = step.circuitNo || (() => {
-        const m = txt.match(/第\s*([一二三四五六1-6])\s*回/)
-          || txt.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/)
-          || txt.match(/第\s*([一二三四五六1-6])\s*(?:个|只|路|号)?\s*(?:空开|空气开关|电闸|闸刀|断路|开关)/);
-        return m ? (N.CN_NUM ? N.CN_NUM[m[1]] : ({ 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }[m[1]] || +m[1])) : null;
-      })();
-      if (no) circ = E.circuitByNo(floor, no);
+      const m = txt.match(/第\s*([一二三四五六1-6])\s*回/)
+        || txt.match(/回(?:路)?\s*([一二三四五六1-6])(?!\d)/)
+        || txt.match(/第\s*([一二三四五六1-6])\s*(?:个|只|路|号)?\s*(?:空开|空气开关|电闸|闸刀|断路|开关)/);
+      if (m) {
+        const no = N.CN_NUM ? N.CN_NUM[m[1]] : ({ 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }[m[1]] || +m[1]);
+        if (no) circ = E.circuitByNo(floor, no);
+      }
     }
     if (!circ) {
       const kind = step.kind || (/照明|灯/.test(txt) ? 'light'
@@ -3268,6 +3276,30 @@
         }
       }
     }
+    return circ || null;
+  }
+
+  async function stepToggleCircuit(step) {
+    const E = window.BIM.elec;
+    if (!E) { ai('电路这一层没加载起来。'); return false; }
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
+    const wantOff = step.power === 'off' || step.action === 'close' || step.action === 'off';
+    const txt = step.text || '';
+
+    /* ── 总开关分支 ──
+       总开关（进线断路器）管整层六路，分路只管自己那一路，这是两层控制，不能混。
+       不加这道拦截，说"把 2 楼总闸拉下来"会掉进下面按分路找路的逻辑 ——
+       结果只断了随机某一路，用户以为整层黑了，其实只停了一类。 */
+    const isMain = step.mainSwitch === true
+      || (!step.circuit && !step.circuitNo && !step.kind
+        && /总开关|总闸|总断路|总电源|进线开关|进线断路|整层断电|整层停|全层断电|这一层全停|一层全停/.test(txt));
+    if (isMain) return await stepMainSwitch(step, floor);
+
+    /* 找路：给了 id 用 id；说了"第几回路"按编号找；否则按房间 + 类型匹配。
+       现场是按编号叫的（"2 楼第一个回路"），不是按 L2A 叫的。 */
+    const circ = resolveCircuit(step, floor, room, txt);
     if (!circ) {
       ai((room ? room.num + ' 这间' : floor + ' 楼') + ' 找不到对应的分路。要不要先看看有哪些分路？');
       chips([
@@ -3552,6 +3584,63 @@
   }
 
   function implicitRoomNums(rooms) { return (rooms || []).map(r => r.num); }
+
+  /* ── 工具 view_circuit：把某一路的走向单独画出来（只看走向，不改通断） ── */
+  async function stepCircuitView(step) {
+    const E = window.BIM.elec;
+    if (!E) { ai('电路这一层没加载起来。'); return false; }
+    const A = window.BIM.agent;
+    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    const floor = step.floor != null ? step.floor : (room ? room.floor : (A.mem.ctx.floor || S.focus || 1));
+    const circ = resolveCircuit(step, floor, room, step.text || '');
+    if (!circ) {
+      ai(floor + ' 楼找不到对应的分路。先说"列这层分路"看看有哪几路，或者直接告诉我第几回路。');
+      return false;
+    }
+    showCircuitImpact(circ.id);
+    return true;
+  }
+
+  /* ── 工具 focus_floor：整体聚焦到某一层（0 = 回到全楼） ──
+     聚焦后本层实心、其它楼层和顶梁 50% 半透明（不隐藏），管线只画本层。
+     具体透明度都在 scene.js 的 applyBody 里算，这里只负责切楼层和说话。 */
+  async function stepFocusFloor(step) {
+    const lv = Math.max(0, Math.min(6, +step.floor || 0));
+    ST.focus = lv;
+    S.setFocus(lv);
+    S.clearHighlight && S.clearHighlight();
+    finishMode(); paintFloors();
+    ai(lv
+      ? '聚焦到 ' + lv + ' 楼：本层实心，其它楼层和顶梁压成 50% 半透明保留体量，管线只画 ' + lv + ' 楼这一层。'
+      : '回到全楼视角：所有楼层和顶梁都出来了，管线按当前开关显示全部。', null, false);
+    return true;
+  }
+
+  /* ── 工具 show_conduits：看管线（全部 / 某层 / 收起） ── */
+  async function stepShowConduits(step) {
+    const sc = step.scope || 'floor';
+    if (sc === 'off') {
+      S.showConduits(false);
+      ai('管线收起来了。', null, false);
+      return true;
+    }
+    if (sc === 'all') {
+      /* 看全部管线：先把视角退回全楼，整栋楼压到 20% 半透明（楼体还在，不是不显示） */
+      ST.focus = 0;
+      S.setFocus(0);
+      S.showConduits(true);
+      finishMode(); paintFloors();
+      ai('显示全部楼层的管线：整栋楼压到 20% 半透明做背景，六路分路的管子都在上面跑。', null, false);
+      return true;
+    }
+    const lv = Math.max(1, Math.min(6, +(step.floor || S.focus || 1)));
+    ST.focus = lv;
+    S.setFocus(lv);
+    S.showConduits(true);
+    finishMode(); paintFloors();
+    ai('只看 ' + lv + ' 楼的管线：别的楼层的管子已经收起来，其它楼层保留 50% 半透明。', null, false);
+    return true;
+  }
 
   /* 查一面墙里到底埋了什么。开洞前先看一眼，比开了再撞上强 */
   async function stepConduits(step) {
@@ -5786,6 +5875,12 @@
         mainSwitch: a.main_switch === true, scope: a.main_switch === true ? 'floor' : undefined
       }),
       query_conduits: a => runTool({ act: 'conduits', text: '', room: a.room, floor: a.floor, side: a.side }),
+      focus_floor: a => runTool({ act: 'floorview', text: '', floor: a.floor == null ? 0 : a.floor }),
+      view_circuit: a => runTool({
+        act: 'circview', text: '', circuit: a.circuit, room: a.room, floor: a.floor,
+        circuitNo: a.circuit_no, circuitSub: a.circuit_sub, kind: a.kind
+      }),
+      show_conduits: a => runTool({ act: 'conduitsview', text: '', scope: a.scope, floor: a.floor }),
 
       /* ---- 视图 / 拓扑 ---- */
       focus_view: a => runTool({

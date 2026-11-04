@@ -493,18 +493,64 @@
     flyTo(v.p, v.t);
   };
 
-  /* ---------------- 楼层聚焦（去掉多余遮挡） ---------------- */
-  /* 只看一层：别的楼层**整块不画**（不是压暗成虚影）。
-     用户在"断一路看回路"时说的是"回路并没有去掉其他楼层的管线"——
-     压到 7% 的虚影在浅色背景上照样看得见，再叠上别层的墙/板/设备，
-     屏幕上就是一团分不清是谁的管线。看回路就要干净：只留本层。 */
+  /* ---------------- 楼层聚焦 ----------------
+     用户的纠正："查看楼层的时候不要隐藏墙体，只是 50% 半透明墙体，并且把顶梁也 50% 半透明"。
+     原来聚焦是把别的楼层直接 visible=false —— 屏幕上整栋楼像被削掉一截，
+     上面只剩几根管线在飘，看着像模型坏了。现在改成半透明：
+     本层不透明看得清，别的楼层和顶梁留 50% 的体量，眼前还是一栋完整的楼。 */
   let floorOnly = 0;
+
+  /* 楼体透明度统一口径（三档）：
+     · 全楼正常      → 全不透明
+     · 聚焦某一层    → 本层不透明，别层 50% 半透明（不隐藏）
+     · 看所有管线    → 整栋 20% 半透明（楼体还在，不是不显示）
+     本层在看管线时也压到 50% —— 不压就看不见埋在墙里的暗管（用户口径就是 50%）。 */
+  const ROOF_BASE = .34;
+
+  /* 顶梁（屋顶那层板/梁）可能是单个 Mesh，也可能是 detail 层返回的一整组 ——
+     直接写 roof.material 在"组"的情况下会炸（material 是 undefined）。 */
+  function roofMats() {
+    const out = [];
+    if (!roof) return out;
+    if (roof.isMesh && roof.material) { (Array.isArray(roof.material) ? roof.material : [roof.material]).forEach(m => out.push(m)); return out; }
+    roof.traverse(o => {
+      if (!o.material) return;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => out.push(m));
+    });
+    return out;
+  }
+  function setRoofOpacity(v) {
+    if (!roof) return;
+    roof.visible = true;
+    roofMats().forEach(m => {
+      m.opacity = v;
+      m.transparent = v < .999;
+      m.depthWrite = v > .6;
+      m.needsUpdate = true;
+    });
+  }
+
+  function applyBody() {
+    const lv = S.focus || 0;
+    const allXray = !!S.xray && lv === 0;
+    floorGroups.forEach(f => {
+      const on = lv !== 0 && f.level === lv;
+      let v;
+      if (allXray) v = .2;
+      else if (lv === 0) v = 1;
+      else v = on ? (S.xray ? .5 : 1) : .5;
+      f.g.visible = true;                    // 墙体一律留着，不再整层藏掉
+      setBodyOpacity(f.mats, v);
+    });
+    setRoofOpacity(allXray ? .2 : (lv === 0 ? ROOF_BASE : .5));   // 顶梁跟着一起半透明
+  }
+  S.applyBody = applyBody;
+
   S.isolateFloor = function (level) {
     floorOnly = level || 0;
-    floorGroups.forEach(f => {
-      f.g.visible = floorOnly ? (f.level === floorOnly) : (S.focus === 0 || f.level <= S.focus);
-    });
-    if (roof) roof.visible = !floorOnly && S.focus === 0;
+    eFloorOnly = floorOnly;                 // 管线只跟楼层有关：看哪层就只画哪层的管
+    eApplyVis();
+    applyBody();
     if (D() && D().apply) D().apply();
     syncPanels();
   };
@@ -530,15 +576,15 @@
     if (level !== lastFocusLevel) { hideTip(); lastFocusLevel = level; }
     floorGroups.forEach(f => {
       const on = level !== 0 && f.level === level;
-      f.g.visible = level === 0 || f.level <= level;
       f.labels.forEach(l => l.visible = on && !l.userData.hidden);
       (f.own || []).forEach(m => { m.visible = on && S.ductsOn; });
       if (f.equips) f.equips.forEach(e => { e.visible = on; });
-      setOpacity(f.mats, level === 0 ? 1 : (on ? 1 : .07));
     });
-    if (roof) roof.visible = level === 0;
+    /* 管线跟楼层走：聚焦 3F 就只画 3F 的管；全楼视角才画全部 */
+    eFloorOnly = level || 0;
+    eApplyVis();
+    applyBody();
     if (D() && D().apply) D().apply();       // 吊顶/家具跟着聚焦一起显隐
-    if (S.xray) S.setXray(true);
     /* 配电箱按楼层跟着走：切到 2F 就只留 2F 那只箱子。
        少了这一步，从 2F 切到 3F 时 2F 的箱子还挂在半空中。 */
     syncPanels();
@@ -560,6 +606,22 @@
 
   function setOpacity(mats, v) {
     Object.values(mats).forEach(m => {
+      const base = m.userData.baseOpacity == null ? 1 : m.userData.baseOpacity;
+      m.opacity = base * v;
+      m.transparent = v < .999 || base < 1;
+      m.depthWrite = v > .6;
+      m.needsUpdate = true;
+    });
+  }
+
+  /* 只压"楼体"这几样：墙、楼板、梁、柱、门。
+     吊顶/家具/风管/玻璃不参与 —— 半透明的物件越多，深度排序和重绘越贵，
+     而用户说的"50% 半透明的墙体和顶梁"本来也不包括桌椅吊顶。 */
+  const BODY_KEYS = ['wallExt', 'wallInt', 'slab', 'col', 'beam', 'door'];
+  function setBodyOpacity(mats, v) {
+    BODY_KEYS.forEach(k => {
+      const m = mats[k];
+      if (!m) return;
       const base = m.userData.baseOpacity == null ? 1 : m.userData.baseOpacity;
       m.opacity = base * v;
       m.transparent = v < .999 || base < 1;
@@ -1483,18 +1545,11 @@
 
   /* ---------------- 透视 / 门位标记 ---------------- */
   S.xray = false;
+  /* 看管线时把楼体压透明。具体压成多少由 applyBody 统一算：
+     全楼视角看所有管线 → 整栋 20%；聚焦某层看管线 → 本层 0.42、别层 50%。 */
   S.setXray = function (on) {
     S.xray = on;
-    floorGroups.forEach(f => {
-      const v = S.focus === 0 ? 1 : (f.level === S.focus ? 1 : .07);
-      ['wallExt', 'wallInt'].forEach(k => {
-        const m = f.mats[k];
-        m.opacity = (on ? .13 : 1) * v;
-        m.transparent = on || v < 1;
-        m.depthWrite = !on && v > .6;
-        m.needsUpdate = true;
-      });
-    });
+    applyBody();
   };
 
   let doorMark = null;
@@ -1708,6 +1763,54 @@
   let eRoot = null, ePanels = null, eHitG = null, eIsoG = null;
   let eByCirc = {};                 // circId -> { mat, ghost }
   let eOn = false;
+  /* 管线的可见性只由两件事决定：看哪一层（eFloorOnly，0=全部）和在看哪一路（eSoloCid）。
+     以前只看"电气层开没开"，切到 3F 时 1~5 层的管子照样全画出来，
+     叠在一起根本分不清哪根是本层的 —— 用户的原话是"管线只跟楼层有关"。 */
+  let eFloorOnly = 0, eSoloCid = null;
+
+  function eApplyVis() {
+    if (!eRoot) return;
+    eRoot.visible = eOn && !eIsoG;          // 有隔离组时，整批让位
+    const D = E() && E().data;
+    Object.keys(eByCirc).forEach(id => {
+      const it = eByCirc[id];
+      const circ = D ? (D.circuits.find(c => c.id === id) || {}) : {};
+      const okFloor = !eFloorOnly || circ.floor === eFloorOnly;
+      const okSolo = !eSoloCid || id === eSoloCid;
+      it.mesh.visible = okFloor && okSolo;
+      if (it.glow) it.glow.visible = !!(eSoloCid && okSolo && okFloor);
+    });
+  }
+  S.conduitFloor = () => eFloorOnly;
+
+  /* 调试/自动化用：当前墙体与管线的呈现统计（回归脚本靠它断言，
+     免得去翻 three.js 内部状态） */
+  S.bodyVis = function () {
+    const out = { focus: S.focus || 0, xray: !!S.xray, roof: null, floors: {} };
+    floorGroups.forEach(f => {
+      const m = f.mats.wallExt;
+      out.floors[f.level] = { visible: f.g.visible, opacity: +(m.opacity || 1).toFixed(3), beam: +(f.mats.beam.opacity || 1).toFixed(3) };
+    });
+    if (roof) {
+      const ms = roofMats();
+      const op = ms.length ? Math.min.apply(null, ms.map(m => m.opacity)) : null;
+      out.roof = { visible: roof.visible, opacity: op == null ? null : +op.toFixed(3), parts: ms.length };
+    }
+    return out;
+  };
+  S.conduitVis = function () {
+    const D = E() && E().data;
+    const out = { on: eOn, floor: eFloorOnly, solo: eSoloCid, root: !!(eRoot && eRoot.visible), byFloor: {}, shown: 0, total: 0 };
+    Object.keys(eByCirc).forEach(id => {
+      const it = eByCirc[id];
+      const circ = D ? (D.circuits.find(c => c.id === id) || {}) : {};
+      const k = circ.floor || 0;
+      if (!out.byFloor[k]) out.byFloor[k] = { all: 0, on: 0 };
+      out.byFloor[k].all++; out.total++;
+      if (it.mesh.visible) { out.byFloor[k].on++; out.shown++; }
+    });
+    return out;
+  };
 
   S.elecOn = () => eOn;
   const EC = () => (E() ? E().COLOR : {
@@ -1719,7 +1822,8 @@
   const circColor = circ => {
     if (!circ) return EC().off;
     if (E() && E().colorOf) return E().colorOf(circ);
-    return circColor(circ);
+    /* 兜底不能写回 circColor(circ) —— 那是自己调自己，一路栈溢出 */
+    return EC()[circ.kind] || EC().light;
   };
 
   function eDispose(g) {
@@ -1887,6 +1991,7 @@
     root.visible = eOn;
     scene.add(root);
     eRoot = root;
+    eApplyVis();
   }
   S.rebuildElec = eBuild;
 
@@ -2230,12 +2335,14 @@
   }
 
 
-  /* 显示/隐藏墙内线管。开的时候自动把墙压成半透明，不然什么都看不见 */
+  /* 显示/隐藏墙内线管。开的时候自动把楼体压成半透明，不然什么都看不见。
+     ★ 管线只跟楼层有关：打开时跟着当前聚焦层过滤，全楼视角才画全部。 */
   S.showConduits = function (on) {
     eOn = !!on;
     if (eOn && !eRoot) eBuild();
     if (eOn && !ePanels) ePanelBuild();
-    if (eRoot) eRoot.visible = eOn;
+    if (eOn) eFloorOnly = S.focus || floorOnly || 0;
+    eApplyVis();
     /* 配电箱不跟电气层开关走 —— 它是真装在墙上的设备，关掉"看管线"也得留着。
        这里只按当前楼层重算显隐。 */
     syncPanels();
@@ -2276,7 +2383,7 @@
   };
   S.clearIsolate = function () {
     if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
-    if (eRoot && eOn) eRoot.visible = true;
+    eApplyVis();
   };
   S.hasIsolate = () => !!eIsoG;
 
@@ -2287,12 +2394,12 @@
     S.clearIsolate();
     const D = E() && E().data;
     if (!D) return;
+    eSoloCid = cid || null;
     Object.keys(eByCirc).forEach(id => {
       const it = eByCirc[id];
       const on = !cid || id === cid;
       const circ = D.circuits.find(c => c.id === id) || {};
       const live = cid ? on : (circ.on !== false);
-      it.mesh.visible = on;
       it.mat.opacity = 1;
       it.mat.transparent = true;
       it.mat.depthWrite = true;
@@ -2301,11 +2408,9 @@
       it.mat.emissive.setHex(live ? (circColor(circ)) : 0x000000);
       it.mat.emissive.multiplyScalar(cid && on ? .8 : .45);
       it.mat.needsUpdate = true;
-      if (it.glow) {
-        it.glow.visible = !!(cid && on);
-        it.glow.material.opacity = cid && on ? .30 : 0;
-      }
+      if (it.glow) it.glow.material.opacity = cid && on ? .30 : 0;
     });
+    eApplyVis();          // 显隐统一由这里定：看哪一层 + 看哪一路
   };
 
   /* 断电的分路在图上变灰：不切断也能看出"这几间现在是没电的"。

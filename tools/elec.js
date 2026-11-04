@@ -770,20 +770,26 @@ const H = t => { console.log('\n' + t); };
     const off0 = flowTex ? flowTex.offset.x : null;
     /* 轮询等它动：单帧抖动（掉帧/GC）不该被判成"没在流" */
     let off1 = off0, tries = 0;
-    while (flowTex && off1 === off0 && tries < 14) {
-      await new Promise(r => setTimeout(r, 120));
+    /* 软件渲染（headless swiftshader）只有 1~2 帧/秒，一帧的位移约 0.2，
+       所以要给足等待窗口；真机上 60 帧，一次就动。 */
+    while (flowTex && off1 === off0 && tries < 30) {
+      await new Promise(r => setTimeout(r, 130));
       off1 = flowTex.offset.x; tries++;
     }
     let sprites = 0;
     S.root().traverse(o => { if (o.isSprite) sprites++; });
     const c = E.circuit('L2B');
-    /* 只显本层：别的楼层整块不画（不是压暗） */
+    /* 楼层呈现：墙体一律留着（别的楼层 50% 半透明），管线只画本层 ——
+       用户明确要求"查看楼层不要隐藏墙体，只是 50% 半透明"+"管线只跟楼层有关"。 */
     const floorVis = {};
     S.root().children.forEach(g => { if (/^F\d$/.test(g.name)) floorVis[g.name] = g.visible; });
+    const body = S.bodyVis ? S.bodyVis() : null;
+    const cvis = S.conduitVis ? S.conduitVis() : null;
     return {
       isolated: S.hasIsolate(), meshes: meshes, outOfFloor: bad,
       flowMeshes: flowMeshes, flowMoves: off0 != null && off1 != null && off1 !== off0,
       sprites: sprites, floorVis: floorVis, floorOnly: S.floorIsolated ? S.floorIsolated() : null,
+      body: body, cvis: cvis,
       focus: S.focus,
       circOn: c.on, othersLive: E.list(2).filter(x => x.id !== 'L2B').every(x => x.live !== false),
       floorAll: E.conduitsOf({ floor: 2 }).length,
@@ -798,10 +804,19 @@ const H = t => { console.log('\n' + t); };
   P('流向贴在管子材质上（流动条纹，不是飘在空中的光点）',
     d13c.flowMeshes > 0 && d13c.flowMoves === true,
     d13c.flowMeshes + ' 条分路的管身挂着条纹，纹理 offset 在推进；场景里 Sprite 共 ' + d13c.sprites + ' 个（都是房间号标签）');
-  P('只显本层：别的楼层整块不画（不是压暗成虚影）',
-    d13c.floorOnly === 2 && d13c.floorVis.F2 === true &&
-    Object.keys(d13c.floorVis).filter(k => k !== 'F2').every(k => d13c.floorVis[k] === false),
-    JSON.stringify(d13c.floorVis));
+  const bodyFl = (d13c.body && d13c.body.floors) || {};
+  const otherFloor = Object.keys(bodyFl).filter(k => k !== '2');
+  P('别的楼层墙体不隐藏，压成 50% 半透明',
+    d13c.floorOnly === 2 && otherFloor.length > 0 &&
+    otherFloor.every(k => bodyFl[k].visible === true && Math.abs(bodyFl[k].opacity - .5) < .02),
+    otherFloor.map(k => 'F' + k + ':' + bodyFl[k].opacity + '/' + bodyFl[k].visible).join(' '));
+  P('顶梁也在，并且 50% 半透明',
+    !!d13c.body && !!d13c.body.roof && d13c.body.roof.visible === true &&
+    d13c.body.roof.opacity != null && Math.abs(d13c.body.roof.opacity - .5) < .02,
+    JSON.stringify(d13c.body && d13c.body.roof));
+  P('管线只跟楼层有关：本层画、别层一根不画',
+    !!d13c.cvis && Object.keys(d13c.cvis.byFloor).every(k => (k === '2' ? d13c.cvis.byFloor[k].on > 0 : d13c.cvis.byFloor[k].on === 0)),
+    JSON.stringify(d13c.cvis && d13c.cvis.byFloor));
   P('镜头推到本层配电箱', d13c.focus === 2, 'focus=' + d13c.focus);
 
   /* 13d. 问"两个房间能不能打通"：只有那面墙半透明，别的墙还是实心的 */

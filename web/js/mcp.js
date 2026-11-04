@@ -32,7 +32,7 @@
     '· 窗：增 open_window｜删 remove_window｜移动 move_window（挪位置/改窗台高）',
     '· 墙：打通/拆墙 open_passage（mode=cut 打一个洞，mode=demolish 整段拆）｜查墙里埋了什么 query_conduits',
     '· 电：查分路 query_circuits（main_switch=true 报总开关）｜断/合分路 toggle_circuit（main_switch=true 操总开关）',
-    '· 视图与拓扑：聚焦 focus_view｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
+    '· 视图与拓扑：整体聚焦 focus_floor｜聚焦房间/设备 focus_view｜看管线 show_conduits｜看回路走向 view_circuit｜还原 show_all｜切层 set_view｜读场景 list_scene｜阀门 toggle_valve、query_impact｜撤回 undo_last',
     '【方向语义】用户说的左/右/前/后/上/下 都是他当前屏幕的方向，你只传 left/right/front/back/up/down，系统按相机换算；只有明说东/南/西/北才传 east/south/west/north。选墙的 side 同理——"左边那面墙开个门"就传 left，别自己换算成 west，用户转过镜头之后会开错墙。"开窗"走 open_window，参数和 open_door 一样多一个 sill（窗台高）；用户说落地窗就传 sill=0.1。',
     '【挪窗——上下和左右不是一回事】窗在墙上只有两个自由度，别混：',
     '  · "往上/往下""抬高/降低""窗台高一点" → move_window(direction=up/down)，改的是窗台标高，窗宽窗高不变；',
@@ -65,6 +65,14 @@
     '  · 总开关合上以后，之前单独断开的分路**不会自动恢复**，那几间房照样没电。用户问"合了总闸怎么还不亮"，就照这个答，并让他单独合那一路；',
     '  · "这间房有几路电""这层怎么分的"→ query_circuits，只查不动手；问"总开关什么状态"→ query_circuits(main_switch=true)；',
     '  · 分路是工程概念，不要和"阀门/水路"混，水路走 toggle_valve / query_impact。',
+    '【"关空开"这种没头没尾的话——是命令，不是查询】用户盯着配电箱说"关闭空开""把电闸关了""空开断开"时，',
+    '  · 这是**要你动手**，不是让你列清单：绝不能回一个分路列表了事（那等于没关）。没指明哪一路时直接 toggle_circuit(action=off)：系统会落到本层最相关的那一路，并在回复里说清关的是第几回路、带哪几间房，再补一句"要关别的就说第几路"；',
+    '  · 只有带"哪些/几路/什么影响/会不会"这种问法才是查询走 query_circuits；带"把/关/断/停/拉"的是动作走 toggle_circuit；',
+    '  · 说了"总开关/总闸/整层"就传 main_switch=true，别落到某一路上。',
+    '【楼层、管线、透明度的呈现规矩】这几条是用户明确要求的，别自己改口径：',
+    '  · 看某一层（focus_floor）→ 本层实心，**别的楼层和顶梁是 50% 半透明，不是隐藏**，整栋楼还看得见；',
+    '  · 管线只跟楼层有关：聚焦哪层就只画哪层的管。只有用户明说"看所有管线/整栋的管"才用 show_conduits(scope=all)，这时整栋楼压到 **20% 半透明**（楼体仍然画出来）；',
+    '  · 看某一路走向用 view_circuit，它会只画这一路；别再描述成"别的楼层的管子还在"。',
     '【默认值】"一点"≈0.3 米，"半米"=0.5；没说距离给 0.4；没说数量给 1；没说什么门按 1.0×2.1 米。这些不用反问。',
     '【模糊需求】用户说"放得合适一点/你看怎么挪好/不太对"这类模糊话时，先想清楚他大概想改善什么（省地方 / 不挡门 / 靠墙整齐 / 别压梁）：调 suggest_positions，系统会自动挑最合适的位置直接放好并把备选返回，你只需用一句话说明"为什么放这儿"和"还能怎么改"。不要反问"你要放哪"，也不要只给建议不动手。',
     '【拓门】"门太窄搬不进去""门加宽到 1.5 米"都走 resize_door。系统会**分别量门洞左右两侧**还能扩多少，再决定"两侧各扩一半 / 只扩余量大的一侧 / 顺墙让一段"——不会硬按两边对半。三个方案都要过开门校核，过不了就门一个字都不改。回答要讲清：两侧各剩多少、最后往哪边扩了多少、拓完设备能不能过、以及设备在最终位置的安全系数（旁边给"看计算书"的入口）。',
@@ -583,6 +591,53 @@
             side: { type: 'string', enum: ['south', 'north', 'east', 'west', 'left', 'right', 'front', 'back'], description: '哪面墙；按镜头的话填 left 等' },
             floor: { type: 'integer', description: '楼层' }
           }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'focus_floor',
+        description: '【视图·整体聚焦】把镜头和显隐整体聚焦到某一层，或回到全楼（floor=0）。聚焦后：本层不透明看得清，**其它楼层和顶梁是 50% 半透明保留体量，不会被藏掉**（整栋楼还在），管线也只画本层的。用户说"看 3 楼""整体看这层""切到 2 楼""到这层看看""回到全楼/整栋看看"时用。注意它和 focus_view 的分工：focus_view 是聚焦到**某间房/某台设备**并可以把别的藏起来；focus_floor 只管**楼层**这一级，不动房间。',
+        parameters: {
+          type: 'object',
+          properties: {
+            floor: { type: 'integer', description: '楼层号；0 = 回到全楼（整栋，全部楼层和管线都画出来）' }
+          },
+          required: ['floor']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'view_circuit',
+        description: '【电·看回路走向】把某一条分路的完整走向单独画出来：本层主干立管 → 层配电箱 → 走廊干线 → 墙内下引 → 房间支线，别的分路整条不画，管身上有流动条纹表示电流方向，受影响的房间会高亮。用户说"看看这一路怎么走的""这条线喂哪几间""查看回路""这条路从哪到哪"时用。只画不看状态，不改通断（改通断走 toggle_circuit）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            circuit: { type: 'string', description: '分路编号，如 L3A' },
+            circuit_no: { type: 'integer', description: '本层第几个回路（空开），1~6' },
+            room: { type: 'string', description: '房号；按这间房所属的分路来找' },
+            floor: { type: 'integer', description: '楼层' },
+            kind: { type: 'string', enum: ['light', 'socket', 'power'], description: '分路类型：照明/插座/动力' },
+            circuit_sub: { type: 'integer', enum: [1, 2], description: '同类里的第几条（照明2、插座1…）' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'show_conduits',
+        description: '【电·看管线】显示或隐藏线管，并决定看哪一层的管。scope=all → 看**所有楼层**的管线，此时整栋楼压到 20% 半透明（楼体仍然画出来，不是不显示）；scope=floor → 只看某一层（默认当前聚焦层）；scope=off → 全部收起。用户说"看一下管线/把管子都显示出来/只看这层的管/关了管线"时用。★ 记住：管线只跟楼层有关，聚焦某层时永远只画那层；只有明确说"看所有管线/整栋的管"才用 scope=all。',
+        parameters: {
+          type: 'object',
+          properties: {
+            scope: { type: 'string', enum: ['all', 'floor', 'off'], description: 'all=所有楼层（楼体 20% 半透明）；floor=只看某层；off=收起' },
+            floor: { type: 'integer', description: '楼层（scope=floor 时用；省略则用当前聚焦层）' }
+          },
+          required: ['scope']
         }
       }
     }
