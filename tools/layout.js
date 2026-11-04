@@ -153,6 +153,145 @@ const H = t => console.log('\n' + t);
     P('找一面能验改线的墙', false, '模型里没有"内墙 + 埋着 2 段管"的墙');
   }
 
+  /* ---------- ④ 功能区「管线」按钮 + 悬浮图层开关 ---------- */
+  H('【4】功能区管线按钮：点一下看当前画面，悬停挑图层');
+  const pb = await p.evaluate(() => {
+    const btn = document.querySelector('#toolbar button[data-k="pipe"]');
+    const pop = document.querySelector('.pipe-pop');
+    return {
+      has: !!btn, pop: !!pop,
+      lay: pop ? pop.querySelectorAll('[data-lay]').length : 0,
+      knd: pop ? pop.querySelectorAll('[data-knd]').length : 0,
+      label: btn ? btn.innerText.trim() : ''
+    };
+  });
+  P('工具栏里多了「管线」按钮', pb.has && /管线/.test(pb.label), pb.label);
+  P('悬停浮层有 6 个管线图层 + 3 个分路开关', pb.pop && pb.lay === 6 && pb.knd === 3,
+    '图层 ' + pb.lay + ' 个、分路 ' + pb.knd + ' 个');
+
+  /* 先把电气视图关掉（前面开门/打通会把它打开），才测得准"点一下打开" */
+  await call('show_conduits', { scope: 'off' });
+  await sleep(1200);
+  await p.click('#toolbar button[data-k="pipe"]');
+  await sleep(2400);
+  const on1 = await p.evaluate(() => {
+    const S = window.BIM.scene, bv = S.bodyVis();
+    const fl = Object.keys(bv.floors).map(k => bv.floors[k]);
+    return { on: S.conduitsOn(), minOp: Math.min.apply(null, fl.map(f => f.opacity)),
+             vis: fl.filter(f => f.visible).length, btnOn: document.querySelector('#toolbar button[data-k="pipe"]').classList.contains('on') };
+  });
+  P('点一下就把当前画面的管线打开', on1.on === true && on1.btnOn === true, JSON.stringify(on1));
+  P('同时楼板/楼体压成半透明', on1.minOp <= 0.5, '最不透明的一层 ' + on1.minOp);
+
+  const boxesAll = await p.evaluate(() => Object.values(window.BIM.scene.conduitStat().byCirc).reduce((a, b) => a + b, 0));
+  await p.evaluate(() => { const pop = document.querySelector('.pipe-pop'); pop.classList.add('show'); pop.querySelector('[data-lay="room"]').click(); });
+  await sleep(2200);
+  const boxesNoRoom = await p.evaluate(() => ({
+    n: Object.values(window.BIM.scene.conduitStat().byCirc).reduce((a, b) => a + b, 0),
+    off: window.BIM.scene.conduitFilter().layer.room === 1
+  }));
+  P('关掉「房间支线」这一层，屋里那圈支线就真的不画了',
+    boxesNoRoom.off && boxesNoRoom.n > 0 && boxesNoRoom.n < boxesAll,
+    '关前 ' + boxesAll + ' 个方头 → 关后 ' + boxesNoRoom.n);
+  /* 还原，后面还要看整层管子 */
+  await p.evaluate(() => { const pop = document.querySelector('.pipe-pop'); pop.querySelector('[data-all]').click(); pop.classList.remove('show'); });
+  await sleep(1600);
+
+  /* ---------- ⑤ 每层每一路都要接到主干立管上 ---------- */
+  H('【5】红/蓝/黄各层横管都要接到竖着的主干立管');
+  const conn = await p.evaluate(() => {
+    const D = window.BIM.elec.data, M = window.BIM_MODEL, E = window.BIM.elec;
+    const ends = c => {
+      if (c.free && c.p1) return [{ x: c.p1[0], y: c.p1[1], z: c.p1[2] }, { x: c.p2[0], y: c.p2[1], z: c.p2[2] }];
+      if (c.vert) return [{ x: c.x, y: c.y, z: c.z0 }, { x: c.x, y: c.y, z: c.z1 }];
+      const w = M.walls.find(q => q.id === c.wall); if (!w) return [];
+      const a = E.axis(w);
+      return [c.at0, c.at1].map(at => ({ x: a.ax + a.ux * at, y: a.ay + a.uy * at, z: c.z }));
+    };
+    const segDist = (pt, c) => {
+      const e = ends(c); if (e.length < 2) return 99;
+      const a = e[0], b = e[1];
+      const vx = b.x - a.x, vy = b.y - a.y, vz = b.z - a.z;
+      const wx = pt.x - a.x, wy = pt.y - a.y, wz = pt.z - a.z;
+      const L2 = vx * vx + vy * vy + vz * vz;
+      let t = L2 ? (wx * vx + wy * vy + wz * vz) / L2 : 0; t = Math.max(0, Math.min(1, t));
+      return Math.hypot(wx - vx * t, wy - vy * t, wz - vz * t);
+    };
+    const out = { floors: {}, bad: [] };
+    [1, 2, 3, 4, 5].forEach(f => {
+      const list = D.conduits.filter(c => c.floor === f);
+      const corr = list.filter(c => c.layer === 'corridor');
+      const outN = list.filter(c => c.layer === 'out').length;
+      const corrDangle = corr.filter(c => ends(c).some(pt =>
+        !list.some(o => o !== c && segDist(pt, o) < 0.12))).length;
+      out.floors[f] = { corr: corr.length, out: outN, corrDangle: corrDangle };
+      if (corrDangle > 0) out.bad.push(f + 'F 有 ' + corrDangle + ' 段干线悬空');
+      if (outN < 12) out.bad.push(f + 'F 箱到桥架只有 ' + outN + ' 段');
+    });
+    out.trunk = D.conduits.filter(c => c.layer === 'trunk').length;
+    out.riserFloor = D.conduits.filter(c => c.layer === 'trunk').map(c => c.floor);
+    return out;
+  });
+  P('五层的主干立管都在，且逐层相接', conn.trunk === 5, '立管 ' + conn.trunk + ' 段（' + conn.riserFloor.join('/') + 'F）');
+  P('每层的走廊干线都接到了配电箱（不再悬在半空）', conn.bad.length === 0,
+    conn.bad.join('；') || [1, 2, 3, 4, 5].map(f => f + 'F干' + conn.floors[f].corr + '/出线' + conn.floors[f].out).join(' '));
+
+  /* ---------- ⑥ 开门回执要有"我自己点位置" ---------- */
+  H('【6】开门回执自带"我自己点位置"按钮');
+  await call('open_door', { room: '207' });
+  await sleep(2600);
+  const dchips = await p.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#chat .chips'));
+    const last = rows[rows.length - 1];
+    return last ? Array.from(last.querySelectorAll('button')).map(b => b.textContent) : [];
+  });
+  P('开门回执挂了自选位置的按钮', dchips.some(t => /我自己点位置|再挑个位置/.test(t)), dchips.join(' / '));
+  /* 点它要真进入"自己点位置"的模式（点完照样走校核 + 改线规划） */
+  await p.evaluate(() => {
+    const rows = document.querySelectorAll('#chat .chips');
+    const row = rows[rows.length - 1];
+    const b = Array.from(row.querySelectorAll('button')).find(x => /我自己点位置|再挑个位置/.test(x.textContent));
+    if (b) b.click();
+  });
+  await sleep(1600);
+  const dmode = await p.evaluate(() => ({
+    mode: window.BIM.state.mode,
+    chip: (document.getElementById('modeChip') || {}).hidden === false,
+    txt: ((document.getElementById('modeTxt') || {}).textContent || '')
+  }));
+  P('点完进入点选开门的模式', dmode.mode === 'door' && dmode.chip && /开门/.test(dmode.txt), dmode.txt);
+  await p.evaluate(() => { const c = document.getElementById('modeCancel'); if (c && !document.getElementById('modeChip').hidden) c.click(); });
+  await sleep(1200);
+
+  /* ---------- ⑦ 209+210 打通：按一整块板放设备、校核、量净距 ---------- */
+  H('【7】209+210 打通后是一块板：中间放设备 / 合并板校核 / 净距按大板量');
+  const rp2 = await call('open_passage', { room: '209', to: '210' });
+  await sleep(2400);
+  P('209 和 210 打通', !!(rp2 && rp2.data && rp2.data.passage), JSON.stringify(rp2 && rp2.data && rp2.data.passage));
+  /* 用户原话就是"放到这俩个房间中间"——两个房号一起丢给 place_equipment */
+  const rq2 = await call('place_equipment', { room: '209和210', device: '空气压缩机' });
+  await sleep(2600);
+  const eq2 = await p.evaluate(() => {
+    const e = window.BIM.state.placed[window.BIM.state.placed.length - 1];
+    const M = window.BIM_MODEL, C = window.BIM.calc;
+    const r209 = M.rooms.find(x => x.num === '209');
+    const pl = C.plateOf(r209);
+    const space = { x0: pl.x0, x1: pl.x1, y0: pl.y0, y1: pl.y1, num: r209.num, id: r209.id, floor: r209.floor, slab: r209.slab };
+    const cl = C.clearance({ room: space, equip: e, x: e.x, y: e.y, others: [] });
+    return e ? {
+      x: +e.x.toFixed(2), y: +e.y.toFixed(2),
+      merged: pl.merged, lx: +pl.lx.toFixed(2), ly: +pl.ly.toFixed(2),
+      west: +cl.west.v.toFixed(2), east: +cl.east.v.toFixed(2)
+    } : null;
+  });
+  /* 209 是 19.8~26.4，210 是 26.4~33，y 都是 9~15.6 → 合并后中间点 (26.4, 12.3) */
+  P('两个房号一起说，"中间"就是合并后这块板的中间', !!eq2 &&
+    Math.abs(eq2.x - 26.4) < 0.7 && Math.abs(eq2.y - 12.3) < 0.7, JSON.stringify(eq2));
+  P('板和板合并成 13.20×6.60', !!eq2 && eq2.merged && Math.abs(eq2.lx - 13.2) < .05 && Math.abs(eq2.ly - 6.6) < .05,
+    eq2 ? eq2.lx + '×' + eq2.ly : '');
+  P('净距按合并后的大板量（不再把中间那道墙当墙）', !!eq2 && Math.min(eq2.west, eq2.east) > 3,
+    '左 ' + (eq2 && eq2.west) + ' / 右 ' + (eq2 && eq2.east));
+
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));
   console.log(fail ? '\n❌ 失败 ' + fail + ' 项' : '\n✅ 全部通过');

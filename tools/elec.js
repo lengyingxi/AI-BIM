@@ -921,6 +921,7 @@ const H = t => { console.log('\n' + t); };
       isoMeshes: isoMeshes, wantWall: wantWall, ldRoom: ld.room, ldSide: ld.side,
       nowInWall: nowInWall,
       allConduitDrawn: eRoot ? eRoot.visible : null,
+      alpha: (S.conduitAlphaValue ? S.conduitAlphaValue() : null),
       allN: E.conduitsOf({ floor: fl }).length
     };
   });
@@ -931,11 +932,15 @@ const H = t => { console.log('\n' + t); };
       '半透明 ' + d13d.ghost.length + ' 面 / 实心 ' + d13d.solid + ' 面' +
       '（' + d13d.r1 + '↔' + d13d.r2 + ' 的共墙）' +
       ' ｜ App 回答：「' + d13d.lastTxt.slice(0, 60) + '」');
-    P('管线只留这面墙里的，其它分路全收起',
-      d13d.allConduitDrawn === false &&
-      (d13d.nowInWall > 0 ? d13d.isoMeshes > 0 : d13d.isoMeshes === 0),
-      '开洞前墙内 ' + d13d.inWall + ' 段、开洞后剩 ' + d13d.nowInWall + ' 段 → 画了 ' +
-      d13d.isoMeshes + ' 个 mesh（本层 ' + d13d.allN + ' 段已隐藏）');
+    /* 口径变了（用户第九阶段之后的新要求）：打通牵涉到管线时，
+       不再"只留墙里那几根"，而是整层管子都留着、压成半透明，
+       墙里被切断的那几根另外描红 —— 只剩几根时根本判断不出这堵墙
+       在整层配电里的位置。 */
+    P('打通时整层管线半透明留着，墙里那几根另外标红',
+      d13d.allConduitDrawn === true && d13d.isoMeshes === 0 &&
+      d13d.alpha != null && d13d.alpha <= 0.45 && d13d.alpha >= 0.1,
+      '本层 ' + d13d.allN + ' 段 × 透明度 ' + d13d.alpha +
+      '；墙里原有 ' + d13d.inWall + ' 段、开洞后剩 ' + d13d.nowInWall + ' 段（标红）');
   } else {
     console.log('  · 跳过打通用例：找不到共墙房间对');
   }

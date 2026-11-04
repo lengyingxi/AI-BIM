@@ -376,11 +376,19 @@
     if (!room || !eq) return null;
     const R = eqRect(eq, o.x, o.y, 0);
     const F = foot(eq);
+    /* 打通以后净距要按**合并后的那块板**量：中间那道墙已经没了，
+       再拿单间边界算，会把"隔壁那半边"当成墙 —— 209+210 打通后
+       设备明明两边各留 3 米，却报"贴着东墙"。 */
+    const pl = o.plate || C.plateOf(room);
+    const B = (pl && pl.merged) ? pl : room;
+    const nm = (pl && pl.merged)
+      ? (pl.rooms || []).map(r => r.num).join('、') + '（已打通）'
+      : room.num + ' 室';
     const S = {
-      west: { key: 'west', v: R.x0 - room.x0, who: room.num + ' 室西墙', cn: '左侧' },
-      east: { key: 'east', v: room.x1 - R.x1, who: room.num + ' 室东墙', cn: '右侧' },
-      south: { key: 'south', v: R.y0 - room.y0, who: room.num + ' 室南墙', cn: '南侧' },
-      north: { key: 'north', v: room.y1 - R.y1, who: room.num + ' 室北墙', cn: '北侧' }
+      west: { key: 'west', v: R.x0 - B.x0, who: nm + '西墙', cn: '左侧' },
+      east: { key: 'east', v: B.x1 - R.x1, who: nm + '东墙', cn: '右侧' },
+      south: { key: 'south', v: R.y0 - B.y0, who: nm + '南墙', cn: '南侧' },
+      north: { key: 'north', v: B.y1 - R.y1, who: nm + '北墙', cn: '北侧' }
     };
 
     const put = (k, v, who) => {
@@ -430,7 +438,7 @@
 
     return {
       room: room, equip: eq, x: o.x == null ? eq.x : o.x, y: o.y == null ? eq.y : o.y,
-      rect: R, foot: F,
+      rect: R, foot: F, plate: (pl && pl.merged) ? pl : null,
       west: S.west, east: S.east, south: S.south, north: S.north,
       face: face, faceCn: FACE_CN[face], faceV: S[face].v, faceWho: S[face].who,
       minKey: minK, minV: S[minK].v, minWho: S[minK].who, minCn: S[minK].cn,

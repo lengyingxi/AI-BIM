@@ -1547,6 +1547,23 @@
     AM.lastDoor = { room: room, side: side, w: w, h: h };
   }
 
+  /* 每条开门回执都挂一个"我自己点位置"：
+     用户经常觉得系统挑的位置不合意（要偏一点、要对着设备），点一下自己定，
+     定完照样走 holeDecision 那套校核 + 改线规划，不是"想放哪就放哪"。
+     用户原话："每次开门的时候回复都要加一个按钮提供给用户自己点击位置，
+     并进行后续的改线规划。" */
+  function doorPointChips(room, side, w, h, firstLabel) {
+    if (!room) return;
+    const one = {
+      label: firstLabel || '我自己点位置',
+      fn: () => startDoor({ room: room, side: side, width: w, doorH: h })
+    };
+    const undo = ST.lastDoor && ST.lastDoor.d
+      ? { label: '撤掉这扇门', fn: () => send('把刚才的门拆掉') }
+      : null;
+    chips(undo ? [one, undo] : [one]);
+  }
+
   function startDoor(p) {
     const room = p.room;
     if (!room) { ai('要在哪一间开？说个房间号，比如「3 楼 306」。'); return; }
@@ -1647,6 +1664,7 @@
           p.width.toFixed(2) + ' 米宽的门已经开在距墙端 ' + C.fmt(at, 2) + ' 米处。' +
           '红色是原来的管线位置，绿色是改完的新走向，绕行多走的线也补上了。',
           conduitCard(dec.hits, dec.reroutes || [], dec));
+        doorPointChips(room, sideOfWall(room, wall) || p.side, p.width, p.height, '再挑个位置');
         return;
       }
       const warnTxt = (chk.warns || []).length ? '<div class="res-adv" style="border-top:1px solid #eef1f5">' + chk.warns.map(w => '<s>·</s> ' + w).join('<br>') + '</div>' : '';
@@ -1655,6 +1673,7 @@
         '<div class="res-grid"><div><i>门宽</i><b>' + p.width.toFixed(2) + ' m</b></div>' +
         '<div><i>门高</i><b>' + p.height.toFixed(2) + ' m</b></div></div>' + warnTxt + '</div>');
       if ((chk.warns || []).length) ai(chk.warns[0] + '，先记一笔。', null, false);
+      doorPointChips(room, sideOfWall(room, wall) || p.side, p.width, p.height, '再挑个位置');
     } else {
       ST.mode = 'idle'; S.mode = 'idle';
       finishMode();
@@ -2332,7 +2351,18 @@
 
   async function stepPlace(step, auto) {
     const A = window.BIM.agent;
-    const room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null) || A.mem.ctx.room;
+    /* "放到 209 和 210 中间"会把两个房号一起塞进 room，
+       roomByNum 查不到就整条指令作废 —— 从里面捞出能认的那一间，
+       合并成一块板以后，落在哪一间其实无所谓。
+       ★ 顺序很重要：必须先认"用户明说的那间"，再退回上下文里那间。
+         以前先取 A.mem.ctx.room，刚开过 207 的门再说"放到 209、210 中间"，
+         就会拿 207 去放，设备落在隔壁房间里。 */
+    let room = step.roomRef || (step.room ? A.roomByNum(step.room, step.floor) : null);
+    if (!room && step.room) {
+      const hit = String(step.room).match(/\d{3}/);
+      if (hit) room = A.roomByNum(hit[0], step.floor);
+    }
+    if (!room) room = A.mem.ctx.room;
     if (!room) { ai('要放到哪一间？说个房间号就行，比如「2 楼 202」。'); return false; }
 
     let dev = step.device ? A.deviceByName(step.device) : null;
@@ -2357,11 +2387,14 @@
          用户原话："在打通的房间内放置设备应该默认放到两个打通的房间中间"。 */
       const sp0 = spaceOf(room);
       const space = sp0.space;
-      const pref = step.pref || (sp0.plate ? 'center' : null);
+      const merged = !!sp0.plate;
+      const pref = step.pref || (merged ? 'center' : null);
       focusSoft(space);                 // 自动聚焦到这块板，别的楼层淡出
       let last = null, okCount = 0, hostRoom = room;
       const from0 = ST.placed.length;
-      const seed = seedForSide(space, step.side, step.sideRel);
+      /* 打通以后（用户说"放到这两间中间"）就别让 side 把落位拽回某一面墙：
+         合并板上没有"靠哪面墙"这回事，中间就是中间。 */
+      const seed = merged && !step.pref ? null : seedForSide(space, step.side, step.sideRel);
       for (let i = 0; i < n; i++) {
         const spot = bestSpotFor(space, dev, pref, i === 0 ? seed : null, !!seed);
         if (!spot) break;
@@ -2501,6 +2534,9 @@
       ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
         ' 米高的门。', card2);
     }
+    /* 三个成功分支（牵线 / 挪位 / 直接开）都挂上"我自己点位置"：
+       用户要的是"每次开门回复都能自己点"。放在分支之后，省得漏。 */
+    doorPointChips(room, side, w, h);
     lastData = {
       door: d.name, room: room.num, side: side, width: w, height: h,
       at: +dec.at.toFixed(2),
@@ -2698,7 +2734,7 @@
        ③ 管线只留这面墙里的，别的分路全收起来
      这跟"显示线管"的默认行为正好相反（那道开关会把整层墙都变虚），
      所以这里每次都先 setXray(false) 把它掰回来。 */
-  function previewPassage(wall, markList) {
+  function previewPassage(wall, markList, touchedN) {
     if (!window.BIM.elec || !wall) return;
     const E = window.BIM.elec;
     const inWall = (E.conduitsOf({ wall: wall.id }) || []);
@@ -2709,8 +2745,15 @@
     S.clearGhostWalls && S.clearGhostWalls();
     S.ghostWall(wall, true);
     S.clearConduitMarks();
-    /* 空数组也调：墙里一根管都没有时，整个电气层就一根都不画 */
-    S.isolateConduits(inWall);
+    /* 打通牵涉到管线时，用户要能看清"这一层的电线是怎么走的、哪几根要改道"，
+       所以不再只留墙里那几根（只剩几根时，根本判断不出这堵墙在电气系统里的位置），
+       而是整层管子都留着、压成半透明，真正被墙打断的那几根再描红。
+       用户原话："打通墙壁的时候如果涉及到管线，需要能够把管线半透明显示"。 */
+    S.clearIsolate && S.clearIsolate();
+    /* "牵涉到管线"要按**拆之前**墙里那几根算：demolish 是先拆墙再调这里，
+       那时 inWall 已经空了；markList 就是被切断的那几根。 */
+    const touched = inWall.length || (markList && markList.length) || touchedN || 0;
+    S.conduitAlpha && S.conduitAlpha(touched ? 0.34 : 0.16);
     if (markList && markList.length) S.markConduits(markList, 0xff3b30);
     S.syncCircuitPower();
     return inWall;
@@ -3074,7 +3117,9 @@
        必须放在 refreshElec 之后：重建电气层会把隔离组一起清掉，先摆就白摆了。 */
     /* 整面拆的时候不描红那几根已经作废的线管：墙都没了，红色粗条会挂在空房间中间，
        看着像还剩一道红墙。哪几路随墙作废，卡片里逐条列了。 */
-    previewPassage(wall, whole ? [] : (dec.hits || []));
+    /* 整面拆的时候不描红那几根（墙都没了），但"涉及管线"这件事得传进去：
+       管子要半透明浮出来，才看得出这面墙在配电里串了哪几路。 */
+    previewPassage(wall, whole ? [] : (dec.hits || []), (dec.hits || []).length);
     (dec.reroutes || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
 
     /* 回复里要把"连通到哪、留了多少过梁、线管怎么处理、还要补什么"一次说清 */
@@ -3595,6 +3640,7 @@
       ['主干立管', cnt('trunk'), '段'],
       ['层进线', cnt('feed'), '段'],
       ['配电箱', 1, '台'],
+      ['箱到桥架', cnt('out'), '段'],
       ['走廊干线', cnt('corridor'), '段'],
       ['墙内下引', cnt('drop'), '处'],
       ['房间支线', cnt('room'), '段'],
@@ -3629,7 +3675,7 @@
     lastData = {
       circuit: circ.id, no: circ.no, label: circ.label,
       on: live, switch_on: ownOn, main_on: E.mainOn(circ.floor),
-      route: { trunk: cnt('trunk'), feed: cnt('feed'), corridor: cnt('corridor'), drop: cnt('drop'), room: cnt('room') },
+      route: { trunk: cnt('trunk'), feed: cnt('feed'), out: cnt('out'), corridor: cnt('corridor'), drop: cnt('drop'), room: cnt('room') },
       rooms: nums
     };
   }
@@ -5467,12 +5513,14 @@
     if (!eq) { ai('先放一台设备，或者点一下要量的那台。'); return false; }
     const room = step.roomRef || M.rooms.find(r => r.id === eq.room);
     if (!room) { ai('这台设备不在任何房间里，量不了四周净距。'); return false; }
-    const cl = C.clearance({ room: room, equip: eq, x: eq.x, y: eq.y, others: othersIn(room) });
+    /* 打通以后按合并的那块板量：中间那道墙没了，就不能再拿单间边界当墙 */
+    const space = spaceOf(room).space;
+    const cl = C.clearance({ room: space, equip: eq, x: eq.x, y: eq.y, others: othersIn(space) });
     if (!cl) { ai('这台设备的净距量不出来，换个位置再试。'); return false; }
 
     const drawn = step.show !== false;
-    if (drawn && S.showClearance) S.showClearance(room, eq, cl);
-    focusSoft(room, { tight: true });   // 一定要拉近，否则虚框上的米数看不清
+    if (drawn && S.showClearance) S.showClearance(space, eq, cl);
+    focusSoft(space, { tight: true });   // 一定要拉近，否则虚框上的米数看不清
     ST.lastClr = { room: room, eq: eq, cl: cl };
     A.mem.lastClr = cl;
 
@@ -5569,13 +5617,102 @@
     ST.flowOn = !!on.flow;
   }
 
-  /* ---------------- 工具栏（画面底部居中，只留四件事） ---------------- */
+  /* ---------------- 工具栏（画面底部居中） ---------------- */
   const ICON = {
     reset: '<svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4.5h4.5"/></svg>',
     tree: '<svg viewBox="0 0 24 24"><path d="M12 3v5"/><path d="M5 21v-4"/><path d="M19 21v-4"/><path d="M12 8H5v9"/><path d="M12 8h7v9"/><rect x="9.5" y="2.5" width="5" height="3.4" rx=".8"/></svg>',
     info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.6" r=".9" fill="currentColor" stroke="none"/></svg>',
-    equip: '<svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="11" rx="1.5"/><path d="M7 7V5h6v2"/><path d="M7 12h4"/></svg>'
+    equip: '<svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="11" rx="1.5"/><path d="M7 7V5h6v2"/><path d="M7 12h4"/></svg>',
+    pipe: '<svg viewBox="0 0 24 24"><path d="M4 20v-6a2 2 0 0 1 2-2h6"/><path d="M12 12V8"/><path d="M9 4h6v4H9z"/><path d="M4 17h0"/><circle cx="4" cy="20" r="1.4"/></svg>'
   };
+
+  /* ---------------- 管线按钮 + 悬浮图层开关 ----------------
+     用户要的是"点一下就在当前画面里看管线，楼板自己变半透明，
+     鼠标一悬停还能挑要看哪一层管子"。所以：
+       · 点击 = 开/关（跟着当前聚焦层走；全楼视角才看整栋）
+       · 悬停 = 弹出图层开关（主干立管/层进线/箱到桥架/走廊干线/墙内下引/房间支线
+                + 按分路种类过滤：照明/插座/动力）
+     开关状态存在 ST.pipeLayer / ST.pipeKind 里，切楼层、重建电气都不会被重置。 */
+  const PIPE_LAYERS = [
+    { k: 'trunk', n: '主干立管' }, { k: 'feed', n: '层进线' }, { k: 'out', n: '箱到桥架' },
+    { k: 'corridor', n: '走廊干线' }, { k: 'drop', n: '墙内下引' }, { k: 'room', n: '房间支线' }
+  ];
+  const PIPE_KINDS = [{ k: 'light', n: '照明' }, { k: 'socket', n: '插座' }, { k: 'power', n: '动力' }];
+  function pipeState() {
+    if (!ST.pipeLayer) { ST.pipeLayer = {}; PIPE_LAYERS.forEach(x => { ST.pipeLayer[x.k] = true; }); }
+    if (!ST.pipeKind) { ST.pipeKind = {}; PIPE_KINDS.forEach(x => { ST.pipeKind[x.k] = true; }); }
+    return { layer: ST.pipeLayer, kind: ST.pipeKind };
+  }
+  function applyPipeFilter() {
+    const s = pipeState();
+    if (window.BIM.scene && S.conduitFilter) {
+      S.conduitFilter({ layer: s.layer, kind: s.kind });
+      S.rebuildConduitFilter && S.rebuildConduitFilter();
+    }
+  }
+  function togglePipe(btn) {
+    const on = !(window.BIM.scene && S.conduitsOn && S.conduitsOn());
+    if (on) {
+      const f = S.focus || 0;
+      window.BIM.mcp.call('show_conduits', f ? { scope: 'floor', floor: f } : { scope: 'all' });
+      applyPipeFilter();
+      toast(f ? ('只看 ' + f + 'F 的电管，楼板压到半透明')
+        : '看整栋楼的电管，楼体压到 20% 半透明');
+    } else {
+      window.BIM.mcp.call('show_conduits', { scope: 'off' });
+      toast('收起管线');
+    }
+    if (btn) btn.classList.toggle('on', on);
+    paintPipePop();
+    return on;
+  }
+  let pipePop = null, pipeHideT = 0;
+  function paintPipePop() {
+    if (!pipePop) return;
+    const s = pipeState();
+    pipePop.querySelectorAll('[data-lay]').forEach(b => {
+      b.classList.toggle('off', !s.layer[b.dataset.lay]);
+    });
+    pipePop.querySelectorAll('[data-knd]').forEach(b => {
+      b.classList.toggle('off', !s.kind[b.dataset.knd]);
+    });
+  }
+  function buildPipePop(bar) {
+    pipePop = document.createElement('div');
+    pipePop.className = 'pipe-pop';
+    pipePop.innerHTML =
+      '<div class="pp-t">管线图层<i>关掉的层不画，其余照旧</i></div>' +
+      '<div class="pp-row">' + PIPE_LAYERS.map(x =>
+        '<button data-lay="' + x.k + '" class="on">' + x.n + '</button>').join('') + '</div>' +
+      '<div class="pp-t">按分路</div>' +
+      '<div class="pp-row">' + PIPE_KINDS.map(x =>
+        '<button data-knd="' + x.k + '" class="on">' + x.n + '</button>').join('') + '</div>' +
+      '<div class="pp-row pp-all"><button data-all="1">全部显示</button></div>';
+    bar.appendChild(pipePop);
+    pipePop.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      const s = pipeState();
+      if (b.dataset.all) {
+        PIPE_LAYERS.forEach(x => { s.layer[x.k] = true; });
+        PIPE_KINDS.forEach(x => { s.kind[x.k] = true; });
+      } else if (b.dataset.lay) {
+        s.layer[b.dataset.lay] = !s.layer[b.dataset.lay];
+      } else if (b.dataset.knd) {
+        s.kind[b.dataset.knd] = !s.kind[b.dataset.knd];
+      }
+      e.stopPropagation();
+      paintPipePop();
+      applyPipeFilter();
+    });
+    /* 悬停才出来：鼠标离开按钮和浮层都给它 260 ms 的回旋余地，
+       否则从按钮滑到浮层中间那几像素的缝里就闪没了 */
+    const show = () => { clearTimeout(pipeHideT); pipePop.classList.add('show'); paintPipePop(); };
+    const hide = () => { clearTimeout(pipeHideT); pipeHideT = setTimeout(() => pipePop.classList.remove('show'), 260); };
+    pipePop.addEventListener('mouseenter', show);
+    pipePop.addEventListener('mouseleave', hide);
+    pipePop._show = show; pipePop._hide = hide;
+  }
 
   function buildToolbar() {
     const bar = $('toolbar');
@@ -5607,6 +5744,7 @@
           toast('点一下设备、墙体、门或柱梁');
         }
       },
+      { k: 'pipe', n: '管线', hover: true, fn: (b) => togglePipe(b) },
       { k: 'equip', n: '设备', fn: openEquip }
     ];
     items.forEach(it => {
@@ -5614,8 +5752,14 @@
       b.dataset.k = it.k;
       b.innerHTML = ICON[it.k] + '<span>' + it.n + '</span>';
       b.onclick = () => it.fn(b);
+      if (it.k === 'pipe') {
+        b.classList.toggle('on', !!(window.BIM.scene && S.conduitsOn && S.conduitsOn()));
+        b.addEventListener('mouseenter', () => { if (pipePop && pipePop._show) pipePop._show(); });
+        b.addEventListener('mouseleave', () => { if (pipePop && pipePop._hide) pipePop._hide(); });
+      }
       bar.appendChild(b);
     });
+    buildPipePop(bar);
   }
 
   /* ---------------- 导入自己的 IFC ---------------- */

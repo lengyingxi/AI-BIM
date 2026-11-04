@@ -563,6 +563,8 @@
 
   S.isolateFloor = function (level) {
     floorOnly = level || 0;
+    /* 回到"全楼"= 退出打通/开门那种特殊视图，管子的半透明也该跟着恢复 */
+    if (!floorOnly && typeof eAlpha === 'number' && eAlpha < 0.99) S.conduitAlpha(1);
     eFloorOnly = floorOnly;                 // 管线只跟楼层有关：看哪层就只画哪层的管
     eApplyVis();
     applyBody();
@@ -1950,6 +1952,8 @@
     const opt = { grow: grow || 1, pipe: true };
     (list || []).forEach(c => {
       if (!D.circuits.some(x => x.id === c.circuit)) return;
+      if (cOff.layer[c.layer]) return;                 // 图层开关：这一层管子被关掉
+      if (cOff.kind[c.kind]) return;                   // 按分路种类关（照明/插座/动力）
       const it = eItemOf(c, opt);
       if (!it) return;
       /* 开了接头就必须给每个方块都带上顶点色：boxGeo 只要有一个方块带 c
@@ -1961,12 +1965,46 @@
     if (withJoints) {
       (D.joints || []).forEach(j => {
         if (!per[j.circuit]) return;          // 这条分路不在本次范围内就别画
+        /* 接头只在"交汇的那几层都关了"时才一起收起来：
+           三通一头在走廊干线、一头在墙内下引，关掉其中一层时三通还得留着 */
+        if (j.layers && j.layers.length && j.layers.every(l => cOff.layer[l])) return;
         const it = eJointItem(j);
         if (it) per[j.circuit].push(it);
       });
     }
     return per;
   }
+
+  /* ---------------- 管线图层开关 ----------------
+     功能区那个「管线」按钮悬停出来的那一排开关就落到这里：
+       cOff.layer —— 主干立管 / 层进线 / 箱到桥架 / 走廊干线 / 墙内下引 / 房间支线
+       cOff.kind  —— 照明 / 插座 / 动力
+     一改就整体重建线管几何（几百个盒子而已，重建比逐 mesh 改 visible 还简单），
+     因为一条分路的网格是按"分路"合的批，图层混在同一个 mesh 里，
+     只改 mesh.visible 根本分不出层。 */
+  const cOff = { layer: {}, kind: {} };
+  S.conduitFilter = function (f) {
+    if (f) {
+      if (f.layer) { cOff.layer = {}; Object.keys(f.layer).forEach(k => { if (!f.layer[k]) cOff.layer[k] = 1; }); }
+      if (f.kind) { cOff.kind = {}; Object.keys(f.kind).forEach(k => { if (!f.kind[k]) cOff.kind[k] = 1; }); }
+    }
+    return { layer: Object.assign({}, cOff.layer), kind: Object.assign({}, cOff.kind) };
+  };
+  S.conduitLayers = function () {
+    const D = E() && E().data;
+    const out = { layer: {}, kind: {} };
+    ((D && D.conduits) || []).forEach(c => {
+      out.layer[c.layer] = (out.layer[c.layer] || 0) + 1;
+      out.kind[c.kind] = (out.kind[c.kind] || 0) + 1;
+    });
+    return out;
+  };
+  /* 开关一变就重建：只有 eOn 时才动，别在"看管线"关着的时候白建一遍 */
+  S.rebuildConduitFilter = function () {
+    if (!eOn) return;
+    eBuild();
+    if (eIsoG) { const g = eIsoG.userData; g && (g.stale = true); }
+  };
 
   /* 按分路建一批盒子 */
   function eBuild() {
@@ -2418,6 +2456,9 @@
   };
   S.clearIsolate = function () {
     if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
+    /* 从"打通时的半透明管子"切回普通视图，透明度得跟着回来，
+       否则整层电线一直是灰扑扑的，看着像断了电 */
+    if (typeof eAlpha === 'number' && eAlpha < 0.99) S.conduitAlpha(1);
     eApplyVis();
   };
   S.hasIsolate = () => !!eIsoG;
@@ -2523,6 +2564,28 @@
     S.clearReroute();
     S.clearIsolate();
   };
+
+  /* 让整批线管半透明：打通/拆墙的时候，用户要的是"看得见哪几根要改道"，
+     而不是只留那几根、其它全消失 —— 只留几根时根本判断不出这堵墙在电气系统里的位置。
+     a=1 恢复原样；a<1 时同时把穿透光罩关掉（半透明的管子再罩一层会糊成一片）。 */
+  let eAlpha = 1;
+  S.conduitAlpha = function (a) {
+    eAlpha = (a == null ? 1 : Math.max(0.12, Math.min(1, a)));
+    Object.keys(eByCirc).forEach(id => {
+      const it = eByCirc[id];
+      it.mat.transparent = true;
+      it.mat.opacity = eAlpha;
+      it.mat.depthWrite = eAlpha > 0.9;
+      it.mat.needsUpdate = true;
+      if (it.glow && eAlpha < 0.95) it.glow.material.opacity = 0;
+    });
+    if (eIsoG) eIsoG.children.forEach(m => {
+      if (m.material) { m.material.transparent = true; m.material.opacity = eAlpha; m.material.needsUpdate = true; }
+    });
+    return eAlpha;
+  };
+  S.conduitAlphaValue = () => eAlpha;
+  S.conduitsOn = () => eOn;
 
   /* 改线后的新走向：沿墙面画一条折线，穿透显示。
      一次可能改好几根管，所以都挂到同一个组里，别互相顶掉。

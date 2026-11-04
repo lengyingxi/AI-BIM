@@ -285,6 +285,25 @@ button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit
 .toolbar button.on{background:var(--acc-2);color:var(--acc-3)}
 .toolbar button:disabled{opacity:.35;cursor:not-allowed}
 
+/* 管线按钮的悬浮图层开关：点按钮开关管线，悬停挑要看哪一层管子 */
+.pipe-pop{
+  position:absolute;left:50%;bottom:100%;transform:translate(-50%,-8px);
+  width:238px;padding:9px 10px 10px;border-radius:12px;
+  background:rgba(255,255,255,.97);backdrop-filter:blur(14px);
+  border:1px solid var(--line);box-shadow:var(--shadow);
+  opacity:0;pointer-events:none;transition:opacity .16s,transform .16s;z-index:9;
+}
+.pipe-pop.show{opacity:1;pointer-events:auto;transform:translate(-50%,-12px)}
+.pipe-pop .pp-t{display:flex;justify-content:space-between;align-items:baseline;
+  font-size:10px;color:var(--ink2);letter-spacing:.3px;margin:2px 0 6px}
+.pipe-pop .pp-t i{font-style:normal;font-size:9px;color:#98a6b3}
+.pipe-pop .pp-row{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:9px}
+.pipe-pop .pp-row button{height:23px;border-radius:7px;font-size:10px;color:var(--acc-3);
+  background:var(--acc-2);border:1px solid transparent;transition:.14s}
+.pipe-pop .pp-row button:hover{border-color:var(--acc-3)}
+.pipe-pop .pp-row button.off{color:#93a1ad;background:transparent;border-color:var(--line2);text-decoration:line-through}
+.pipe-pop .pp-row.pp-all{grid-template-columns:1fr;margin-bottom:0}
+
 .toast{
   position:absolute;left:50%;bottom:84px;transform:translate(-50%,8px);
   background:#1d2a33;color:#fff;font-size:11.5px;padding:8px 14px;border-radius:20px;

@@ -96,7 +96,7 @@
   /* 管线在拓扑里属于哪一层。原来所有线管一视同仁，看不出"主干—干线—支线"，
      加了这个字段，图例、统计、"这条管归谁"都能说清楚。 */
   E.LAYER_CN = {
-    trunk: '主干立管', feed: '层进线', corridor: '走廊干线',
+    trunk: '主干立管', feed: '层进线', out: '箱到桥架', corridor: '走廊干线',
     drop: '墙内下引', room: '房间支线'
   };
 
@@ -700,6 +700,63 @@
       if (circ.rooms.indexOf(p.room) < 0) circ.rooms.push(p.room);
     });
 
+    /* ---- ⑥b 箱到桥架：六路各自从配电箱接到自己那条走廊干线上 ----
+       以前只有"层进线"那一路（动力1）真的有线：立管 → 层进线 → 箱子。
+       其余五路（照明 1/2、插座 1/2、动力 2）的走廊干线两头全悬在墙端，
+       图上就是红/蓝/黄横管"停在半空"，看不出电是从哪儿上去的 ——
+       用户说的"到主管的路径缺乏连接"就是这个。
+       现在把配电箱出线补上：
+         箱顶 →（引上到本路桥架标高）→（水平搭到本路走廊干线，接成三通）。
+       六路沿墙各错开 7 cm 排成一小束：既不会互相 z-fighting，也像真的出线束。 */
+    D.panels.forEach(p => {
+      const dir = p.dir || [1, 0], nrm = p.n || [1, 0];
+      const bx = p.x + nrm[0] * ((p.t || 0.2) / 2 + 0.05);
+      const by = p.y + nrm[1] * ((p.t || 0.2) / 2 + 0.05);
+      const zTop = p.z + p.h / 2;
+      const mine = (p.circuits || []).map(id => byId[id]).filter(Boolean);
+      mine.forEach((c, k) => {
+        const z = E.zMain(c.kind, c.sub);
+        const off = (k - (mine.length - 1) / 2) * 0.07;
+        const px = bx + dir[0] * off, py = by + dir[1] * off;
+        /* ① 箱顶引上 */
+        if (z > zTop + 0.03) {
+          const id = 'PU-' + p.floor + '-' + c.id;
+          D.conduits.push({
+            id: id, floor: p.floor, wall: null, kind: c.kind, circuit: c.id,
+            layer: 'out', vert: true, x: px, y: py, z0: zTop, z1: z,
+            s: 0.05, d: 0.05, at0: 0, at1: 0, z: (zTop + z) / 2,
+            room: p.room, roomNum: p.roomNum, added: false
+          });
+          c.conduits.push(id);
+        }
+        /* ② 水平搭到本路走廊干线：就近取它上面的一点，端点落在管身中段就是三通 */
+        const mains = D.conduits.filter(q => q.circuit === c.id && q.layer === 'corridor' && q.wall);
+        let best = null;
+        mains.forEach(q => {
+          const w = allWalls.find(x => x.id === q.wall);
+          if (!w) return;
+          const a = axis(w);
+          const x0 = a.ax + a.ux * q.at0, y0 = a.ay + a.uy * q.at0;
+          const x1 = a.ax + a.ux * q.at1, y1 = a.ay + a.uy * q.at1;
+          const vx = x1 - x0, vy = y1 - y0, L2 = vx * vx + vy * vy;
+          let t = L2 ? ((px - x0) * vx + (py - y0) * vy) / L2 : 0;
+          t = Math.max(0, Math.min(1, t));
+          const hx = x0 + vx * t, hy = y0 + vy * t;
+          const d = Math.hypot(px - hx, py - hy);
+          if (!best || d < best.d) best = { x: hx, y: hy, d: d };
+        });
+        if (!best || best.d < 0.06) return;               // 已经贴在干线上，不用再搭
+        const id2 = 'PO-' + p.floor + '-' + c.id;
+        D.conduits.push({
+          id: id2, floor: p.floor, wall: null, kind: c.kind, circuit: c.id,
+          layer: 'out', free: true, p1: [px, py, z], p2: [best.x, best.y, z],
+          s: 0.05, d: 0.05, at0: 0, at1: 0, z: z,
+          room: p.room, roomNum: p.roomNum, added: false
+        });
+        c.conduits.push(id2);
+      });
+    });
+
     /* ---- ⑦ 接头 / 弯头 ----
        真实线管不会"一根到这儿停住、下一根从那头开始"，中间一定有直通接头、
        弯头或者接线盒。原来只画管段，拐弯的地方就是两个方头硬怼在一起，
@@ -768,8 +825,9 @@
           const q = groups[k];
           if (Math.abs(q.x - p.x) < JTOL && Math.abs(q.y - p.y) < JTOL && Math.abs(q.z - p.z) < JTOL) { g = q; break; }
         }
-        if (!g) { g = { x: 0, y: 0, z: 0, n: 0, s: 0, d: 0, tee: false }; groups.push(g); }
+        if (!g) { g = { x: 0, y: 0, z: 0, n: 0, s: 0, d: 0, tee: false, ly: {} }; groups.push(g); }
         g.n++;
+        g.ly[o.c.layer] = 1;        // 这个接头是哪几层的管交汇出来的（图层开关要用）
         g.x += (p.x - g.x) / g.n; g.y += (p.y - g.y) / g.n; g.z += (p.z - g.z) / g.n;
         g.s = Math.max(g.s, o.c.s || 0.05);
         g.d = Math.max(g.d, o.c.d || 0.05);
@@ -785,7 +843,7 @@
         D.joints.push({
           id: 'JT-' + cid + '-' + gi, floor: circ.floor, circuit: cid, kind: circ.kind,
           x: g.x, y: g.y, z: g.z, r: r, d: Math.min(r, g.d || r),
-          type: g.tee ? 'tee' : 'elbow', n: g.n
+          type: g.tee ? 'tee' : 'elbow', n: g.n, layers: Object.keys(g.ly)
         });
       });
     });
@@ -1105,7 +1163,7 @@
         /* 一条分路自己在拓扑里各层级的管段数：干线几段、支线几段。
            回答"这路是怎么走的"要用，不然只能说"带 11 间房"，说不出路径。 */
         const mine = (ready().conduits || []).filter(x => x.circuit === c.id);
-        const layers = ['trunk', 'feed', 'corridor', 'drop', 'room'].reduce((a, k) => {
+        const layers = ['trunk', 'feed', 'out', 'corridor', 'drop', 'room'].reduce((a, k) => {
           const n = mine.filter(x => x.layer === k).length;
           if (n) a[k] = n;
           return a;
@@ -1171,7 +1229,7 @@
         a[k] = D.conduits.filter(c => c.kind === k).length; return a;
       }, {}),
       /* 按拓扑层级统计：主干几根、走廊干线几根、房间支线几根，一眼看出是"树"不是"一盘散沙" */
-      by_layer: ['trunk', 'feed', 'corridor', 'drop', 'room'].reduce((a, k) => {
+      by_layer: ['trunk', 'feed', 'out', 'corridor', 'drop', 'room'].reduce((a, k) => {
         a[k] = D.conduits.filter(c => c.layer === k).length; return a;
       }, {}),
       trunk: D.trunk || null
