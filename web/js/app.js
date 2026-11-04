@@ -3327,7 +3327,9 @@
        "别的楼层的管线还在"，分不清哪根管是本层的 —— 看回路的时候必须干净。 */
     S.isolateFloor && S.isolateFloor(circ.floor);
     const floorCond = E.conduitsOf({ floor: circ.floor });
-    if (floorCond.length) S.isolateConduits(floorCond, { grow: 1.6 });
+    /* 管径、接头都跟"看所有分路"时一模一样（grow 1 + 带接头）——
+       以前这里 grow:1.6 把管子放粗、还不画接头，同一根管在两个视图里粗细不同。 */
+    if (floorCond.length) S.isolateConduits(floorCond, { grow: 1, joints: true });
     const fluxList = E.conduitsOf({ circuit: circ.id }).concat(
       floorCond.filter(c => c.layer === 'trunk' || c.layer === 'feed'));
     S.flux(fluxList, { floor: circ.floor });
@@ -3441,7 +3443,8 @@
     /* 总开关动的是整层，只留本层的管子；六路全部参与流动，
        一眼看出"这一闸管的就是这一层的这六条路"。 */
     const floorAll = E.conduitsOf({ floor: floor });
-    if (floorAll.length) S.isolateConduits(floorAll, { grow: 1.6 });
+    /* 同上：管径与接头跟"看所有分路"保持一致 */
+    if (floorAll.length) S.isolateConduits(floorAll, { grow: 1, joints: true });
     S.flux(floorAll, { floor: floor });
     S.syncCircuitPower();
 
@@ -3563,7 +3566,7 @@
       '<div class="res-adv" style="border-top:1px solid #eef1f5">' +
       '<s>·</s> 影响的房间：' + nums.slice(0, 12).join('、') + (nums.length > 12 ? ' 等 ' : '') +
       '<br><s>·</s> ' + where +
-      '<br><s>·</s> 图上只留下这一条路（本层主干立管 + 本回路），其它回路、以及别的楼层的主干都已收起；绿色地面就是受影响的房间' +
+      '<br><s>·</s> 图上只留下这一条路（本层主干立管 + 本回路），其它回路、以及别的楼层都已收起；本层墙体/梁柱 50% 半透明，绿色地面就是受影响的房间' +
       (live ? '' : (ownOn
         ? '<br><s>·</s> 这路的手柄其实还合着，是 ' + circ.floor + 'F 总开关断了才没电 —— 合总开关就整层恢复'
         : '<br><s>·</s> 这一路自己的手柄是落下的，其它两路不受影响')) +
@@ -3610,9 +3613,11 @@
     S.setFocus(lv);
     S.clearHighlight && S.clearHighlight();
     finishMode(); paintFloors();
-    ai(lv
-      ? '聚焦到 ' + lv + ' 楼：本层实心，其它楼层和顶梁压成 50% 半透明保留体量，管线只画 ' + lv + ' 楼这一层。'
-      : '回到全楼视角：所有楼层和顶梁都出来了，管线按当前开关显示全部。', null, false);
+    /* 文案跟着当前模式走：正在看管线（透视开着）时别层是收起的，
+       这时说"别的楼层 50% 半透明保留体量"就是骗人。 */
+    if (!lv) ai('回到全楼视角：所有楼层和顶梁都出来了，管线按当前开关显示全部。', null, false);
+    else if (S.xray) ai('聚焦到 ' + lv + ' 楼：其它楼层收起，' + lv + 'F 的墙体/梁柱 50% 半透明，管线只画这一层。', null, false);
+    else ai('聚焦到 ' + lv + ' 楼：本层实心，其它楼层和顶梁压成 50% 半透明保留体量，管线只画 ' + lv + ' 楼这一层。', null, false);
     return true;
   }
 
@@ -3638,7 +3643,7 @@
     S.setFocus(lv);
     S.showConduits(true);
     finishMode(); paintFloors();
-    ai('只看 ' + lv + ' 楼的管线：别的楼层的管子已经收起来，其它楼层保留 50% 半透明。', null, false);
+    ai('只看 ' + lv + ' 楼的管线：其它楼层已经收起，' + lv + 'F 的墙体、梁柱压到 50% 半透明，墙里的暗管才看得见。', null, false);
     return true;
   }
 

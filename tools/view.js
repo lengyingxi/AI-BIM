@@ -65,7 +65,11 @@ const H = t => console.log('\n' + t);
   P('回复说清了关的是第几回路、带哪几间房', /第\s*\d\s*回路/.test(say) && /间/.test(say), say.slice(0, 70));
 
   /* ---------- ② 楼层半透明 ---------- */
-  H('【2】查看楼层：墙体不隐藏，50% 半透明，顶梁也 50%');
+  H('【2】查看楼层（不看管线）：墙体不隐藏，50% 半透明，顶梁也 50%');
+  /* 上一步"关闭空开"走的是回路控制，会把透视打开（那是"看管线"的档位）。
+     这里验的是**普通聚焦楼层**，先把透视关掉，否则别层是收起的，口径不一样。 */
+  await p.evaluate(() => { window.BIM.scene.showConduits(false); window.BIM.scene.setXray(false); });
+  await sleep(300);
   await p.evaluate(() => window.BIM.scene.setFocus(3, false));
   await sleep(700);
   let s = await state();
@@ -86,16 +90,27 @@ const H = t => console.log('\n' + t);
   await sleep(400);
   P('focus_floor 能切层', r1 && r1.ok !== false && (await state()).focus === 2, JSON.stringify(r1).slice(0, 100));
   const r2 = await call('view_circuit', { floor: 2, circuit_no: 3 });
-  await sleep(600);
+  await sleep(900);
   P('view_circuit 能只画某一路', r2 && r2.ok !== false && /完整路由/.test(JSON.stringify(r2)), JSON.stringify(r2.say || '').slice(0, 90));
+  const iso = await p.evaluate(() => (window.BIM.scene.conduitStat ? window.BIM.scene.conduitStat().iso : null));
+  P('看回路时管径与"看所有分路"一致（grow=1）', !!iso && iso.grow === 1, JSON.stringify(iso));
+  P('看回路时接头也画（与"看所有分路"一致）', !!iso && iso.joints === true && iso.shaded === true,
+    iso ? iso.boxes + ' 个方头，接头着色=' + iso.shaded : '无');
 
   /* ---------- ④ 管线跟楼层 ---------- */
-  H('【4】管线只跟楼层有关');
+  H('【4】管线只跟楼层有关；看某层管线时只留这一层');
   const r3 = await call('show_conduits', { scope: 'floor', floor: 2 });
-  await sleep(700);
+  await sleep(900);
   s = await state();
   P('show_conduits(floor) 只画本层', r3 && r3.ok !== false && Object.keys(s.cond.byFloor).every(k => (k === '2' ? s.cond.byFloor[k].on > 0 : s.cond.byFloor[k].on === 0)),
     JSON.stringify(s.cond.byFloor));
+  const fl2 = s.body.floors || {};
+  const others2 = Object.keys(fl2).filter(k => k !== '2');
+  P('别的楼层整层收起', others2.length > 0 && others2.every(k => fl2[k].visible === false),
+    others2.map(k => 'F' + k + ':' + fl2[k].visible).join(' '));
+  P('本层墙体与梁柱 50% 半透明', !!fl2['2'] && fl2['2'].visible === true &&
+    Math.abs(fl2['2'].opacity - .5) < .02 && Math.abs(fl2['2'].beam - .5) < .02, JSON.stringify(fl2['2']));
+  P('顶梁跟着收起', !!s.body.roof && s.body.roof.visible === false, JSON.stringify(s.body.roof));
 
   /* ---------- ⑤ 看所有管线 ---------- */
   H('【5】看所有管线：整栋 20% 半透明，楼体还在');

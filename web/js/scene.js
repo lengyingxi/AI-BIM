@@ -500,11 +500,16 @@
      本层不透明看得清，别的楼层和顶梁留 50% 的体量，眼前还是一栋完整的楼。 */
   let floorOnly = 0;
 
-  /* 楼体透明度统一口径（三档）：
-     · 全楼正常      → 全不透明
-     · 聚焦某一层    → 本层不透明，别层 50% 半透明（不隐藏）
-     · 看所有管线    → 整栋 20% 半透明（楼体还在，不是不显示）
-     本层在看管线时也压到 50% —— 不压就看不见埋在墙里的暗管（用户口径就是 50%）。 */
+  /* 楼体透明度统一口径（四档，全在这里算，别在别处再写一份）：
+     · 全楼正常              → 全不透明
+     · 聚焦某一层（不看管线） → 本层不透明，别层 50% 半透明（保留体量，不隐藏）
+     · 看某层管线 / 看分路 / 看回路影响（透视 + 聚焦某层）
+                             → **别层整层收起**，只留本层：墙、梁、柱、楼板压到 50%，
+                               不压就看不见埋在墙里的暗管
+     · 看所有管线（透视 + 全楼）→ 整栋 20% 半透明（楼体还在，不是不显示）
+     第三档是用户明确纠正过的："查看单独楼层的管线设置以及分路显示的时候，隐藏其他楼层，
+     只有当前楼层的墙体和梁半透明" —— 屏幕上同时挂着五层半透明的楼，
+     看某一层墙里的管子和分支走向仍然是糊的。 */
   const ROOF_BASE = .34;
 
   /* 顶梁（屋顶那层板/梁）可能是单个 Mesh，也可能是 detail 层返回的一整组 ——
@@ -519,9 +524,9 @@
     });
     return out;
   }
-  function setRoofOpacity(v) {
+  function setRoofOpacity(v, vis) {
     if (!roof) return;
-    roof.visible = true;
+    roof.visible = vis === undefined ? true : !!vis;
     roofMats().forEach(m => {
       m.opacity = v;
       m.transparent = v < .999;
@@ -532,17 +537,23 @@
 
   function applyBody() {
     const lv = S.focus || 0;
-    const allXray = !!S.xray && lv === 0;
+    const allXray = !!S.xray && lv === 0;       // 全楼看管线：整栋 20%
+    /* 单层看管线 / 看分路 / 看回路影响：别层整层收起，只留本层半透明 */
+    const single = !!S.xray && lv !== 0;
     floorGroups.forEach(f => {
       const on = lv !== 0 && f.level === lv;
-      let v;
-      if (allXray) v = .2;
-      else if (lv === 0) v = 1;
-      else v = on ? (S.xray ? .5 : 1) : .5;
-      f.g.visible = true;                    // 墙体一律留着，不再整层藏掉
+      let v, vis;
+      if (allXray) { vis = true; v = .2; }
+      else if (lv === 0) { vis = true; v = 1; }
+      else if (on) { vis = true; v = single ? .5 : 1; }     // 本层：看管线时半透明，平时实心
+      else { vis = !single; v = .5; }                       // 别层：看管线时收起，普通聚焦时 50%
+      f.g.visible = vis;
       setBodyOpacity(f.mats, v);
     });
-    setRoofOpacity(allXray ? .2 : (lv === 0 ? ROOF_BASE : .5));   // 顶梁跟着一起半透明
+    /* 顶梁：全楼看管线时 20%；普通聚焦时 50%（整栋楼还在）；
+       单层看管线/分路时跟着别层一起收起 —— 屋顶本来就不属于当前这一层，
+       留着会在俯视时糊住整层，也违背"只显示当前楼层"。 */
+    setRoofOpacity(allXray ? .2 : (lv === 0 ? ROOF_BASE : .5), !single);
   }
   S.applyBody = applyBody;
 
@@ -2214,9 +2225,11 @@
     const list = (D.conduits || []).filter(c =>
       c.circuit === circ.id ||
       ((c.layer === 'trunk' || c.layer === 'feed') && c.floor === circ.floor));
-    /* 画粗一档：这一屏是把整层框进来，原尺寸的管子在屏幕上只有一两个像素，
-       不放大根本看不出"这条电是从竖井下来、沿走廊跑、再分进哪几间房" */
-    S.isolateConduits(list, { grow: 3.0 });
+    /* 管子粗细、接头必须跟"查看所有分路"时**一模一样**：
+       以前这里 grow:3 把管径放粗三倍、又不带接头（eBatch 的第二参是 false），
+       同一个回路在两个视图里粗细不一样，用户一眼就看出"这不是同一根管子"。
+       现在统一 grow:1 + 带接头，只靠材质的自发光和绿色地面来突出这一路。 */
+    S.isolateConduits(list, { grow: 1, joints: true });
     /* 光点改成贴在管身上的流动条纹了（见 S.flux），从电闸一路跑到房间 */
     S.flux(list, { floor: circ.floor });
     if (rooms && rooms.length) S.highlightRooms(rooms, 0x17a673); else disposeHl();
@@ -2341,7 +2354,12 @@
     eOn = !!on;
     if (eOn && !eRoot) eBuild();
     if (eOn && !ePanels) ePanelBuild();
-    if (eOn) eFloorOnly = S.focus || floorOnly || 0;
+    if (eOn) {
+      /* 从"只看那一路"（隔离组）切回"看这层的管线"时，隔离组必须收掉 ——
+         不然屏幕还停在那一根管子上，用户以为"看管线"根本没反应。 */
+      S.clearIsolate();
+      eFloorOnly = S.focus || floorOnly || 0;
+    }
     eApplyVis();
     /* 配电箱不跟电气层开关走 —— 它是真装在墙上的设备，关掉"看管线"也得留着。
        这里只按当前楼层重算显隐。 */
@@ -2352,14 +2370,21 @@
 
   /* 只显示这几根线管：其它分路整体隐藏，命中的管子按本体颜色单独画出来。
      碰撞检查、查某面墙里埋了什么，都用它 ——
-     现场就是这样：墙里挡路的就那几根，别的管线全都跑来抢视线没有意义。 */
+     现场就是这样：墙里挡路的就那几根，别的管线全都跑来抢视线没有意义。
+
+     opt.grow   截面放大倍数，默认 1（**默认必须跟 eBuild 一致**，不然同一根管
+                在两种视图里粗细不同）；只有冲突标记这种"要罩粗才醒目"的场合才传 >1。
+     opt.joints 把接头/弯头一并画出来。看整条回路走向时要 true ——
+                少了接头，管子看着就是一根根悬空的棍子，跟"查看所有分路"对不上。 */
   S.isolateConduits = function (list, opt) {
     if (eIsoG) { eDispose(eIsoG); eIsoG = null; }
     const D = E() && E().data;
     if (!D) return;
+    const grow = (opt && opt.grow) || 1;
+    const joints = !!(opt && opt.joints);
     if (eRoot) eRoot.visible = false;              // 先把整批藏起来
     if (!list || !list.length) return;
-    const per = eBatch(list, false, opt && opt.grow);
+    const per = eBatch(list, joints, grow);
     const g = new THREE.Group();
     g.name = 'elec-iso';
     Object.keys(per).forEach(cid => {
@@ -2367,7 +2392,8 @@
       const col = new THREE.Color(circColor(circ));
       const mat = new THREE.MeshStandardMaterial({
         color: col, emissive: col.clone().multiplyScalar(.85), emissiveIntensity: 2.4,
-        roughness: .4, metalness: .3, transparent: true, opacity: 1
+        roughness: .4, metalness: .3, transparent: true, opacity: 1,
+        vertexColors: joints              // 接头靠顶点色压暗一档，跟 eBuild 同一个规矩
       });
       mat.userData.ownMat = true;
       const mesh = new THREE.Mesh(boxGeo(per[cid]), mat);
@@ -2378,6 +2404,11 @@
       g.add(mesh);
     });
     if (!g.children.length) { if (eRoot && eOn) eRoot.visible = true; return; }
+    /* 自检用：这一批是按什么口径画的（grow / 有没有接头 / 共几个方头）。
+       回归脚本靠它断言"看回路影响"与"看所有分路"的管径一致。 */
+    let boxes = 0;
+    g.children.forEach(m => { if (m.geometry && m.geometry.attributes.position) boxes += m.geometry.attributes.position.count / 24; });
+    g.userData = { grow: grow, joints: joints, boxes: boxes, circs: Object.keys(per) };
     scene.add(g); eIsoG = g;
     applyFlow();                       // 新画出来的这批管也要按当前"谁在流"挂上条纹
   };
@@ -2386,6 +2417,26 @@
     eApplyVis();
   };
   S.hasIsolate = () => !!eIsoG;
+
+  /* 自检用：全楼那批管每条分路几个方头，以及当前隔离组是按什么口径画的。
+     "看回路影响"和"看所有分路"的管径必须一样，回归脚本就靠 grow/joints 这两项断言。 */
+  S.conduitStat = function () {
+    const out = { floor: eFloorOnly, solo: eSoloCid, byCirc: {}, iso: null };
+    Object.keys(eByCirc).forEach(id => {
+      const g = eByCirc[id].mesh.geometry;
+      out.byCirc[id] = (g && g.attributes.position) ? g.attributes.position.count / 24 : 0;
+    });
+    if (eIsoG) {
+      const u = eIsoG.userData || {};
+      const m = eIsoG.children[0];
+      out.iso = {
+        grow: u.grow == null ? 1 : u.grow, joints: !!u.joints, boxes: u.boxes || 0,
+        circs: u.circs || [], meshes: eIsoG.children.length,
+        shaded: !!(m && m.geometry && m.geometry.attributes.color)   // 有没有接头用的顶点色
+      };
+    }
+    return out;
+  };
 
   /* 只看一条分路：它自己发亮 + 穿透显示，别的分路**整条隐藏**。
      以前是把别的压到 0.07 透明度，屏幕上还是一堆管子在眼前晃；

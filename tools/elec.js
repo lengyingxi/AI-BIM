@@ -790,6 +790,7 @@ const H = t => { console.log('\n' + t); };
       flowMeshes: flowMeshes, flowMoves: off0 != null && off1 != null && off1 !== off0,
       sprites: sprites, floorVis: floorVis, floorOnly: S.floorIsolated ? S.floorIsolated() : null,
       body: body, cvis: cvis,
+      stat: S.conduitStat ? S.conduitStat() : null,
       focus: S.focus,
       circOn: c.on, othersLive: E.list(2).filter(x => x.id !== 'L2B').every(x => x.live !== false),
       floorAll: E.conduitsOf({ floor: 2 }).length,
@@ -806,17 +807,30 @@ const H = t => { console.log('\n' + t); };
     d13c.flowMeshes + ' 条分路的管身挂着条纹，纹理 offset 在推进；场景里 Sprite 共 ' + d13c.sprites + ' 个（都是房间号标签）');
   const bodyFl = (d13c.body && d13c.body.floors) || {};
   const otherFloor = Object.keys(bodyFl).filter(k => k !== '2');
-  P('别的楼层墙体不隐藏，压成 50% 半透明',
+  /* 用户第三次纠正的口径："查看单独楼层的管线/分路时，隐藏其他楼层，
+     只有当前楼层的墙体和梁半透明" —— 别层不再是 50% 虚影，而是整层收起。 */
+  P('别的楼层整层收起（只留当前楼层）',
     d13c.floorOnly === 2 && otherFloor.length > 0 &&
-    otherFloor.every(k => bodyFl[k].visible === true && Math.abs(bodyFl[k].opacity - .5) < .02),
-    otherFloor.map(k => 'F' + k + ':' + bodyFl[k].opacity + '/' + bodyFl[k].visible).join(' '));
-  P('顶梁也在，并且 50% 半透明',
-    !!d13c.body && !!d13c.body.roof && d13c.body.roof.visible === true &&
-    d13c.body.roof.opacity != null && Math.abs(d13c.body.roof.opacity - .5) < .02,
+    otherFloor.every(k => bodyFl[k].visible === false),
+    otherFloor.map(k => 'F' + k + ':' + bodyFl[k].visible).join(' '));
+  P('本层墙体与梁柱压到 50% 半透明（墙里的暗管才看得见）',
+    !!bodyFl['2'] && bodyFl['2'].visible === true &&
+    Math.abs(bodyFl['2'].opacity - .5) < .02 && Math.abs(bodyFl['2'].beam - .5) < .02,
+    JSON.stringify(bodyFl['2']));
+  P('顶梁跟着别层一起收起（屋顶不属于当前这一层）',
+    !!d13c.body && !!d13c.body.roof && d13c.body.roof.visible === false,
     JSON.stringify(d13c.body && d13c.body.roof));
   P('管线只跟楼层有关：本层画、别层一根不画',
     !!d13c.cvis && Object.keys(d13c.cvis.byFloor).every(k => (k === '2' ? d13c.cvis.byFloor[k].on > 0 : d13c.cvis.byFloor[k].on === 0)),
     JSON.stringify(d13c.cvis && d13c.cvis.byFloor));
+  /* 用户："管线的直径以及接头都需要跟查看所有分路的一致" ——
+     以前看回路走的是 grow:3 + 不画接头，同一个回路在两个视图里粗细差三倍。 */
+  P('看回路时管径与"看所有分路"一致（grow=1，不再放粗）',
+    !!d13c.stat && !!d13c.stat.iso && d13c.stat.iso.grow === 1,
+    JSON.stringify(d13c.stat && d13c.stat.iso));
+  P('接头也一起画出来（带顶点色压暗，跟"看所有分路"同一套）',
+    !!d13c.stat && !!d13c.stat.iso && d13c.stat.iso.joints === true && d13c.stat.iso.shaded === true,
+    d13c.stat && d13c.stat.iso ? (d13c.stat.iso.boxes + ' 个方头，接头着色=' + d13c.stat.iso.shaded) : '无');
   P('镜头推到本层配电箱', d13c.focus === 2, 'focus=' + d13c.focus);
 
   /* 13d. 问"两个房间能不能打通"：只有那面墙半透明，别的墙还是实心的 */
