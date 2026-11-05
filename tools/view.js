@@ -65,7 +65,7 @@ const H = t => console.log('\n' + t);
   P('回复说清了关的是第几回路、带哪几间房', /第\s*\d\s*回路/.test(say) && /间/.test(say), say.slice(0, 70));
 
   /* ---------- ② 楼层半透明 ---------- */
-  H('【2】查看楼层（不看管线）：墙体不隐藏，50% 半透明，顶梁也 50%');
+  H('【2】查看楼层（不看管线）：以上楼层收起，以下 50% 当参照，顶梁也收起');
   /* 上一步"关闭空开"走的是回路控制，会把透视打开（那是"看管线"的档位）。
      这里验的是**普通聚焦楼层**，先把透视关掉，否则别层是收起的，口径不一样。 */
   await p.evaluate(() => {
@@ -79,13 +79,18 @@ const H = t => console.log('\n' + t);
   await sleep(700);
   let s = await state();
   const fl = s.body.floors || {};
-  const others = Object.keys(fl).filter(k => k !== '3');
-  P('别的楼层还在画（visible=true，不是藏起来）', others.length > 0 && others.every(k => fl[k].visible === true),
-    others.map(k => 'F' + k + ':' + fl[k].visible).join(' '));
-  P('别的楼层墙体 50% 半透明', others.every(k => Math.abs(fl[k].opacity - .5) < .02),
-    others.map(k => 'F' + k + ':' + fl[k].opacity).join(' '));
-  P('顶梁 50% 半透明且可见', !!s.body.roof && s.body.roof.visible === true && Math.abs(s.body.roof.opacity - .5) < .02,
-    JSON.stringify(s.body.roof));
+  const above = Object.keys(fl).filter(k => +k > 3);
+  const below = Object.keys(fl).filter(k => +k < 3);
+  /* 用户原话："看楼层的时候是需要隐藏该楼层以上的内容的"。
+     上面那几层正好横在本层和镜头之间，留着半透明也把本层糊住；
+     下面几层不挡视线，留 50% 让整栋楼还看得出上下关系。 */
+  P('本层以上的楼层收起来了（不挡视线）', above.length > 0 && above.every(k => fl[k].visible === false),
+    above.map(k => 'F' + k + ':' + fl[k].visible).join(' '));
+  P('本层以下的楼层还在画，50% 半透明当参照',
+    below.length > 0 && below.every(k => fl[k].visible === true && Math.abs(fl[k].opacity - .5) < .02),
+    below.map(k => 'F' + k + ':' + fl[k].visible + '/' + fl[k].opacity).join(' '));
+  P('本层实心', fl['3'] && fl['3'].visible === true && Math.abs(fl['3'].opacity - 1) < .02, JSON.stringify(fl['3'] || null));
+  P('顶梁跟着收起（它在本层之上）', !!s.body.roof && s.body.roof.visible === false, JSON.stringify(s.body.roof));
 
   /* ---------- ③ MCP 工具 ---------- */
   H('【3】聚焦 / 看回路 / 看管线 都是 MCP 工具');

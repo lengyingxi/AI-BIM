@@ -863,6 +863,22 @@
     ((E.data && E.data.panels) || []).forEach(p => { prevP[p.id] = p.mainOn; });
     D.circuits.forEach(c => { c.on = prevC[c.id] !== false; });
     D.panels.forEach(p => { p.mainOn = prevP[p.id] !== false; });
+
+    /* 改线记录也要跟着活下来。
+       ★ 这里修的是"撤掉门再点回来就判碰撞"的根子：reroutes 原来只活在 E.data 里，
+         E.rebuild() 一跑（开窗、打通、改尺寸、导入模型……任何一次重建都会跑）就整包清零。
+         于是墙上那扇门明明是"牵着线开出来的"，过一会儿再校核又变成"墙里有管、撞"，
+         用户看到的就是"刚才还能开，现在怎么撞了"。
+         现在重建时按 conduit id 把还存在的记录带过来；管子没了（墙被拆）就自然丢掉。 */
+    const prevR = (E.data && E.data.reroutes) || {};
+    const wallIds = {};
+    (D.conduits || []).forEach(c => { if (c.wall) wallIds[c.wall] = 1; });
+    Object.keys(prevR).forEach(id => {
+      const r = prevR[id];
+      /* 管子还在、或者这面墙还在（管子只是被洞口切成了新 id）→ 记录留着 */
+      if (D.conduits.some(c => c.id === id) || (r && r.wall && wallIds[r.wall])) D.reroutes[id] = r;
+    });
+
     applyLive(D);
     E.data = D;
     return D;
@@ -898,9 +914,34 @@
   E.panel = id => (ready().panels || []).find(c => c.id === id) || null;
 
   /* ---------------- 冲突检测 ---------------- */
+  /* 一根线管在**这面墙上**占的那一段：沿墙位置 [a0, a1] × 高度 [s0, s1]。
+     横管本来就有 at0/at1；竖直管（墙内下引、箱到桥架）没有"沿墙长度"，
+     得把它的平面坐标投影到墙轴上算出来 —— 这一步以前缺了，于是所有竖管
+     都被当成"在墙的另一头"，开洞时一根都报不出来（用户原话：
+     "在管线开门汇集处没有考虑所有管线的绕行"）。 */
+  function spanOnWall(wall, c, a) {
+    if (c.vert) {
+      if (c.x == null || c.y == null) return null;
+      const ax = a || axis(wall);
+      const at = (c.x - ax.ax) * ax.ux + (c.y - ax.ay) * ax.uy;
+      const perp = Math.abs((c.x - ax.ax) * (-ax.uy) + (c.y - ax.ay) * ax.ux);
+      /* 竖直管必须**埋在墙里**才算这面墙的管：贴着墙面外面走的（比如桥架）
+         只是路过，凿洞并不碰它。厚度按墙厚一半再放 6 cm 施工误差。 */
+      if (perp > wall.t / 2 + 0.06) return null;
+      const s = c.s || 0.04;
+      return {
+        vert: true, at: at, a0: at - s / 2, a1: at + s / 2,
+        s0: Math.min(c.z0, c.z1), s1: Math.max(c.z0, c.z1)
+      };
+    }
+    if (c.at0 == null || c.at1 == null) return null;
+    return { vert: false, at: (c.at0 + c.at1) / 2, a0: c.at0, a1: c.at1, s0: c.z - c.s / 2, s1: c.z + c.s / 2 };
+  }
+  E.spanOnWall = spanOnWall;
+
   /* 开一个洞会不会打断墙里的线管。
        洞：沿墙 [at-w/2, at+w/2] × 高度 [sill, sill+h]
-       线管：沿墙 [at0, at1] × 高度 [z-s/2, z+s/2]
+       线管：沿墙 [a0, a1] × 高度 [s0, s1]（横管按 at0/at1，竖管按平面投影）
      两个矩形相交就是打架。已经改过线的线管（reroutes 里有记录且覆盖这个洞）不算。 */
   E.hitWall = function (wall, o) {
     if (!wall || !E.data) return [];
@@ -908,12 +949,15 @@
     const sill = o.sill == null ? 0 : o.sill;
     const h0 = at - w / 2 - 0.05, h1 = at + w / 2 + 0.05;
     const z0 = sill - 0.05, z1 = sill + h + 0.05;
+    const a = axis(wall);
     const out = [];
     (E.data.conduits || []).forEach(c => {
       if (c.wall !== wall.id) return;
-      if (c.at1 <= h0 || c.at0 >= h1) return;                 // 沿墙方向不相交
-      if (c.z + c.s / 2 <= z0 || c.z - c.s / 2 >= z1) return;  // 高度方向不相交
-      if (reroutedOver(c, h0, h1)) return;                     // 已经改过线了
+      const sp = spanOnWall(wall, c, a);
+      if (!sp) return;
+      if (sp.a1 <= h0 || sp.a0 >= h1) return;                  // 沿墙方向不相交
+      if (sp.s1 <= z0 || sp.s0 >= z1) return;                   // 高度方向不相交
+      if (reroutedOver(c, h0, h1)) return;                      // 已经改过线了
       out.push(c);
     });
     return out;
@@ -922,13 +966,41 @@
   /* 这根线管在这个洞口范围里是不是已经改过线了。
      比的是"覆盖关系"：改线时记的洞要能罩住这次查的洞。
      两边各留 0.1 m 容差 —— 查冲突时洞会外扩 5 cm 当保护层，
-     不放容差的话改完线再查回来还是判"撞"，等于白改。 */
+     不放容差的话改完线再查回来还是判"撞"，等于白改。
+     ★ 还认第二种情况：同一面墙、同一条回路上"洞对得上"的记录。
+       因为一旦重建（开窗/打通/导入模型），被洞口切开的线管会换成新的 id，
+       按 id 就再也对不上，墙上那扇门立刻变回"撞管" —— 用户看到的就是
+       "刚才还能开，撤掉再点回来怎么又撞了"。 */
   function reroutedOver(c, h0, h1) {
-    const r = (E.data.reroutes || {})[c.id];
-    if (!r) return false;
-    return r.hole.at0 <= h0 + 0.10 && r.hole.at1 >= h1 - 0.10;
+    const R = (E.data.reroutes || {});
+    const cover = r => !!(r && r.hole && r.hole.at0 <= h0 + 0.10 && r.hole.at1 >= h1 - 0.10);
+    if (cover(R[c.id])) return true;
+    return Object.keys(R).some(k => {
+      const r = R[k];
+      if (!r || k === c.id) return false;
+      if (r.wall !== c.wall || r.circuit !== c.circuit) return false;
+      return cover(r);
+    });
   }
   E.reroutedOver = reroutedOver;
+
+  /* 把"某个洞口范围内"的改线记录全部撤掉（不管记在哪个 conduit id 上）。
+     撤门要用它：门撤了，为它改的道就该全部放回原样，
+     原来只按门身上记的那几个 id 撤，重建过一次 id 变了就撤不掉，
+     图上就一直挂着一截绿线（用户原话："撤掉门后还是有原来绕行的管线"）。 */
+  E.undoReroutesAt = function (wallId, at0, at1) {
+    const D = ready();
+    const gone = [];
+    Object.keys(D.reroutes || {}).forEach(k => {
+      const r = D.reroutes[k];
+      if (!r || !r.hole) return;
+      if (wallId && r.wall !== wallId) return;
+      /* 有重叠就算这个门的（门可能被挪过一点，别要求完全一致） */
+      const ov = Math.min(r.hole.at1, at1) - Math.max(r.hole.at0, at0);
+      if (ov > -0.05) { gone.push(r.conduit || k); delete D.reroutes[k]; }
+    });
+    return gone;
+  };
 
   /* 某根线管在某个洞口的绕行方案
      往洞顶以上或洞底以下翻过去——真实施工就是"上翻/下翻"。
@@ -936,6 +1008,47 @@
   E.planReroute = function (c, hole) {
     const wall = (M().walls || []).find(w => w.id === c.wall);
     if (!wall || !c) return { ok: false, why: '找不到这根线管所在的墙' };
+
+    /* ── 竖直管（墙内下引、箱到桥架）──
+       它没有"上翻/下翻"这条路：一头接吊顶干线、一头接墙上的支线端头，
+       上下都动不了。真实施工里只能**沿墙横着让到洞口旁边**，
+       两头各补一段水平短段接回去（就是一个 U 形）。
+       以前这类管子压根不进 hitWall，所以从来没被"考虑"过；现在算进来了，
+       就得给它一条真能落地的走法，否则 plans 里有一根不 ok，整扇门都判开不了。 */
+    if (c.vert) {
+      const a = axis(wall);
+      const sp = spanOnWall(wall, c, a);
+      if (!sp) return { ok: false, why: '这根竖直管不在这面墙里' };
+      const half = (c.s || 0.04) / 2 + 0.06;
+      const left = hole.at0 - GUARD - half;         // 让到洞口左边
+      const right = hole.at1 + GUARD + half;        // 让到洞口右边
+      const lo = 0.10, hi = (a.L || 3) - 0.10;
+      const okL = left >= lo, okR = right <= hi;
+      let to = null;
+      if (okL && okR) to = (sp.at - left) <= (right - sp.at) ? left : right;
+      else if (okL) to = left;
+      else if (okR) to = right;
+      if (to == null) {
+        return {
+          ok: false, c: c, hole: hole,
+          why: '这根下引管在距墙端 ' + fmt(sp.at) + ' m 处竖着下来，洞口两边都留不出位置让它躲开'
+        };
+      }
+      const zTop = sp.s1, zBot = sp.s0;
+      /* 顶端横挪 → 贴着新位置下来 → 底端再横挪回去 */
+      const pts = [
+        { at: sp.at, z: zTop }, { at: to, z: zTop },
+        { at: to, z: zBot }, { at: sp.at, z: zBot }
+      ];
+      const addLen = Math.abs(to - sp.at) * 2;
+      return {
+        ok: true, c: c, hole: hole, dir: to < sp.at ? 'left' : 'right', z: to, pts: pts,
+        addLen: addLen, wall: wall, vert: true,
+        why: '这根墙内下引是竖直的，上翻下翻都不行，只能沿墙让到洞口' +
+          (to < sp.at ? '左' : '右') + '侧 ' + fmt(to) + ' m 处重新下来，多走 ' + fmt(addLen) + ' 米线'
+      };
+    }
+
     const half = c.s / 2 + 0.03;
     const up = hole.z1 + 0.12 + half;          // 洞顶以上
     const dn = hole.z0 - 0.12 - half;          // 洞底以下
@@ -1247,6 +1360,10 @@
     return c.name + '（' + c.id + '，' + c.phase + ' 相，' + c.rated + 'A，带 ' + rs.length + ' 间房）';
   };
 
-  /* 模型结构变了就重建（导入 IFC 后调用） */
-  E.rebuild = function () { E.data = null; return E.build(); };
+  /* 模型结构变了就重建（导入 IFC 后调用）
+     ★ 不要先把 E.data 置空再 build：build 要从旧数据里把"分路通断 / 总开关 /
+       改线记录"带过来，先置空等于把它们全扔了（改线记录尤其致命，
+       墙上那扇门明明是牵着线开的，重建一次就变成"撞管"）。
+       现在直接 build，build 内部会读旧 E.data、算完再覆盖。 */
+  E.rebuild = function () { return E.build(); };
 })();

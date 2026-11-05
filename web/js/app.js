@@ -13,7 +13,8 @@
     mode: 'idle', pending: null, device: null, placed: [],
     last: null, sound: false, ducts: true, xray: false, focus: 0, equipId: 1, quiet: false, sel: null,
     flowOn: false,       // 流向是否正在展示（只在看阀门影响时亮）
-    doorAsked: {}        // 哪几间房已经问过「要不要拓门」，别一台一台重复问
+    doorAsked: {},       // 哪几间房已经问过「要不要拓门」，别一台一台重复问
+    lastUndone: null     // 刚撤掉的那扇门（墙上位置 + 尺寸），"再点回来"时按它开回去
   };
   /* 已放设备要能被计算层读到：拆墙打通以后，隔壁那台设备也压在同一块板上，
      楼板校核必须把联通块里的设备一起叠加（calc.js 的 C.check 会从这里取）。 */
@@ -93,6 +94,7 @@
       const d = S.addDoorOpening(wall, dec.at, W, H);
       d.room = room.id;
       if (ids.length) d._reroutes = ids;
+      syncElecAfterDoor();
       ST.lastDoor = { wall: wall, at: dec.at, w: W, d: d, chk: dec.chk, room: room };
       return { ok: true, id: d.id, code: d.code, at: +dec.at.toFixed(2), rerouted: n, moved: !!dec.moved };
     }
@@ -1725,6 +1727,14 @@
     (d._reroutes || []).forEach(cid => {
       if (E && E.undoReroute && E.undoReroute(cid)) condBack++;
     });
+    /* 门身上记的 id 只是"开门那一刻"的名单。只要中间重建过一次
+       （开窗、打通、改尺寸都会重建），被洞口切开的线管就换了 id，
+       按 id 一个都撤不掉 —— 图上那截绿线永远挂着。
+       所以再按"这个洞口范围"兜一次底，凡是记在这个洞上的改线全撤。 */
+    if (E && E.undoReroutesAt && wall && at != null) {
+      const gone = E.undoReroutesAt(wall.id, at - (d.w || 1) / 2, at + (d.w || 1) / 2) || [];
+      gone.forEach(cid => { if ((d._reroutes || []).indexOf(cid) < 0) condBack++; });
+    }
     let ok = S.removeDoor(d);
     if (!ok && wall) {
       /* 洞口和门记录对不上时兜底：按反查号、再按最近位置硬摘一个洞口，然后把墙重建 */
@@ -1755,6 +1765,15 @@
       }
     });
     if (openBack && wall) S.rebuildWall(wall);
+    /* 洞口补上了 → 线管按"没有这个洞"重铺一遍，门口那一截接回连续 */
+    syncElecAfterDoor();
+    /* 撤门 = 这一屏就结束了，画面上不能再留着"这扇门办事时的痕迹"：
+       红色碰撞标记、绿色绕行路线、只剩那几根的隔离、还有半透明的墙。
+       以前这里什么都不清，用户看到的就是"门撤了，可原来绕行的那几根还挂在那儿"
+       （原话："撤掉门后还是有原来绕行的管线"）。 */
+    S.clearConduitMarks && S.clearConduitMarks();
+    S.clearGhostWalls && S.clearGhostWalls();
+    S.clearHighlight && S.clearHighlight();
     S.markDoorSpotClear && S.markDoorSpotClear();
     S.clearOpeningHighlight && S.clearOpeningHighlight();
     if (ST.lastDoor && ST.lastDoor.d === d) ST.lastDoor = null;
@@ -1765,6 +1784,12 @@
     }
     snap.conduitsRestored = condBack;
     snap.openingsRestored = openBack;
+    /* 记住"刚撤掉的是哪一扇"：用户撤完常常就在同一个位置再点回来，
+       有这条记录才能在他点偏/点不准时报出"刚才那扇在 X 米处"并按原尺寸开回去，
+       而不是一句"会撞上东西"把人挡回去。 */
+    if (wall && at != null) {
+      ST.lastUndone = { wall: wall.id, floor: wall.floor, at: at, w: d.w, h: d.h, room: d.room, t: Date.now() };
+    }
     if (!quiet) {
       ai('把「' + snap.name + '」撤掉了，墙上恢复成没有洞口的样子' +
         (condBack ? '；开门时为它改道的那 ' + condBack + ' 根线管也放回原来的走法了' : '') +
@@ -1911,6 +1936,7 @@
       const d = S.addDoorOpening(wall, at, p.width, p.height);
       d.room = room.id;
       if (rIds.length) d._reroutes = rIds;     // 撤门时把改道的线管放回原样
+      syncElecAfterDoor();                      // 洞口变了，线管按新洞形重铺一遍
       ST.lastDoor = { wall, at, w: p.width, d, chk, room };
       rememberDoor(room, sideOfWall(room, wall) || p.side, p.width, p.height);
       ST.mode = 'idle'; S.mode = 'idle';
@@ -1946,18 +1972,38 @@
         '<div class="res-adv">' + list2 + '</div></div>');
 
       const cs = [];
+      /* 先看是不是"刚刚撤掉的那扇门"：用户撤了再点回来，多半就是想原样开回去。
+         这时不要只冷冷地报"会撞上东西"（他上一次明明开成了），
+         直接把那扇门的位置给出来，一点就照原样开回去（该改线还是会改线）。 */
+      const lu = ST.lastUndone;
+      if (lu && lu.wall === wall.id && lu.at != null && Date.now() - lu.t < 30 * 60 * 1000) {
+        cs.push({
+          label: '开回刚才撤掉的 ' + C.fmt(lu.at, 2) + ' 米处', fn: () => {
+            const r2 = openDoorHere(wall, room, lu.at, lu.w, lu.h);
+            if (!r2.ok) { ai('刚才那个位置现在也开不了了：' + (r2.dec && r2.dec.why || '原因不明')); return; }
+            ST.lastUndone = null;
+            ai('照刚才那扇的尺寸开回去了（' + C.fmt(lu.at, 2) + ' 米处），门已经放到墙上。' +
+              (r2.ids && r2.ids.length ? '为它改道的 ' + r2.ids.length + ' 根线管也重新改好了。' : ''),
+              '<div class="res ok"><div class="res-top"><span class="k">开回原位</span><span class="tag">已就位</span></div>' +
+              '<div class="res-grid"><div><i>门宽</i><b>' + lu.w.toFixed(2) + ' m</b></div>' +
+              '<div><i>门高</i><b>' + lu.h.toFixed(2) + ' m</b></div></div></div>');
+            doorPointChips(room, sideOfWall(room, wall) || p.side, lu.w, lu.h, '再挑个位置');
+          }
+        });
+      }
       const sug = C.suggestDoorAt({ wall, room, at: at, w: p.width, h: p.height, equipments: eqs });
       if (sug && sug.d >= 0.25 && sug.d < 3.2) {
         cs.push({
           label: '挪 ' + sug.d.toFixed(1) + ' 米就能开', fn: () => {
-            const d = S.addDoorOpening(wall, sug.at, p.width, p.height);
-            S.markDoorSpot(wall, sug.at, p.width, p.height, true);
-            S.focusDoor(wall, sug.at, room);
-            ST.lastDoor = { wall, at: sug.at, w: p.width, d, chk: sug.check, room };
-            rememberDoor(room, sideOfWall(room, wall) || p.side, p.width, p.height);
-            ai('往旁边挪了 ' + sug.d.toFixed(1) + ' 米，这里能开，门已经放上去了。',
+            /* 走完整链路：这个位置要动哪几根线管，一并规划好再开 */
+            const r2 = openDoorHere(wall, room, sug.at, p.width, p.height);
+            if (!r2.ok) { ai('往旁边挪 ' + sug.d.toFixed(1) + ' 米还是不行：' + (r2.dec && r2.dec.why || '原因不明')); return; }
+            S.focusDoor(wall, r2.dec.at, room);
+            ai('往旁边挪了 ' + sug.d.toFixed(1) + ' 米，这里能开，门已经放上去了。' +
+              ((r2.dec.needReroute) ? '这个位置墙里有 ' + (r2.dec.hits || []).length + ' 根线管，' + (r2.dec.rerouteNote || '已经改线绕开') + '。' : ''),
               '<div class="res ok"><div class="res-top"><span class="k">可以开</span><span class="tag">无碰撞</span></div>' +
               '<div class="res-grid"><div><i>门宽</i><b>' + p.width.toFixed(2) + ' m</b></div><div><i>门高</i><b>' + p.height.toFixed(2) + ' m</b></div></div></div>');
+            doorPointChips(room, sideOfWall(room, wall) || p.side, p.width, p.height, '再挑个位置');
           }
         });
       }
@@ -2848,6 +2894,8 @@
     /* 这扇门为了腾位置让哪几根线管改了道，记在门身上：
        撤门时按这份名单把管子放回原来的走法（"回复原装"）。 */
     if (reroutedIds.length) d._reroutes = reroutedIds;
+    /* 洞口变了 → 线管重新按新洞形铺一遍（门口该断的断开），再画红标/绿线 */
+    syncElecAfterDoor();
     focusSoft(room, { keepView: true, color: false });
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
@@ -3060,6 +3108,23 @@
   /* 真把线管改道落到数据里。out 传进来就把"改了哪几根"记进去 ——
      撤门的时候要按这份名单撤回（E.undoReroute），否则管子会一直保持着
      "为这扇门绕行"的走法，墙明明恢复原样了，图上还挂着一截绿线。 */
+  /* 门窗洞一改，电气数据必须跟着重算一遍。
+     ★ 这里修的是"撤掉门后还是有原来绕行的管线"的最后一块：
+       线管是按"墙上现在有哪些洞口"铺的（splitByOpenings）。开了门不重算，
+       管子还跨着洞口走，红标和绿线就成了图纸上的一层贴纸；
+       撤了门不重算，管子就永远停在"为那扇门断开"的样子 —— 墙上洞都没了，
+       管子在门口还缺一截。所以开/撤之后都重建一次，让管子回到真实形态：
+       有洞就断在洞口（红色那截就是"原来的位置"），绕行由绿线表达。 */
+  function syncElecAfterDoor() {
+    if (!window.BIM.elec) return;
+    try {
+      window.BIM.elec.rebuild();
+      S.rebuildElec();
+      S.rebuildPanels && S.rebuildPanels();
+      S.syncCircuitPower && S.syncCircuitPower();
+    } catch (e) { console.warn('elec sync', e && e.message); }
+  }
+
   function applyReroutes(dec, out) {
     const E = window.BIM.elec;
     if (!E || !dec || !dec.reroutes || !dec.reroutes.length) return 0;
@@ -3071,6 +3136,28 @@
       }
     });
     return n;
+  }
+
+  /* 在一面墙的某个位置把门放上去：结构校核 → 顺墙让位 → 线管改线，一条不落。
+     ★ 快捷按钮（"往旁边挪 X 米就能开""开回原位"）必须走这里。
+       以前那几个按钮是直接 S.addDoorOpening，跳过了 holeDecision ——
+       墙上那几根管根本没被算进来，门照样放上去，用户看到的就是
+       "门口汇集了好几根线，系统只绕了其中一部分"。 */
+  function openDoorHere(wall, room, at, w, h) {
+    const eqs = ST.placed.filter(e => e.floor === wall.floor);
+    const dec = holeDecision(wall, { at: at, w: w, h: h, sill: 0, room: room, equipments: eqs, kind: 'door' });
+    if (!dec.ok) return { ok: false, dec: dec };
+    const ids = [];
+    if (dec.needReroute) applyReroutes(dec, ids);
+    const d = S.addDoorOpening(wall, dec.at, w, h);
+    d.room = room.id;
+    if (ids.length) d._reroutes = ids;
+    syncElecAfterDoor();
+    ST.lastDoor = { wall: wall, at: dec.at, w: w, d: d, chk: dec.chk, room: room };
+    rememberDoor(room, sideOfWall(room, wall) || null, w, h);
+    S.markDoorSpot(wall, dec.at, w, h, true);
+    if ((dec.hits && dec.hits.length) || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
+    return { ok: true, d: d, dec: dec, ids: ids };
   }
 
   /* 打通预览：用户问"这两间能不能打通"时要的那一屏。
@@ -4083,10 +4170,10 @@
     S.clearHighlight && S.clearHighlight();
     finishMode(); paintFloors();
     /* 文案跟着当前模式走：正在看管线（透视开着）时别层是收起的，
-       这时说"别的楼层 50% 半透明保留体量"就是骗人。 */
+       这时说"别的楼层 50% 半透明"就是骗人。 */
     if (!lv) ai('回到全楼视角：所有楼层和顶梁都出来了，管线按当前开关显示全部。', null, false);
     else if (S.xray) ai('聚焦到 ' + lv + ' 楼：其它楼层收起，' + lv + 'F 的墙体/梁柱 50% 半透明，管线只画这一层。', null, false);
-    else ai('聚焦到 ' + lv + ' 楼：本层实心，其它楼层和顶梁压成 50% 半透明保留体量，管线只画 ' + lv + ' 楼这一层。', null, false);
+    else ai('聚焦到 ' + lv + ' 楼：' + lv + 'F 实心看得清，' + lv + 'F 以上的楼层和顶梁收起来了（不挡住这一层），以下的楼层留 50% 半透明当参照，管线只画这一层。', null, false);
     return true;
   }
 

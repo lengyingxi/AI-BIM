@@ -642,6 +642,122 @@ const H = t => console.log('\n' + t);
   });
   P('设备落在打通两间的几何中间', mid && mid.merged && mid.d < 1.5, JSON.stringify(mid));
 
+  /* ---------------- 【14】门口汇集处的每根管都要算进来 ----------------
+     用户原话："在管线开门汇集处没有考虑所有管线的绕行，撤掉门后还是有原来绕行的管线，
+     撤掉再点回来会碰撞"。根子有三条：
+       ① hitWall 只认"沿墙有长度"的横管，墙内下引（竖直管）的 at0/at1 是占位的 0，
+          于是永远被当成"在墙的另一头"，门口那几根竖着下来的管一根都没被算进来；
+       ② 撤门只删数据，不擦画面 —— 红色碰撞标记、绿色绕行线、只剩那几根的隔离全留着；
+       ③ 改线记录只活在 E.data 里，任何一次 rebuild 就整包清零，
+          墙上那扇门明明是牵着线开的，过一会儿再校核又变成"撞管"。 */
+  H('【14】门口汇集处所有管线都算进来 · 撤门不留痕 · 改线记录活过重建');
+
+  /* ① 单元级：洞口盖住墙内下引管时，hitWall 必须报出来，而且方案能落地 */
+  const vt = await p.evaluate(() => {
+    const E = window.BIM.elec, M = window.BIM_MODEL, C = window.BIM.calc;
+    E.ready();
+    let found = null, nVert = 0;
+    M.rooms.forEach(rm => {
+      if (found) return;
+      ['north', 'south', 'east', 'west'].forEach(side => {
+        if (found) return;
+        const wl = M.walls.find(w => w.id === (rm.sides || {})[side]);
+        if (!wl || wl.kind === 'ext') return;
+        const a = E.axis(wl);
+        const ts = [[rm.x0, rm.y0], [rm.x1, rm.y0], [rm.x0, rm.y1], [rm.x1, rm.y1]]
+          .map(q => (q[0] - a.ax) * a.ux + (q[1] - a.ay) * a.uy);
+        const lo = Math.min.apply(null, ts), hi = Math.max.apply(null, ts);
+        for (let at = lo + 0.6; at <= hi - 0.6; at += 0.1) {
+          const hit = E.hitWall(wl, { at: at, w: 1.0, h: 2.1, sill: 0 }) || [];
+          const vs = hit.filter(c => c.vert);
+          if (!vs.length) continue;
+          nVert++;
+          const hole = { at0: at - 0.5, at1: at + 0.5, z0: 0, z1: 2.1 };
+          const plans = vs.map(c => E.planReroute(c, hole));
+          if (!plans.every(q => q && q.ok)) continue;
+          const pl = plans[0];
+          found = {
+            room: rm.num, side: side, wall: wl.id, at: +at.toFixed(2),
+            hit: hit.length, vert: vs.length,
+            why: pl.why, pts: (pl.pts || []).length, dir: pl.dir, addLen: +(+pl.addLen).toFixed(2)
+          };
+        }
+      });
+    });
+    return { found: found, nVert: nVert };
+  });
+  P('洞口盖住墙内下引管时，hitWall 现在报得出来（以前一根都看不到）',
+    vt.nVert > 0 && !!vt.found, vt.nVert + ' 个洞口位置报出了竖直管');
+  P('竖直管也有可落地的绕行方案（沿墙让到洞口一侧，U 形四段）',
+    !!(vt.found && vt.found.pts === 4 && vt.found.dir && /竖直/.test(vt.found.why)),
+    JSON.stringify(vt.found));
+
+  /* ② 链路级：开（撞横管）→ rebuild → 撤 → 再开 */
+  const v14 = await p.evaluate(async () => {
+    const E = window.BIM.elec, S = window.BIM.scene, M = window.BIM_MODEL, D = window.BIM.doorDbg, C = window.BIM.calc;
+    E.ready();
+    let best = null;
+    M.rooms.forEach(rm => {
+      if (best) return;
+      ['north', 'south', 'east', 'west'].forEach(side => {
+        if (best) return;
+        const wl = M.walls.find(w => w.id === (rm.sides || {})[side]);
+        if (!wl || wl.kind === 'ext') return;
+        const a = E.axis(wl);
+        const ts = [[rm.x0, rm.y0], [rm.x1, rm.y0], [rm.x0, rm.y1], [rm.x1, rm.y1]]
+          .map(q => (q[0] - a.ax) * a.ux + (q[1] - a.ay) * a.uy);
+        const lo = Math.min.apply(null, ts), hi = Math.max.apply(null, ts);
+        for (let at = lo + 0.6; at <= hi - 0.6; at += 0.1) {
+          const chk = C.door({ wall: wl, at: at, w: 1.0, h: 2.1, room: rm, equipments: [] });
+          if ((chk.blocks || []).filter(q => q.k !== 'conduit').length) continue;
+          const hit = chk.conduits || [];
+          if (!hit.length) continue;
+          const hole = { at0: at - 0.5, at1: at + 0.5, z0: 0, z1: 2.1 };
+          if (!hit.map(c => E.planReroute(c, hole)).every(q => q && q.ok)) continue;
+          best = { room: rm.num, side: side, wall: wl.id, at: +at.toFixed(2), hit: hit.length };
+        }
+      });
+    });
+    if (!best) return { best: null };
+    const rm = M.rooms.find(r => r.num === best.room);
+    S.setFocus(rm.floor);
+    const gcount = name => { const g = S.root().getObjectByName(name); return g ? g.children.length : 0; };
+    const S2 = window.BIM.state;
+    const o1 = D.openAt(rm, best.side, best.at, 1.0, 2.1);
+    const plan = E.reroutes()[0];
+    if (plan) S.showReroute(plan, 0x17a673);      // 等价于 UI 里 showHoleConflict 画的那条绿线
+    const opened = {
+      ok: !!(o1 && o1.ok), rerouted: (o1 && o1.rerouted) || 0,
+      rrData: Object.keys(E.data.reroutes || {}).length, sceneRr: gcount('reroutes')
+    };
+    E.rebuild();                                   // 开窗 / 打通 / 改尺寸都会走这里
+    const afterRebuild = Object.keys(E.data.reroutes || {}).length;
+    const u = D.undo();
+    await new Promise(rs => setTimeout(rs, 60));
+    const undone = {
+      restored: (u && u.conduitsRestored) || 0,
+      rrData: Object.keys(E.data.reroutes || {}).length,
+      sceneRr: gcount('reroutes'),
+      lastUndone: S2.lastUndone ? { at: +S2.lastUndone.at.toFixed(3), wall: S2.lastUndone.wall } : null
+    };
+    const o2 = D.openAt(rm, best.side, best.at, 1.0, 2.1);
+    const again = { ok: !!(o2 && o2.ok), rerouted: (o2 && o2.rerouted) || 0, why: o2 && o2.why };
+    if (o2 && o2.ok) D.undo();
+    return { best: best, opened: opened, afterRebuild: afterRebuild, undone: undone, again: again };
+  });
+  P('找到一个"能开、墙里真有横管"的位置', !!(v14.best && v14.best.hit > 0), JSON.stringify(v14.best));
+  P('开门时那几根管都改道了', !!(v14.opened && v14.opened.ok && v14.opened.rerouted === v14.best.hit),
+    JSON.stringify(v14.opened));
+  P('改线记录活过一次 rebuild（不再被整包清零）', v14.afterRebuild >= v14.best.hit,
+    '开门后 ' + v14.opened.rrData + ' 条 → 重建后 ' + v14.afterRebuild + ' 条');
+  P('撤门把改线记录清干净', v14.undone.rrData === 0, '剩 ' + v14.undone.rrData + ' 条，退回 ' + v14.undone.restored + ' 根');
+  P('撤门把画面上的绕行线一起收掉（不留痕）', v14.undone.sceneRr === 0,
+    '场景 reroutes 组剩 ' + v14.undone.sceneRr + ' 条');
+  P('撤门记下"刚撤掉的是哪一扇"', !!(v14.undone.lastUndone && Math.abs(v14.undone.lastUndone.at - v14.best.at) < 0.01),
+    JSON.stringify(v14.undone.lastUndone));
+  P('撤掉再点回来：同一个位置照样能开、照样改线',
+    !!(v14.again.ok && v14.again.rerouted >= 1), JSON.stringify(v14.again));
+
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));
   console.log(fail ? '\n❌ 失败 ' + fail + ' 项' : '\n✅ 全部通过');
