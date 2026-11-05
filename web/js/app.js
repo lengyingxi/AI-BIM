@@ -1029,8 +1029,10 @@
     const wall = M.walls.find(w => w.id === d.wall);
     if (wall) {
       const at = kind === 'door' ? S.doorAt(d, wall) : S.windowAt(d, wall);
+      /* 只判"在不在画面里"，不再要求"够不够大"：
+         洞口小但已经在画面里时，用户自己会推近；系统一动镜头，他刚摆好的视角就没了。 */
       if (at != null && (!S.inView || !S.inView(wall.floor,
-        d.pos[0] - 1.6, d.pos[1] - 1.6, d.pos[0] + 1.6, d.pos[1] + 1.6, 0.05, 0.02))) {
+        d.pos[0] - 1.6, d.pos[1] - 1.6, d.pos[0] + 1.6, d.pos[1] + 1.6, 0.04))) {
         S.focusDoor(wall, at, (M.rooms.find(r => (d.rooms || []).indexOf(r.id) >= 0)) || null);
       }
     }
@@ -2739,8 +2741,11 @@
             .map(x => x.num).join('、') + ' 打通，按合并后的大板 ' +
             ST.last.lx.toFixed(2) + '×' + ST.last.ly.toFixed(2) + ' m 重新校核：安全系数 ' + C.fmt(ST.last.K) + '（' + ST.last.v.word + '）。'
           : '';
+        /* 沿用上一轮那间（用户没报房号）时要说清"我按哪间放的"，
+           不然用户不知道系统是接着上文理解，还是自己猜的 */
+        const inhTxt = step.inheritedRoom ? '（沿用刚才的 ' + room.num + ' 室' + (ST.last && ST.last.merged ? '，已算作打通后的大板' : '') + '）' : '';
         ai((cont ? '接着又放了 ' : '好，' + hostNum + ' 室' + prefTxt + '放好 ') + okCount +
-          ' 台「' + dev.name + '」。' + tail + (fTxt ? fTxt + '。' : '') + mgTxt +
+          ' 台「' + dev.name + '」。' + inhTxt + tail + (fTxt ? fTxt + '。' : '') + mgTxt +
           (clashList.length ? '有 ' + clashList.length + ' 处和周边撞上了，都放进去了，位置列在下面。' : ''),
           card(ST.last) + (clashList.length
             ? '<div class="res bad" style="margin-top:8px"><div class="res-top"><span class="k">' + clashList.length +
@@ -2843,7 +2848,7 @@
     /* 这扇门为了腾位置让哪几根线管改了道，记在门身上：
        撤门时按这份名单把管子放回原来的走法（"回复原装"）。 */
     if (reroutedIds.length) d._reroutes = reroutedIds;
-    focusSoft(room, { color: false });
+    focusSoft(room, { keepView: true, color: false });
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
     /* 只留当前楼层，门洞别被上下层挡住 */
@@ -3209,7 +3214,7 @@
     const rerouted = dec.needReroute ? applyReroutes(dec) : 0;
     const d = S.addWindowOpening(wall, dec.at, w, h, sill);
     d.room = room.id;
-    focusSoft(room);
+    focusSoft(room, { keepView: true, color: false });
     const sp = doorSpot(wall, dec.at);
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, dec.at, room);
     /* 只留当前楼层，门洞别被上下层挡住 */
@@ -3554,7 +3559,7 @@
       side_changed: pickedFrom ? { from: pick, to: side } : null,
       warns: dec.chk.warns
     };
-    A.commit(step, { room: room, side: side });
+    A.commit(step, { room: room, side: side, to: room2 ? room2.num : null });
     return true;
   }
 
@@ -4197,6 +4202,7 @@
     if (!d.added) { ai('「' + d.name + '」是模型里原有的窗，拆不了。只说我新建的窗才能拆。'); return false; }
     const wall = M.walls.find(w => w.id === d.wall);
     const at = wall ? S.windowAt(d, wall) : null;
+    const rmW = wall ? (roomOfOpening(d, wall, at) || A.mem.ctx.room) : null;
     const snap = { wall: wall, at: at, w: d.w, h: d.h, sill: d.sill, name: d.name, room: d.room };
     S.removeWindow(d);
     if (ST.lastWin && ST.lastWin.d === d) ST.lastWin = null;
@@ -4207,6 +4213,7 @@
     });
     ai('把 ' + snap.name + ' 封了，墙上恢复成整面墙。要说撤回也行。');
     lastData = { removed: snap.name };
+    if (rmW) window.BIM.agent.commit({ act: 'windowoff', text: step.text }, { room: rmW });
     return true;
   }
 
@@ -4296,7 +4303,8 @@
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) { ai('找不到这扇窗挂在哪面墙上了。'); return false; }
     const at0 = S.windowAt(d, wall);
-    const room = step.roomRef || roomOfOpening(d, wall, at0) || null;
+    // 同改尺寸：窗在哪一段墙上说了算，上下文那间只作兜底
+    const room = roomOfOpening(d, wall, at0) || step.roomRef || null;
     if (at0 == null) { ai('这扇窗的位置读不出来，可能墙上的洞口已经被改掉了。'); return false; }
     const sill0 = d.sill == null ? 0.9 : d.sill;
     const w = d.w, h = d.h;
@@ -4388,7 +4396,7 @@
     ST.lastWin = { wall: wall, at: atF, w: w, h: h, d: nd, chk: chk, room: room };
     const sp = doorSpot(wall, atF);
     S.markDoorSpot(wall, atF, w, h, true);
-    if (room) focusSoft(room);
+    if (room) focusSoft(room, { keepView: true, color: false });
     if (!S.inView(wall.floor, sp.x - 1.8, sp.y - 1.8, sp.x + 1.8, sp.y + 1.8)) S.focusDoor(wall, atF, room);
 
     pushUndo('把窗挪回原来的位置', () => {
@@ -4419,6 +4427,7 @@
       headroom_m: +Math.max(0, upLeft).toFixed(2),
       slid_to_fit: !!note
     };
+    if (room) window.BIM.agent.commit({ act: 'winmove', text: step.text }, { room: room });
     return true;
   }
 
@@ -4439,8 +4448,12 @@
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) { ai('找不到这扇窗挂在哪面墙上了。'); return false; }
     const at0w = S.windowAt(d, wall);
-    const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null)
-      || roomOfOpening(d, wall, at0w) || null;
+    /* ★ 房间以"这扇窗实际在墙上的哪一段"为准，其次才用对话里给的房号/上下文。
+       反过来的话，刚在某间房打完洞（上下文记着那间），再点另一间的窗改尺寸，
+       会拿错房间去校核 —— 报"这个位置已经出了本房间的墙面范围"，
+       明明原位扩 0.15 m 都过不了。 */
+    const room = roomOfOpening(d, wall, at0w)
+      || step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || null;
 
     const has = step.width != null || step.height != null || step.sill != null;
     if (!has) {
@@ -4490,7 +4503,7 @@
     if (!nd) { ai('洞口没改成功，先撤回再试。'); return false; }
     ST.lastWin = { wall: wall, at: atF, w: nw, h: nh, d: nd, chk: chk, room: room };
     S.markDoorSpot(wall, atF, nw, nh, true);
-    if (room) focusSoft(room);
+    if (room) focusSoft(room, { keepView: true, color: false });
     pushUndo('把这扇窗改回 ' + before.w.toFixed(2) + '×' + before.h.toFixed(2) + ' 米', () => {
       const bak = S.replaceWindow(nd, { at: at, w: before.w, h: before.h, sill: before.sill });
       if (bak) ST.lastWin = { wall: wall, at: at, w: before.w, h: before.h, d: bak, room: room };
@@ -4518,6 +4531,7 @@
       at: +atF.toFixed(2), corner_left_m: +(atF - nw / 2 - span.lo).toFixed(2),
       corner_right_m: +(span.hi - atF - nw / 2).toFixed(2), slid_to_fit: !!slid
     };
+    if (room) window.BIM.agent.commit({ act: 'winsize', text: step.text }, { room: room });
     return true;
   }
 
@@ -4845,6 +4859,14 @@
     const o = opts || {};
     S.setFocus(room.floor, false);
     if (o.only) S.isolateRoom(room, true);
+    /* keepView：只切显隐，相机一点都不碰。
+       门窗选中/改尺寸/挪位置都走这条 —— 用户原话："不要旋转，保持用户视角不变"。
+       frameBounds 就算 keepAngle 也会把俯角拉到 0.86 rad，用户看来就是"镜头转了一下"。 */
+    if (o.keepView) {
+      if (o.color === false) return;
+      if (o.color || o.fill > 0) S.highlightRoom(room, o.color || 0x10a394, { fill: o.fill || 0, beam: o.beam });
+      return;
+    }
     // tight：不管房间在不在画面里都重新取景。问净距必须这么干——
     // 全楼视角下房间"确实在画面里"，可虚框上 0.5 m 的数字只剩三五个像素
     if (o.tight || !S.inView || !S.inView(room.floor, room.x0, room.y0, room.x1, room.y1, 0.06, 0.12)) {
@@ -5450,6 +5472,8 @@
       return false;
     }
     const wasModel = !d.added;
+    const rmD = (d.room && M.rooms.find(r => r.id === d.room))
+      || M.rooms.find(r => (d.rooms || []).indexOf(r.id) >= 0) || null;
     const snap = undoDoor(d, true);
     if (!snap) { ai('这扇门在墙上找不到对应的洞口，没敢动它。'); return false; }
     /* 以前这里对模型原有的门一律拒绝（"只说我新建的门才能拆"）。
@@ -5468,6 +5492,7 @@
       if (snap.added) nd.added = true;
       ST.lastDoor = { wall: wall, at: snap.at, w: snap.w, d: nd, room: doorRoom(nd) };
     });
+    if (rmD) window.BIM.agent.commit({ act: 'dooroff', text: step.text }, { room: rmD });
     return true;
   }
 
@@ -5484,7 +5509,9 @@
     }
     const wall0 = M.walls.find(w => w.id === d.wall);
     if (!wall0) return false;
-    const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
+    // 门实际挂在哪一段墙上，比上下文更可信（否则挪门会拿错房间校核）
+    const room = roomOfOpening(d, wall0, S.doorAt(d, wall0))
+      || step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
 
     // 换墙：说到另一面墙时把门整体搬过去（"左边那面墙"要按当前镜头换算）
     let wall = wall0, changedWall = false;
@@ -5577,7 +5604,7 @@
     if (rm) rememberDoor(rm, wantSide || null, d.w, d.h);
     const sp = doorSpot(wall, finalAt);
     S.markDoorSpot(wall, finalAt, d.w, d.h, true);
-    if (rm) focusSoft(rm, { color: false });
+    if (rm) focusSoft(rm, { color: false, keepView: true });
     if (!S.inView(wall.floor, sp.x - 1.6, sp.y - 1.6, sp.x + 1.6, sp.y + 1.6)) S.focusDoor(wall, finalAt, rm);
 
     pushUndo('把门挪回原来的位置', () => {
@@ -5593,6 +5620,7 @@
       (moveReroutes ? '墙里那 ' + moveReroutes.length + ' 根线管按新位置重新绕了一次，绿色是改完的走向。' : ''));
     lastData = { width: d.w, height: d.h, moved_m: +moved.toFixed(2), changedWall: changedWall,
                  at: +finalAt.toFixed(2), rerouted: moveReroutes ? moveReroutes.length : 0 };
+    if (rm) window.BIM.agent.commit({ act: 'doormove', text: step.text }, { room: rm });
     return true;
   }
 
@@ -5610,7 +5638,10 @@
     }
     const wall = M.walls.find(w => w.id === d.wall);
     if (!wall) return false;
-    const room = step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
+    /* 同开窗：这扇门实际在哪一段墙上才是准的，上下文那间只作兜底 */
+    const atD0 = S.doorAt(d, wall);
+    const room = roomOfOpening(d, wall, atD0)
+      || step.roomRef || (step.room ? window.BIM.agent.roomByNum(step.room, step.floor) : null) || doorRoom(d);
 
     const has = step.width != null || step.height != null;
     if (!has) {
@@ -5668,7 +5699,7 @@
     ST.lastDoor = { wall: wall, at: best.at, w: best.w, d: nd, chk: chk, room: room };
     if (room) rememberDoor(room, null, best.w, nh);
     S.markDoorSpot(wall, best.at, best.w, nh, true);
-    if (room) focusSoft(room, { color: false });
+    if (room) focusSoft(room, { keepView: true, color: false });
     pushUndo('把门改回 ' + before.w.toFixed(2) + '×' + before.h.toFixed(2) + ' 米', () => {
       const bak = S.replaceDoor(nd, { at: best.at, w: before.w, h: before.h });
       if (bak) ST.lastDoor = { wall: wall, at: best.at, w: before.w, d: bak, room: room };
@@ -5709,6 +5740,7 @@
     lastData = { door: nd.code || nd.name, door_id: nd.id, width: best.w, height: nh,
                  moved: +moved.toFixed(2), rerouted: reRouted,
                  grow: [+growL.toFixed(2), +growR.toFixed(2)], k: r2 ? +C.fmt(r2.K) : null };
+    if (room) window.BIM.agent.commit({ act: 'doorsize', text: step.text }, { room: room });
     return true;
   }
 
@@ -5898,7 +5930,7 @@
     ST.lastDoor = { wall: wall, at: best.at, w: best.w, d: nd, chk: chk, room: room };
     if (room) rememberDoor(room, null, best.w, nh);
     S.markDoorSpot(wall, best.at, best.w, nh, true);
-    if (room) focusSoft(room);
+    if (room) focusSoft(room, { keepView: true, color: false });
     pushUndo('把门改回 ' + d.w.toFixed(2) + '×' + d.h.toFixed(2) + ' 米', () => {
       const bak = S.replaceDoor(nd, { at: best.at, w: d.w, h: d.h });
       if (bak) ST.lastDoor = { wall: wall, at: best.at, w: d.w, d: bak, room: room };

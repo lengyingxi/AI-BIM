@@ -1904,8 +1904,9 @@
     flyTo(new THREE.Vector3(x + 8, f.elev + 14, -y + 11), new THREE.Vector3(x, f.elev + .6, -y), 700);
   };
 
-  /* 把镜头放到房间内侧，正对这面墙看门 */
-  S.focusDoor = function (wall, at, room) {
+  /* 把镜头放到房间内侧，正对这面墙看门 —— 这是"我要看这扇门"的老行为（会转视角）。
+     现在点门窗、改尺寸之后一律走下面那套"只平移、不旋转"，所以把老行为单独留个名字。 */
+  S.faceDoor = function (wall, at, room) {
     const [ax, ay] = wall.p1, [bx, by] = wall.p2;
     const L = Math.hypot(bx - ax, by - ay) || 1, ux = (bx - ax) / L, uy = (by - ay) / L;
     const px = ax + ux * at, py = ay + uy * at;
@@ -1920,6 +1921,31 @@
     const t = new THREE.Vector3(px, wall.base + 1.2, -py);
     const p = new THREE.Vector3(px + nx * dist, wall.base + 3.0, -(py + ny * dist));
     flyTo(p, t, 680);
+  };
+
+  /* 对准一个门窗洞口，但**绝不旋转视角**：
+     用户原话："点击窗子并操作以后，再次点击窗子或别的窗子，视角会旋转，不要旋转，保持用户视角不变"。
+     所以这里只做两件事：
+       ① 洞口已经在画面里 → 一点都不动（连平移都不做）；
+       ② 洞口在画面外 → 保持当前镜头方向与距离，把视点平移到洞口上（纯平移，视角朝向不变）。
+     opt.rotate=true 才退回"飞过去正对墙面"的老做法（faceDoor）。 */
+  S.focusDoor = function (wall, at, room, opt) {
+    const o = opt || {};
+    if (o.rotate) return S.faceDoor(wall, at, room);
+    const [ax, ay] = wall.p1, [bx, by] = wall.p2;
+    const L = Math.hypot(bx - ax, by - ay) || 1, ux = (bx - ax) / L, uy = (by - ay) / L;
+    const px = ax + ux * at, py = ay + uy * at;
+    const half = Math.max(1.4, (o.w || 2) / 2 + 0.9);
+    if (S.inView && S.inView(wall.floor, px - half, py - half, px + half, py + half, 0.02)) return;
+    const f = floorGroups.find(q => q.level === wall.floor);
+    const elev = f ? f.elev : 0;
+    const t = new THREE.Vector3(px, elev + 1.3, -py);
+    const dir = camera.position.clone().sub(controls.target);
+    let D = dir.length();
+    if (!isFinite(D) || D < 4) { dir.set(.12, .82, .57); D = 22; }
+    dir.normalize();
+    const p = t.clone().add(dir.multiplyScalar(D));
+    flyTo(p, t, 460);
   };
 
   /* 按一块区域（若干房间）自动取景，保证被高亮的房间全在画面里 */

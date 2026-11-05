@@ -540,22 +540,107 @@ const H = t => console.log('\n' + t);
     return { id: d.id };
   });
   await sleep(1200);
+  /* 用户要的是"视角别转"，不是"一次都别动相机"：
+     洞口在画面外时允许把视点平移过去，但**朝向必须一点不变**。
+     所以这里量的是 camera 的视线方向（position-target），不是调用次数。 */
+  const camDir = () => p.evaluate(() => {
+    const S = window.BIM.scene, c = S.camera(), t = S.controls();
+    const v = c.position.clone().sub(t.target || t).normalize();
+    return { x: +v.x.toFixed(4), y: +v.y.toFixed(4), z: +v.z.toFixed(4) };
+  });
+  const d0 = await camDir();
   const cam2 = await p.evaluate(id => {
     const M = window.BIM_MODEL;
     const d = (M.doors || []).find(x => x.id === id);
-    window.BIM.selectOpening({ kind: 'door', data: d }, true);   // 先让它把镜头摆到门上
+    window.__fly = 0;
+    window.BIM.selectOpening({ kind: 'door', data: d }, true);
     return { w: window.__fly };
   }, cam.id);
-  await sleep(1400);
-  const cam3 = await p.evaluate(id => {
+  await sleep(900);
+  const d1 = await camDir();
+  const cam3 = await p.evaluate(async id => {
     const M = window.BIM_MODEL;
     const d = (M.doors || []).find(x => x.id === id);
     window.__fly = 0;
-    for (let i = 0; i < 3; i++) window.BIM.selectOpening({ kind: 'door', data: d }, true);
+    for (let i = 0; i < 3; i++) {
+      window.BIM.selectOpening({ kind: 'door', data: d }, true);
+      await new Promise(r => setTimeout(r, 600));
+    }
     return { fly: window.__fly };
   }, cam.id);
-  P('门窗已经在画面里时，再点它不动镜头', cam3.fly === 0,
-    '把镜头对准它时飞了 ' + cam2.w + ' 次，之后再点 3 次飞 ' + cam3.fly + ' 次');
+  await sleep(600);
+  const d2 = await camDir();
+  const same = (a, b) => Math.abs(a.x - b.x) < 5e-3 && Math.abs(a.y - b.y) < 5e-3 && Math.abs(a.z - b.z) < 5e-3;
+  P('点门窗不转视角（朝向一点不变）', same(d0, d1) && same(d0, d2),
+    '朝向 ' + JSON.stringify(d0) + ' → 第1次 ' + JSON.stringify(d1) + ' → 连点3次后 ' + JSON.stringify(d2) +
+    '（镜头调用 ' + cam2.w + ' / ' + cam3.fly + ' 次，只平移不旋转）');
+
+  /* ---------- ⑬ 2.4 m 以上能拓 · 打通后"放中间"接得上上下文 ---------- */
+  H('【13】门洞 2.4 m 不是死线 · 打通后不报房号也接得上');
+  /* 磁共振这类设备立起来搬要 2.55 m 宽，模型里 2.4 m 的门以前被一票否决 */
+  const wide = await p.evaluate(() => {
+    const M = window.BIM_MODEL, S = window.BIM.scene, C = window.BIM.calc;
+    const wall = M.walls.find(w => w.floor === 2 && w.kind === 'corr');
+    const a = C.door({ wall: wall, at: 4.8, w: 2.55, h: 2.3, conduitBlock: false });
+    const b2 = C.door({ wall: wall, at: 4.8, w: 4.5, h: 2.3, conduitBlock: false });
+    function spanOf(wl, r) {
+      const [ax, ay] = wl.p1, [bx, by] = wl.p2;
+      const L = Math.hypot(bx - ax, by - ay), ux = (bx - ax) / L, uy = (by - ay) / L;
+      const ts = [[r.x0, r.y0], [r.x1, r.y0], [r.x0, r.y1], [r.x1, r.y1]]
+        .map(([x, y]) => (x - ax) * ux + (y - ay) * uy);
+      return { lo: Math.min.apply(null, ts), hi: Math.max.apply(null, ts) };
+    }
+    let n = 0;
+    (M.doors || []).forEach(d => {
+      const wl = M.walls.find(w => w.id === d.wall);
+      if (!wl || wl.kind === 'ext') return;
+      const at = S.doorAt(d, wl);
+      if (at == null) return;
+      const rr = (M.rooms || []).filter(x => (wl.rooms || []).indexOf(x.id) >= 0 && x.zone !== 'corr')
+        .find(x => { const s2 = spanOf(wl, x); return at > s2.lo + 0.02 && at < s2.hi - 0.02; });
+      if (!rr) return;
+      const plan = C.widenPlan({ wall: wl, at: at, w: d.w, h: 2.3, need: 2.55, room: rr, equipments: [], self: d });
+      if (plan.best && plan.best.w >= 2.54) n++;
+    });
+    return {
+      w255: { pass: a.pass, blocks: a.blocks.map(x => x.k + ':' + x.t), warns: a.warns },
+      w450: { pass: b2.pass, blocks: b2.blocks.map(x => x.k + ':' + x.t) },
+      n: n
+    };
+  });
+  P('2.55 m 宽不再判"不能开"，只提示按特殊门做',
+    !wide.w255.blocks.some(t => /^size/.test(t)) && wide.w255.warns.some(w => /2\.4/.test(w)),
+    'blocks=' + JSON.stringify(wide.w255.blocks) + ' warns=' + wide.w255.warns[0]);
+  P('4.5 m 才算结构洞口拦下', wide.w450.pass === false && wide.w450.blocks.some(t => /^size/.test(t)),
+    JSON.stringify(wide.w450).slice(0, 120));
+  P('全楼有 10 扇以上的门真能拓到 2.55 m', wide.n >= 10, wide.n + ' 扇（修之前 2.4 m 一票否决，必然是 0）');
+
+  await call('open_passage', { room: '202', to: '203' });
+  await sleep(2400);
+  const ctx2 = await p.evaluate(() => {
+    const A = window.BIM.agent;
+    const lp = A.local('放个设备到中间');
+    return {
+      room: A.mem.ctx.room && A.mem.ctx.room.num,
+      lastPassage: A.mem.lastPassage && A.mem.lastPassage.room.num,
+      step: (lp.steps || [])[0] ? { act: lp.steps[0].act, roomRef: lp.steps[0].roomRef && lp.steps[0].roomRef.num, pref: lp.steps[0].pref } : null
+    };
+  });
+  P('打通后上下文记着是哪间、哪块板',
+    ctx2.room === '202' && ctx2.lastPassage === '202', JSON.stringify(ctx2));
+  P('「放个设备到中间」不反问房号，直接落到 202 的合并板中间',
+    !!(ctx2.step && ctx2.step.roomRef === '202' && ctx2.step.pref === 'center'), JSON.stringify(ctx2.step));
+
+  const put = await call('place_equipment', { device: '空气压缩机' });
+  await sleep(2200);
+  const mid = await p.evaluate(() => {
+    const S = window.BIM.state, M = window.BIM_MODEL;
+    const e = S.placed[S.placed.length - 1];
+    const a = M.rooms.find(r => r.num === '202'), b2 = M.rooms.find(r => r.num === '203');
+    const mx = (Math.min(a.x0, b2.x0) + Math.max(a.x1, b2.x1)) / 2, my = (Math.min(a.y0, b2.y0) + Math.max(a.y1, b2.y1)) / 2;
+    return e ? { d: +Math.hypot(e.x - mx, e.y - my).toFixed(2), merged: !!(S.last && S.last.merged) } : null;
+  });
+  P('设备落在打通两间的几何中间', mid && mid.merged && mid.d < 1.5, JSON.stringify(mid));
 
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));

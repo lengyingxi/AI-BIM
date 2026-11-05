@@ -110,11 +110,15 @@
     placed: [],         // 本轮会话放过的设备
     lastDoor: null,
     lastValve: null,
-    lastResult: null    // 最近一次结构校核结果
+    lastResult: null,   // 最近一次结构校核结果
+    /* 最近一次打通/拆墙：之后用户说"放中间""这块板"要落到这两间的合并板上 */
+    lastPassage: null,
+    lastOpening: null   // 最近一次动过的门窗（改尺寸/挪位/拆掉）
   };
   A.resetMem = function () {
     A.mem.turns = []; A.mem.ctx = { floor: null, room: null, device: null, pref: null, side: null };
     A.mem.lastPlaced = null; A.mem.placed = []; A.mem.lastDoor = null; A.mem.lastValve = null; A.mem.lastResult = null;
+    A.mem.lastPassage = null; A.mem.lastOpening = null;
   };
   function remember(role, text) {
     A.mem.turns.push({ role: role, text: String(text).slice(0, 200) });
@@ -169,6 +173,9 @@
   A.deviceByName = deviceByName;
   A.fillStep = function (st) { return fill(st); };      // 给工具层用
 
+  /* 这些动作天然是"落在某一间房里"的：用户没给房号就沿用上一间（多轮连贯） */
+  const INHERIT_ROOM = /^(place|move|remove|replace|resize|suggest|findroom|clearance|door|doorsize|doormove|dooroff|doorinfo|doors|window|winsize|winmove|windowoff|wininfo|wins|passage|valve|impact)$/;
+
   /* 指代/省略补全：把这一步缺的槽位用上下文填上 */
   function fill(step) {
     const m = A.mem;
@@ -176,6 +183,8 @@
     const t = step.text || '';
     const REF_ROOM = /这个房间|这间房|这一间|这里|该房间|同一间|还是这间|它那间/;
     const REF_DEV = /这个设备|这台设备|这台|该设备|它|刚刚那台|刚才那台|同一台/;
+    /* 「这块板」「打通的这两间」也是指代：打通之后用户不会再报房号 */
+    const REF_PLATE = /这块(?:楼)?板|这片|这两间|两间|连通|打通|合并/;
 
     if (step.room) {
       const r = roomByNum(step.room, step.floor);
@@ -184,7 +193,20 @@
       step.roomRef = m.ctx.room; step.floor = m.ctx.room.floor;
     } else if (!step.room && step.act === 'place' && m.ctx.room && /再放|再摆|继续放|再来一台|还要放/.test(t)) {
       step.roomRef = m.ctx.room; step.floor = m.ctx.room.floor;
+    } else if (!step.room && m.ctx.room && INHERIT_ROOM.test(step.act || '')) {
+      /* ★ 多轮连贯：刚打完洞/开完门，用户下一句往往只说"放个设备到中间""挪一下"
+         不再报房号。以前这里只认「再放」「这间房」，于是上下文断了，
+         系统反问"要放到哪一间"——用户原话："对话上下文理解没有连贯"。
+         现在：action 本身是要落在某间房里的，且用户没给房号、也没换楼层，就沿用上一间。 */
+      if (step.floor == null || step.floor === m.ctx.room.floor) {
+        step.roomRef = m.ctx.room;
+        step.floor = m.ctx.room.floor;
+        step.inheritedRoom = true;
+      }
     }
+    /* 打通之后说"中间/正中/这块板"→ 落位取合并大板的正中（not 某一小间的正中） */
+    if (step.act === 'place' && /中间|正中|居中|这块(?:楼)?板|两间/.test(t) && (!step.pref)) step.pref = 'center';
+    if (step.act === 'place' && REF_PLATE.test(t) && m.lastPassage) step.plateHint = true;
 
     if (!step.device && (REF_DEV.test(t) || step.act === 'place' && /再放|再来一台|还要放|再摆/.test(t))) {
       step.device = m.ctx.device || (m.lastPlaced && m.lastPlaced.name) || null;
@@ -1277,6 +1299,26 @@
     if (step.act === 'door' && extra && extra.room) {
       m.ctx.room = extra.room; m.ctx.floor = extra.room.floor;
       m.lastDoor = { room: extra.room, side: extra.side || step.side, w: step.width, h: step.height };
+    }
+    /* ★ 打通/拆墙、开窗、改门窗尺寸位置 —— 都要把"现在在弄哪间房"记下来。
+       以前只记 place/door/valve，打通完接着一句"放个设备到中间"，
+       上下文里房间是空的，系统只能反问"要放到哪一间"。
+       同时把打通这件事本身记进 lastPassage，后面说"这块板/这两间"能认出来。 */
+    if (extra && extra.room && /^(passage|window|winsize|winmove|windowoff|doorsize|doormove|dooroff)$/.test(step.act || '')) {
+      m.ctx.room = extra.room;
+      m.ctx.floor = extra.room.floor;
+      m.lastOpening = { kind: step.act, room: extra.room, side: extra.side || step.side || null, at: Date.now() };
+    }
+    if (step.act === 'passage') {
+      const rm = (extra && extra.room) || m.ctx.room;
+      if (rm) {
+        m.lastPassage = {
+          room: rm, floor: rm.floor, to: (extra && extra.to) || step.to || null,
+          side: (extra && extra.side) || step.side || null, at: Date.now()
+        };
+        // 打通完紧接着"放到中间"，取的是合并大板的正中
+        m.ctx.pref = 'center';
+      }
     }
     if (step.act === 'valve') {
       if (extra && extra.valve) { m.lastValve = extra.valve; if (extra.room) { m.ctx.room = extra.room; m.ctx.floor = extra.room.floor; } }

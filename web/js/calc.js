@@ -639,11 +639,25 @@
     if (e0 < 0.22) blocks.push({ t: e0 < 0.02 ? '门已经压到墙角上，墙垛留不住' : '离墙角只有 ' + fmt(e0, 2) + ' 米，墙垛太窄', k: 'angle' });
     if (e1 < 0.22) blocks.push({ t: e1 < 0.02 ? '门已经压到另一头墙角' : '离另一头墙角只有 ' + fmt(e1, 2) + ' 米，墙垛太窄', k: 'angle' });
 
-    // 尺寸本身是否合理
+    /* 尺寸本身是否合理。
+       ★ 2.4 m 不是"开不了"，只是"常规门做不到"——搬运大设备（磁共振、CT、冷水机组）
+       的机房门口 2.5~3.0 m 很常见，做法是特殊门/门套/上门顶过梁。
+       以前把它当硬性 block，于是"明明两侧各有 2 米多的余量，却说这扇门拓不了"，
+       用户直接指出来过。现在 2.4 m 只提示做法，4 m 以上才按结构洞口拦。 */
     if (w < 0.6) blocks.push({ t: '门宽 ' + fmt(w, 2) + ' m 太窄，人过不去（最小 0.6 m）', k: 'size' });
-    if (w > 2.4) blocks.push({ t: '门宽 ' + fmt(w, 2) + ' m 超过 2.4 m，要做特殊门或加门套', k: 'size' });
+    if (w > 2.4 && w <= 4.0) {
+      warns.push('门洞 ' + fmt(w, 2) + ' m 超过常规 2.4 m，要按特殊门做（门顶加过梁、五金按大洞口选，必要时带门套）');
+    }
+    if (w > 4.0) blocks.push({ t: '门洞 ' + fmt(w, 2) + ' m 超过 4.0 m，这已经是洞口而不是门，要按结构洞口做过梁和抗侧', k: 'size' });
     if (o.room) {
-      const ts = [[o.room.x0, o.room.y0], [o.room.x1, o.room.y0], [o.room.x0, o.room.y1], [o.room.x1, o.room.y1]]
+      /* 打通以后这一片是一块板：门往外扩到隔壁那间里也是合法的，
+         所以范围要按**合并后的板**量，不能还按原来那一小间卡。 */
+      let geo = o.room;
+      if (C.plateOf) {
+        const pl = C.plateOf(o.room);
+        if (pl && pl.merged && pl.x1 > pl.x0) geo = pl;
+      }
+      const ts = [[geo.x0, geo.y0], [geo.x1, geo.y0], [geo.x0, geo.y1], [geo.x1, geo.y1]]
         .map(([x, y]) => (x - ax) * ux + (y - ay) * uy);
       const lo2 = Math.min.apply(null, ts), hi2 = Math.max.apply(null, ts);
       if (at - half < lo2 - 0.05 || at + half > hi2 + 0.05) {
@@ -1125,7 +1139,9 @@
                            equipments: equipments, self: o.self });
       if (chk.pass) return { chk: chk, pass: true, reroutes: null, needReroute: false };
       const bl = chk.blocks || [];
-      const onlyCond = bl.length === 1 && bl[0].k === 'conduit';
+      /* 只要**卡住的都是线管**（不管报了几条），就都算"能处理"，再牵一次线即可。
+         以前写死 bl.length===1，同时报两条线管就判死 —— 用户看到的就是"明明能拓却不行"。 */
+      const onlyCond = bl.length > 0 && bl.every(b => b.k === 'conduit');
       if (onlyCond) {
         const pl = rerouteForConduits(chk.conduits || [], at2, w2, h, 0);
         if (pl) return { chk: chk, pass: true, reroutes: pl, needReroute: true };
