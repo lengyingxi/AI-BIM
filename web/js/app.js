@@ -1956,7 +1956,8 @@
           (dec.moved ? dec.moveNote + '；' : '') +
           (dec.rerouteNote ? dec.rerouteNote + '。' : '') +
           p.width.toFixed(2) + ' 米宽的门已经开在距墙端 ' + C.fmt(at, 2) + ' 米处。' +
-          '红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向，绕行多走的线也补上了。',
+          '半透明带虚线边的那根是原管线的走向（留着做对照），红色两个断头是它原来穿门洞的位置（已经凿断），' +
+          '绿色是改完的新走向，绕行多走的线也补上了。',
           conduitCard(dec.hits, dec.reroutes || [], dec));
         doorPointChips(room, sideOfWall(room, wall) || p.side, p.width, p.height, '再挑个位置');
         return;
@@ -2921,7 +2922,7 @@
     if (dec.needReroute) {
       ai(head2 + '。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
         '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
-        '。红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card2);
+        '。半透明带虚线边的那根是原管线走向（留着对照），红色的两个断头是它原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card2);
     } else if (dec.moved) {
       ai(head2 + '。' + dec.moveNote + '。', card2);
     } else {
@@ -3058,7 +3059,7 @@
     /* ── 第二段：位置没问题，剩下的只可能是墙里的线管 ────────── */
     const hits = c0.conduits || [];
     const sill = o.kind === 'window' ? o.sill : 0;
-    const hole = { at0: at - o.w / 2, at1: at + o.w / 2, z0: sill, z1: sill + o.h };
+    const hole = { at0: at - o.w / 2, at1: at + o.w / 2, z0: sill, z1: sill + o.h, wall: wall.id };
     /* 同一个洞口常常不止一根管：一根一根排，后面的要避开前面已经占掉的标高，
        否则三根管会被排到同一个高度上 —— 画出来是一条绿线，实际是三根叠在一起。
        用户原话："在管线开门汇集处没有考虑所有管线的绕行"。 */
@@ -3247,6 +3248,27 @@
         if (z0 < hole.z0 - 0.01) out.push(Object.assign({}, c, { id: c.id + '-s0', z0: Math.max(z0, hole.z0 - g), z1: hole.z0 }));
         return;
       }
+      /* 明敷段（配电箱层进线、箱到桥架）：只有两端点，没有 at0/at1，
+         就在洞口两侧各截 0.18 m 出来，红色读作"这里被打断了"。 */
+      if (c.free && c.p1 && c.p2 && wall) {
+        const E = window.BIM.elec;
+        const ax = E && E.axis ? E.axis(wall) : null;
+        if (!ax) return;
+        const f = q => (q[0] - ax.ax) * ax.ux + (q[1] - ax.ay) * ax.uy;
+        const aA = f(c.p1), aB = f(c.p2), den = aB - aA;
+        if (Math.abs(den) < 1e-6) return;
+        const P = atv => {
+          const t = Math.max(0, Math.min(1, (atv - aA) / den));
+          return [c.p1[0] + (c.p2[0] - c.p1[0]) * t,
+                  c.p1[1] + (c.p2[1] - c.p1[1]) * t,
+                  c.p1[2] + (c.p2[2] - c.p1[2]) * t];
+        };
+        const l0 = P(hole.at0 - g), l1 = P(hole.at0);
+        const r0 = P(hole.at1), r1 = P(hole.at1 + g);
+        if (Math.abs(f(l1) - f(l0)) > 0.02) out.push(Object.assign({}, c, { id: c.id + '-s0', p1: l0, p2: l1 }));
+        if (Math.abs(f(r1) - f(r0)) > 0.02) out.push(Object.assign({}, c, { id: c.id + '-s1', p1: r0, p2: r1 }));
+        return;
+      }
       if (c.at0 == null) return;
       const a0 = Math.max(c.at0, hole.at0 - g), a1 = Math.min(c.at1, hole.at0);
       if (a1 - a0 > 0.02) out.push(Object.assign({}, c, { id: c.id + '-s0', at0: a0, at1: a1 }));
@@ -3281,11 +3303,31 @@
          不能拿 hits 里的旧对象 —— 旧对象还跨着门洞，画出来就是"管子还穿过门"。
          按"同墙、同回路"重新取一遍，拿不到才退回旧对象。 */
     const E2 = window.BIM.elec;
-    const circOn = {};
-    all.forEach(c => { if (c && c.circuit) circOn[c.circuit] = 1; });
-    const fresh = (E2.conduitsOf ? (E2.conduitsOf({ wall: wall.id }) || []) : [])
+    const circOn = {}, offKey = {};
+    all.forEach(c => {
+      if (!c) return;
+      if (c.circuit) circOn[c.circuit] = 1;
+      /* 没挂在墙上、但被这扇门撞到的明敷段（配电箱层进线、箱到桥架）：
+         按"回路 + 层"认，重建之后它们会换成 FD-4-s0 这类新 id，按 id 认不出来。 */
+      if (!c.wall && c.circuit) offKey[c.circuit + '|' + c.layer] = 1;
+    });
+    const wallOn = (E2.conduitsOf ? (E2.conduitsOf({ wall: wall.id }) || []) : [])
       .filter(c => circOn[c.circuit]);
+    /* ★ 这面墙上的管 + 被撞到的明敷连接管，一起摆在画面上。
+       上一版只取 `conduitsOf({wall})`，而明敷段的 wall 是 null，
+       于是"涉及到的原管线"被漏掉了 —— 用户原话：
+       "把原先需要展示的涉及到的原管线去掉了，我需要保留展示"。 */
+    const offOn = (E2.conduitsOf ? (E2.conduitsOf({ floor: wall.floor }) || []) : [])
+      .filter(c => !c.wall && offKey[c.circuit + '|' + c.layer]);
+    const fresh = wallOn.concat(offOn);
     S.isolateConduits(fresh.length ? fresh : all);
+    /* ★ 原管线要整根显示出来，不能只剩断头。
+       用户原话："原管线也需要显示，而不是直接截断了" ——
+       改线之后墙里那根已经被洞口断成两截，只看红色断头根本判断不出
+       "它原来是从这头走到那头的"。所以把**开门前**的完整走向再铺一层虚影：
+       40% 半透明 + 白色虚线边，读作"原来是这么走的，现在改到绿线那儿去了"。
+       它是虚影不是管子（不参与碰撞、也不在隔离那批里），实心层在门洞里仍然是空的。 */
+    if (S.showRemovedConduits && all.length) S.showRemovedConduits(all, 0.40);
     const hole = (plans && plans.length && plans[0] && plans[0].hole) || null;
     S.markConduits(hole ? cutStubs(wall, all, hole) : all, 0xff3b30);
     (plans || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
@@ -3368,7 +3410,7 @@
       ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
         ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
         '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
-        '。红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card);
+        '。半透明带虚线边的那根是原管线走向（留着对照），红色的两个断头是它原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card);
     } else if (dec.moved) {
       ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
         ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + dec.moveNote + '。', card);

@@ -859,6 +859,145 @@ const H = t => console.log('\n' + t);
   P('一个洞口里好几根管时，每根排到互不相同的标高（不再叠死）',
     !!(mv && mv.n >= 2 && mv.distinct === mv.n), JSON.stringify(mv));
 
+  /* ---------------- 【16】配电箱的连接管撞门也要改道 ----------------
+     用户原话："这个目前在405的控制箱后面开门时候连接管碰撞到了门但是没有绕行的处理"。
+     那根是**层进线 FD**（从立管水平引到箱顶，2.05 m 高），它 wall=null 只有两端点，
+     以前 hitWall 按"墙 id"过滤，这类明敷段根本进不了冲突集合 ——
+     于是门头前面横着一根管，既不报冲突、也没有绿线，用户只能说"没处理"。
+     另外用户还指出："把原先需要展示的涉及到的原管线去掉了" ——
+     上一版隔离清单只取 conduitsOf({wall})，明敷段照样被漏掉，这一节一起验。 */
+  H('【16】配电箱层进线撞门：算进冲突 · 抬过门头 · 撤门还原');
+  const v16 = await p.evaluate(async () => {
+    const E = window.BIM.elec, M = window.BIM_MODEL, S = window.BIM.scene, D = window.BIM.doorDbg;
+    E.ready();
+    const rm = M.rooms.find(x => x.num === '405');
+    const wl = M.walls.find(w => w.id === rm.sides.west);
+    const a = E.axis(wl);
+    const f = M.floors.find(x => x.level === 4);
+    const AT = 1.90, W = 1.0, H = 2.1;
+    const HOLE = { at0: AT - W / 2, at1: AT + W / 2, z0: 0, z1: H };
+    const R2 = v => +v.toFixed(3);
+
+    const hitObjs = E.hitWall(wl, { at: AT, w: W, h: H, sill: 0 }) || [];
+    const hits = hitObjs.map(c => c.id);
+    const fdBefore = (E.data.conduits || []).filter(c => /^FD-4$/.test(c.id)).length;
+
+    S.setFocus(4, false);
+    const o = D.openAt(rm, 'west', AT, W, H);
+
+    /* 铺出来的 FD 段（改道后应该拆成 5 段，跨门那段在门头以上） */
+    const fd = (E.data.conduits || []).filter(c => /^FD-4/.test(c.id)).map(c => {
+      const zs = c.free ? [c.p1[2], c.p2[2]] : [c.z0, c.z1];
+      return { id: c.id, z0: R2(Math.min.apply(null, zs)), z1: R2(Math.max.apply(null, zs)) };
+    });
+    const fdHigh = fd.filter(x => /-h$/.test(x.id));
+
+    /* 画面上到底有没有东西落在门洞里：直接读场景几何。
+       ★ 注意 three.js 的轴：v.x = 模型 x，v.y = 标高，v.z = -模型 y，
+         平面坐标要还原成 (x, -z) 再投影，别拿 v.y 当平面 y 用。 */
+    /* 按**方盒**判重叠，不是按顶点：一根 6.6 m 长的管只在其两端有顶点，
+       拿顶点判会把"整根穿过门洞"错判成没碰到。boxGeo 每个盒子 24 个顶点，
+       把每个盒子的 24 个点都换成 (沿墙 at, 法向 perp, 标高 z)，取包络再做矩形相交。 */
+    const scan = (g, pad) => {
+      if (!g) return { boxes: 0, inHole: 0 };
+      let boxes = 0, hitN = 0;
+      g.traverse(o2 => {
+        if (!o2.isMesh || !o2.geometry || !o2.geometry.attributes.position) return;
+        o2.updateWorldMatrix(true, false);
+        const pos = o2.geometry.attributes.position;
+        const v = new window.THREE.Vector3();
+        for (let b = 0; b + 23 < pos.count; b += 24) {
+          boxes++;
+          let a0 = 1e9, a1 = -1e9, p0 = 1e9, p1 = -1e9, z0 = 1e9, z1 = -1e9;
+          for (let i = b; i < b + 24; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o2.matrixWorld);
+            const at = (v.x - a.ax) * a.ux + ((-v.z) - a.ay) * a.uy;
+            const pp = (v.x - a.ax) * (-a.uy) + ((-v.z) - a.ay) * a.ux;
+            const zz = v.y - f.elev;
+            if (at < a0) a0 = at; if (at > a1) a1 = at;
+            if (pp < p0) p0 = pp; if (pp > p1) p1 = pp;
+            if (zz < z0) z0 = zz; if (zz > z1) z1 = zz;
+          }
+          if (a1 > HOLE.at0 + pad && a0 < HOLE.at1 - pad &&
+              z1 > HOLE.z0 + pad && z0 < HOLE.z1 - pad &&
+              p0 < wl.t / 2 + 0.06 && p1 > -(wl.t / 2 + 0.06)) hitN++;
+        }
+      });
+      return { boxes: boxes, inHole: hitN };
+    };
+    const iso = scan(S.root().getObjectByName('elec-iso'), 0.01);
+    const hitG = (S.root().children || []).filter(c => c.type === 'Group' && !c.name).map(g => scan(g, 0.12))[0];
+    const rer = scan(S.root().getObjectByName('reroutes'), 0.01);
+    /* 原管线虚影（elec-dead）：它**应该**穿过门洞 —— 这就是"原来从这儿过去"的那一层 */
+    const dead = scan(S.root().getObjectByName('elec-dead'), 0.01);
+
+    /* 明敷段有没有被显示出来：FD 的两截 2.05 m 段在 at 2.58~3.30 一带 */
+    let fdShown = 0;
+    const isoG = S.root().getObjectByName('elec-iso');
+    if (isoG) {
+      isoG.traverse(o2 => {
+        if (!o2.isMesh || !o2.geometry || !o2.geometry.attributes.position) return;
+        o2.updateWorldMatrix(true, false);
+        const pos = o2.geometry.attributes.position;
+        const v = new window.THREE.Vector3();
+        for (let i = 0; i < pos.count; i += 3) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(o2.matrixWorld);
+          const at = (v.x - a.ax) * a.ux + ((-v.z) - a.ay) * a.uy;
+          const zz = v.y - f.elev;
+          if (at > 2.66 && at < 3.34 && Math.abs(zz - 2.05) < 0.10) fdShown++;
+        }
+      });
+    }
+
+    /* 红色断头：4 处（插座 0.32 m 两处 + 层进线 2.05 m 两处），都很短。
+       用**开门前**的命中对象算，跟 showHoleConflict 里的调用完全一致。 */
+    const stubs = (D.stubs ? D.stubs(wl, hitObjs, HOLE) : []) || [];
+    const stubLen = stubs.map(s => (s.free ? Math.hypot(s.p1[0] - s.p2[0], s.p1[1] - s.p2[1], s.p1[2] - s.p2[2])
+      : (s.vert ? Math.abs(s.z1 - s.z0) : Math.abs(s.at1 - s.at0))));
+
+    const rr = E.reroutes().map(x => ({ c: x.conduit, z: R2(x.z), off: !!x.off, cuts: x.cuts ? x.cuts.length : 0 }));
+
+    E.rebuild();
+    const afterRebuild = { fdN: (E.data.conduits || []).filter(c => /^FD-4/.test(c.id)).length,
+                           rr: Object.keys(E.data.reroutes || {}).length };
+    D.undo();
+    const afterUndo = { fd: (E.data.conduits || []).filter(c => /^FD-4/.test(c.id)).map(c => c.id),
+                        rr: Object.keys(E.data.reroutes || {}).length };
+
+    return {
+      hits: hits, fdBefore: fdBefore, opened: o, fd: fd, fdHigh: fdHigh,
+      iso: iso, hitG: hitG, rer: rer, dead: dead, fdShown: fdShown,
+      stubs: stubs.length, stubMax: stubLen.length ? R2(Math.max.apply(null, stubLen)) : 0,
+      rr: rr, afterRebuild: afterRebuild, afterUndo: afterUndo
+    };
+  });
+  P('配电箱的层进线被算进这扇门的冲突（以前 hitWall 只认墙里的管）',
+    v16.hits.indexOf('FD-4') >= 0, JSON.stringify(v16.hits));
+  P('开门时墙里那根和连接管一起改道', !!(v16.opened && v16.opened.rerouted === 2),
+    JSON.stringify(v16.rr));
+  P('连接管的绕行方案带 4 个三维转角（铺管要按它拆段）',
+    v16.rr.some(x => x.off && x.cuts === 4), JSON.stringify(v16.rr.filter(x => x.off)));
+  P('连接管真的被拆成 5 段铺出来、跨门那段抬到门头以上',
+    v16.fd.length === 5 && v16.fdHigh.length === 1 && v16.fdHigh[0].z0 > 2.1,
+    v16.fd.map(x => x.id + '@' + x.z0 + '~' + x.z1).join(' '));
+  P('画面上门洞里一根实心管都不剩（隔离管 / 红标 / 绿线三批方盒全是 0）',
+    v16.iso.inHole === 0 && (!v16.hitG || v16.hitG.inHole === 0) && v16.rer.inHole === 0,
+    '隔离 ' + v16.iso.boxes + ' 个方盒/' + v16.iso.inHole + ' 落洞里，红标 ' +
+    (v16.hitG ? v16.hitG.boxes : 0) + '/' + (v16.hitG ? v16.hitG.inHole : 0) +
+    '，绿线 ' + v16.rer.boxes + '/' + v16.rer.inHole);
+  P('原管线整根按虚影留着（不是只剩两个断头）',
+    v16.dead.boxes > 0 && v16.dead.inHole > 0,
+    '虚影 ' + v16.dead.boxes + ' 个方盒，其中 ' + v16.dead.inHole + ' 个与门洞重叠（"原来从这儿穿过"）');  P('涉及到的原管线仍然显示（含明敷的层进线，不再被漏掉）',
+    v16.iso.boxes >= 8 && v16.fdShown > 0,
+    '隔离出 ' + v16.iso.boxes + ' 个方盒，其中箱前 2.05 m 那段有 ' + v16.fdShown + ' 个顶点');  P('红色断头 4 处（插座 2 + 层进线 2），每段都很短',
+    v16.stubs >= 4 && v16.stubMax <= 0.2,
+    v16.stubs + ' 段，最长 ' + v16.stubMax + ' m');
+  P('重建之后还是 5 段、记录还在', v16.afterRebuild.fdN === 5 && v16.afterRebuild.rr === 2,
+    JSON.stringify(v16.afterRebuild));
+  P('撤门后连接管接回一整段、记录清空',
+    v16.afterUndo.fd.length === 1 && v16.afterUndo.fd[0] === 'FD-4' && v16.afterUndo.rr === 0,
+    JSON.stringify(v16.afterUndo));
+
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));
   console.log(fail ? '\n❌ 失败 ' + fail + ' 项' : '\n✅ 全部通过');

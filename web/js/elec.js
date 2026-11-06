@@ -353,7 +353,7 @@
          用户看到的就是"绿色改道叠在别的管子上、管子还是照老路走"。
          记录按"同墙 + 同回路 + 洞口对得上"找（重建后线管会换 id，不能按 id 找）。 */
       const rec = Object.keys(D.reroutes || {}).map(k => D.reroutes[k]).find(r =>
-        r && r.wall === wall.id && r.circuit === circ.id && r.hole && r.z != null &&
+        r && !r.off && r.wall === wall.id && r.circuit === circ.id && r.hole && r.z != null &&
         r.hole.at0 <= g.at0 + 0.25 && r.hole.at1 >= g.at1 - 0.25);
       if (rec) zr = rec.z;
 
@@ -713,6 +713,34 @@
       });
     }
 
+    /* 明敷自由段：一段两端点。若这段为某个洞口改过线（记录里有 cuts），
+       就按"原标高 → 抬到门头以上 → 跨过去 → 落回原标高"拆成五段。
+       ★ 少了这一步，门头上那根层进线就成了"数据上已经改道、画面上还从门洞里穿过去"，
+         用户看到的就是"连接管撞到门了却没有绕行的处理"。 */
+    function freeRun(idBase, fl, circ, sec, A, B, room, roomNum, layer) {
+      const rec = (D.reroutes || {})[idBase];
+      const mk = (id, a, b) => ({
+        id: id, floor: fl, wall: null, kind: circ ? circ.kind : 'power',
+        circuit: circ ? circ.id : null, layer: layer || 'feed',
+        free: true, p1: a, p2: b, z: (a[2] + b[2]) / 2,
+        at0: 0, at1: 0, s: sec.s, d: sec.d,
+        room: room || null, roomNum: roomNum || null, added: false
+      });
+      const emit = (id, a, b) => {
+        if (seen[id]) return;
+        seen[id] = 1;
+        D.conduits.push(mk(id, a, b));
+        if (circ) circ.conduits.push(id);
+      };
+      if (!(rec && rec.cuts && rec.cuts.length === 4)) { emit(idBase, A, B); return; }
+      const q = rec.cuts;
+      emit(idBase + '-s0', A, q[0]);          // 原标高走到洞口左侧
+      emit(idBase + '-v0', q[0], q[1]);       // 竖着抬上去
+      emit(idBase + '-h', q[1], q[2]);        // 跨过门头
+      emit(idBase + '-v1', q[2], q[3]);       // 竖着落回来
+      emit(idBase + '-s1', q[3], B);          // 接着走到原终点
+    }
+
     /* ---- ⑥ 层进线：从主干水平引到本层配电箱顶部 ----
        这一段没有墙可依附，是房间里明敷的桥架/母线，所以用自由段（free）：
        只给两端点，渲染时按两点连线建盒子。 */
@@ -724,15 +752,8 @@
       const by = p.y + ny * ((p.t || 0.2) / 2);
       if (Math.hypot(bx - tx, by - ty) < 0.25) return;
       const zE = p.z + p.h / 2 + 0.10;              // 从箱子顶进线
-      const id = 'FD-' + p.floor;
-      const c = {
-        id: id, floor: p.floor, wall: null, kind: 'power', circuit: circ.id,
-        layer: 'feed', free: true, p1: [tx, ty, zE], p2: [bx, by, zE],
-        s: 0.12, d: 0.12, at0: 0, at1: 0, z: zE,
-        room: p.room, roomNum: p.roomNum, added: false
-      };
-      D.conduits.push(c);
-      circ.conduits.push(id);
+      freeRun('FD-' + p.floor, p.floor, circ, { s: 0.12, d: 0.12 },
+        [tx, ty, zE], [bx, by, zE], p.room, p.roomNum, 'feed');
       if (circ.rooms.indexOf(p.room) < 0) circ.rooms.push(p.room);
     });
 
@@ -782,14 +803,8 @@
           if (!best || d < best.d) best = { x: hx, y: hy, d: d };
         });
         if (!best || best.d < 0.06) return;               // 已经贴在干线上，不用再搭
-        const id2 = 'PO-' + p.floor + '-' + c.id;
-        D.conduits.push({
-          id: id2, floor: p.floor, wall: null, kind: c.kind, circuit: c.id,
-          layer: 'out', free: true, p1: [px, py, z], p2: [best.x, best.y, z],
-          s: 0.05, d: 0.05, at0: 0, at1: 0, z: z,
-          room: p.room, roomNum: p.roomNum, added: false
-        });
-        c.conduits.push(id2);
+        freeRun('PO-' + p.floor + '-' + c.id, p.floor, c, { s: 0.05, d: 0.05 },
+          [px, py, z], [best.x, best.y, z], p.room, p.roomNum, 'out');
       });
     });
 
@@ -973,6 +988,48 @@
   }
   E.spanOnWall = spanOnWall;
 
+  /* 没挂在墙上、但贴着这面墙明敷的一段（配电箱层进线 FD、箱到桥架 PO/PU）。
+     这类段只有两端点，没有 at0/at1，按"墙 id"过滤永远取不到 ——
+     于是"控制箱后面开门"时，门头上那根 2.05 m 的层进线明明从洞前横过去，
+     既没被判冲突、也没有绕法（用户原话："连接管碰撞到了门但是没有绕行的处理"）。
+     做法：按采样点投影回墙轴，取 at/标高的包络。
+     "附近"取墙厚一半再放 0.30 m —— 门框带门套的安装空间就是这个量级；
+     再远的（走廊对面那排桥架）不能算，否则满楼都是假冲突。 */
+  const OFF_GAP = 0.30;
+  function spanOffWall(wall, c, a) {
+    if (!c || c.wall) return null;
+    const half = (c.s || 0.04) / 2;
+    const lim = wall.t / 2 + OFF_GAP + half;
+    let pts = null;
+    if (c.free && c.p1 && c.p2) {
+      pts = [];
+      for (let i = 0; i <= 20; i++) {
+        const t = i / 20;
+        pts.push([c.p1[0] + (c.p2[0] - c.p1[0]) * t,
+                  c.p1[1] + (c.p2[1] - c.p1[1]) * t,
+                  c.p1[2] + (c.p2[2] - c.p1[2]) * t]);
+      }
+    } else if (c.vert && c.x != null && c.y != null) {
+      pts = [[c.x, c.y, Math.min(c.z0, c.z1)], [c.x, c.y, Math.max(c.z0, c.z1)]];
+    }
+    if (!pts) return null;
+    const ax = a || axis(wall);
+    let a0 = Infinity, a1 = -Infinity, s0 = Infinity, s1 = -Infinity, near = false;
+    pts.forEach(q => {
+      const at = (q[0] - ax.ax) * ax.ux + (q[1] - ax.ay) * ax.uy;
+      const perp = Math.abs((q[0] - ax.ax) * (-ax.uy) + (q[1] - ax.ay) * ax.ux);
+      if (perp > lim) return;
+      near = true;
+      if (at < a0) a0 = at;
+      if (at > a1) a1 = at;
+      if (q[2] - half < s0) s0 = q[2] - half;
+      if (q[2] + half > s1) s1 = q[2] + half;
+    });
+    if (!near) return null;
+    return { off: true, a0: a0, a1: a1, s0: s0, s1: s1, at: (a0 + a1) / 2 };
+  }
+  E.spanOffWall = spanOffWall;
+
   /* 开一个洞会不会打断墙里的线管。
        洞：沿墙 [at-w/2, at+w/2] × 高度 [sill, sill+h]
        线管：沿墙 [a0, a1] × 高度 [s0, s1]（横管按 at0/at1，竖管按平面投影）
@@ -992,6 +1049,24 @@
       if (sp.a1 <= h0 || sp.a0 >= h1) return;                  // 沿墙方向不相交
       if (sp.s1 <= z0 || sp.s0 >= z1) return;                   // 高度方向不相交
       if (reroutedOver(c, h0, h1)) return;                      // 已经改过线了
+      out.push(c);
+    });
+    /* ★ 第二遍：没挂在墙上、但贴着这面墙明敷的段（配电箱层进线 FD、箱到桥架 PO/PU）。
+       它们 wall=null，第一遍按墙 id 过滤永远看不到 —— "控制箱后面开门"时，
+       门头上那根 2.05 m 的进线就从门框前横过去，既不报冲突也没有绕法。
+       只认 feed / out 这两层：别的层要么本来就在墙里（第一遍已经管），
+       要么是走道对面那排干线（不该算到"这扇门"头上）。
+       ★ 整面拆墙时不算：明敷段不属于这面墙，墙拆了它还在，不能记成"随墙作废"。 */
+    if (o.demolish) return out;
+    (E.data.conduits || []).forEach(c => {
+      if (c.wall || c.floor !== wall.floor) return;
+      if (c.layer !== 'feed' && c.layer !== 'out') return;
+      const sp = spanOffWall(wall, c, a);
+      if (!sp) return;
+      if (sp.a1 <= h0 || sp.a0 >= h1) return;
+      if (sp.s1 <= z0 || sp.s0 >= z1) return;
+      if (reroutedOver(c, h0, h1)) return;
+      if (out.some(x => x.id === c.id)) return;
       out.push(c);
     });
     return out;
@@ -1028,7 +1103,9 @@
     Object.keys(D.reroutes || {}).forEach(k => {
       const r = D.reroutes[k];
       if (!r || !r.hole) return;
-      if (wallId && r.wall !== wallId) return;
+      /* 明敷段的记录自己 wall=null，得回落到 wallId 才认得出是哪面墙的 */
+      const wid = r.wall || r.wallId;
+      if (wallId && wid !== wallId) return;
       /* 有重叠就算这个门的（门可能被挪过一点，别要求完全一致） */
       const ov = Math.min(r.hole.at1, at1) - Math.max(r.hole.at0, at0);
       if (ov > -0.05) { gone.push(r.conduit || k); delete D.reroutes[k]; }
@@ -1040,8 +1117,26 @@
      往洞顶以上或洞底以下翻过去——真实施工就是"上翻/下翻"。
      哪边近走哪边；近了会顶梁或贴地就换另一边；两边都不行就明确说不行。 */
   E.planReroute = function (c, hole, avoid) {
-    const wall = (M().walls || []).find(w => w.id === c.wall);
-    if (!wall || !c) return { ok: false, why: '找不到这根线管所在的墙' };
+    if (!c) return { ok: false, why: '找不到这根线管' };
+    const wall = (M().walls || []).find(w => w.id === (c.wall || (hole && hole.wall)));
+    if (!wall) return { ok: false, why: '找不到这根线管所在的墙' };
+
+    /* ── 不挂在墙上的明敷段（配电箱层进线 FD、箱到桥架 PO）──
+       它们只有两端点，wall=null，按墙 id 取不到，所以以前既不算冲突也没有绕法。
+       绕法和横管同一个道理：把洞口那一段整段抬到门头以上（或压到门底以下），
+       两头各加一个竖向短段接回原标高。真实施工就是把桥架/线槽"过门头".
+       箱子顶上的立管（PU）不一样：它一头焊在箱子上，只能挪箱或改门位。 */
+    if (!c.wall) {
+      const a0 = axis(wall);
+      const spo = spanOffWall(wall, c, a0);
+      if (!spo) return { ok: false, why: '这段明敷线不在这面墙附近' };
+      if (c.vert || spo.s1 - spo.s0 > 0.30) {
+        return {
+          ok: false, c: c, hole: hole,
+          why: '这是配电箱顶上那根立管，上翻下翻都动不了 —— 要么把箱子挪开，要么门换个位置'
+        };
+      }
+    }
 
     /* ── 竖直管（墙内下引、箱到桥架）──
        它没有"上翻/下翻"这条路：一头接吊顶干线、一头接墙上的支线端头，
@@ -1100,9 +1195,17 @@
       };
     }
 
-    const half = c.s / 2 + 0.03;
     const seg = 0.18;                          // 洞两侧各让出的水平距离
-    const L = axis(wall).L;
+    const ax0 = axis(wall);
+    const L = ax0.L;
+    /* 沿墙位置与标高：墙上横管直接读 at0/at1/z；
+       明敷段（层进线、箱到桥架）按投影取包络，标高取管中心 ——
+       它没有 at0/at1，这两个字段在数据里一直是占位的 0。 */
+    const off = c.wall ? null : spanOffWall(wall, c, ax0);
+    const zC = off ? (off.s0 + off.s1) / 2 : c.z;
+    const aLo = off ? off.a0 : Math.max(0, c.at0);
+    const aHi = off ? off.a1 : Math.min(L, c.at1);
+    const half = (c.s || 0.04) / 2 + 0.03;
 
     /* ── 绕行标高不能撞别的管子 ──
        以前只判断"洞顶以上还有没有空间"，于是同一个洞口的三根管会全部被安排到
@@ -1111,14 +1214,16 @@
        用户原话："在管线开门汇集处没有考虑所有管线的绕行"。
        所以先把"这段 at 区间里已经被占掉的标高"收集起来：
          · 同一面墙上别的线管（含竖管的上下区间）
+         · 贴着这面墙明敷的段（配电箱的连接管束，以前根本没算进来）
          · 这一轮已经排好的其它绕行（avoid）
        再在这个区间里找一个真正空着的标高。 */
     const bands = [];
-    const a2 = axis(wall);
+    const a2 = ax0;
     (E.data.conduits || []).forEach(o => {
       if (!o || o.id === c.id) return;
-      if (o.wall !== wall.id) return;
-      const sp2 = spanOnWall(wall, o, a2);
+      let sp2 = null;
+      if (o.wall === wall.id) sp2 = spanOnWall(wall, o, a2);
+      else if (!o.wall && o.floor === wall.floor && (o.layer === 'feed' || o.layer === 'out')) sp2 = spanOffWall(wall, o, a2);
       if (!sp2) return;
       if (sp2.a1 <= hole.at0 - seg || sp2.a0 >= hole.at1 + seg) return;   // 沿墙不搭界
       bands.push([sp2.s0 - 0.03, sp2.s1 + 0.03]);
@@ -1142,7 +1247,7 @@
     let dir = null, z = null;
     if (up != null && dn != null) {
       // 线管本来就在洞上方 → 上翻更顺；否则比距离
-      const preferUp = (c.z >= hole.z1) || (Math.abs(up - c.z) <= Math.abs(dn - c.z));
+      const preferUp = (zC >= hole.z1) || (Math.abs(up - zC) <= Math.abs(dn - zC));
       dir = preferUp ? 'up' : 'down'; z = preferUp ? up : dn;
     } else if (up != null) { dir = 'up'; z = up; }
     else if (dn != null) { dir = 'down'; z = dn; }
@@ -1161,18 +1266,38 @@
     /* 绕行折线：从这根管子的**真实起点**走过去，绕完再回到**真实终点**。
        以前只画洞口两侧那一小段，0.36 m 宽贴在墙里，屏幕上几乎看不见，
        用户反馈"改线看不到路线"。现在整根画出来，一眼就知道电改走哪儿了。 */
-    const e0 = Math.max(0, c.at0), e1 = Math.min(L, c.at1);
+    const e0 = aLo, e1 = aHi;
     const pts = [];
-    if (e0 < hole.at0 - seg - 0.02) pts.push({ at: e0, z: c.z });
-    pts.push({ at: hole.at0 - seg, z: c.z });
+    if (e0 < hole.at0 - seg - 0.02) pts.push({ at: e0, z: zC });
+    pts.push({ at: hole.at0 - seg, z: zC });
     pts.push({ at: hole.at0 - seg, z: z });
     pts.push({ at: hole.at1 + seg, z: z });
-    pts.push({ at: hole.at1 + seg, z: c.z });
-    if (e1 > hole.at1 + seg + 0.02) pts.push({ at: e1, z: c.z });
-    const addLen = Math.abs(z - c.z) * 2 + seg * 2;
+    pts.push({ at: hole.at1 + seg, z: zC });
+    if (e1 > hole.at1 + seg + 0.02) pts.push({ at: e1, z: zC });
+    const addLen = Math.abs(z - zC) * 2 + seg * 2;
+    /* 明敷段不是"墙里的 at/z"，它是三维里的两点连线，
+       所以额外算出四个 3D 转角，铺管时按它把原段拆成五段（见 build 的 freeRun）。 */
+    let cuts = null, perp = null;
+    if (off && c.free && c.p1 && c.p2) {
+      const fAt = q => (q[0] - ax0.ax) * ax0.ux + (q[1] - ax0.ay) * ax0.uy;
+      const fPp = q => (q[0] - ax0.ax) * (-ax0.uy) + (q[1] - ax0.ay) * ax0.ux;
+      perp = (fPp(c.p1) + fPp(c.p2)) / 2;       // 绿线要跟着管子偏出墙面，别贴在墙里画
+      const aA = fAt(c.p1), aB = fAt(c.p2), den = aB - aA;
+      if (Math.abs(den) > 1e-6) {
+        const P2 = atv => {
+          const t = Math.max(0, Math.min(1, (atv - aA) / den));
+          return [c.p1[0] + (c.p2[0] - c.p1[0]) * t, c.p1[1] + (c.p2[1] - c.p1[1]) * t];
+        };
+        const q0 = P2(hole.at0 - seg), q1 = P2(hole.at1 + seg);
+        cuts = [
+          [q0[0], q0[1], zC], [q0[0], q0[1], z],
+          [q1[0], q1[1], z], [q1[0], q1[1], zC]
+        ];
+      }
+    }
     return {
       ok: true, c: c, hole: hole, dir: dir, z: z, pts: pts,
-      addLen: addLen, wall: wall,
+      addLen: addLen, wall: wall, off: !!off, cuts: cuts, perp: perp,
       why: (dir === 'up' ? '上翻' : '下翻') + '到洞口' + (dir === 'up' ? '顶' : '底') +
         '以上 ' + fmt(z) + ' m 处绕过，多走 ' + fmt(addLen) + ' 米线'
     };
@@ -1184,9 +1309,16 @@
     plan = plan || E.planReroute(c, hole);
     if (!plan.ok) return null;
     D.reroutes[c.id] = {
-      conduit: c.id, circuit: c.circuit, wall: c.wall, floor: c.floor,
+      conduit: c.id, circuit: c.circuit, floor: c.floor,
+      wall: c.wall || null,
+      /* 这条改道是为**哪面墙**做的。明敷段自己 wall=null，靠 wallId 才找得回那面墙：
+         撤门要按它撤、绿线要按它画。但不写进 wall，免得 detourAt 把
+         "同回路 + 同墙"的墙内横管错当成这段明敷的改线（那会把两根管拉到同一标高）。 */
+      wallId: (plan.wall && plan.wall.id) || c.wall || null,
       hole: { at0: hole.at0, at1: hole.at1, z0: hole.z0, z1: hole.z1 },
-      dir: plan.dir, z: plan.z, pts: plan.pts, addLen: plan.addLen
+      dir: plan.dir, z: plan.z, pts: plan.pts, addLen: plan.addLen,
+      /* 明敷段（配电箱层进线）不是墙里的 at/z，铺管时要按这四个 3D 转角拆段 */
+      off: !!plan.off, cuts: plan.cuts || null, perp: plan.perp == null ? null : plan.perp
     };
     return D.reroutes[c.id];
   };

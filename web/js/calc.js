@@ -32,10 +32,17 @@
      这个洞会不会打断某一路电。判定交给 elec 层（那边知道线管的走向、标高、分路），
      这里只负责把结果翻译成一句人能听懂的话。
      没装 elec 层（例如单测结构）时退化成"没有线管"，不影响原来的校核。 */
-  function conduitHits(wall, at, w, h, sill) {
+  function conduitHits(wall, at, w, h, sill, opt) {
     const E = window.BIM && window.BIM.elec;
     if (!E || !E.data || !wall) return [];
-    try { return E.hitWall(wall, { at: at, w: w, h: h, sill: sill }) || []; }
+    try {
+      return E.hitWall(wall, {
+        at: at, w: w, h: h, sill: sill,
+        /* 整面拆墙时，贴着墙明敷的那几段（配电箱层进线）不属于这面墙，拆墙不动它们；
+           开洞才是真的会碰上。这个口径交给 elec 层判断。 */
+        demolish: !!(opt && opt.demolish)
+      }) || [];
+    }
     catch (e) { return []; }
   }
   C.conduitHits = conduitHits;
@@ -949,7 +956,7 @@
     });
 
     // ⑤ 墙内线管
-    const chits = conduitHits(wall, at, w, h, sill);
+    const chits = conduitHits(wall, at, w, h, sill, { demolish: !!o.demolish });
     if (chits.length && o.conduitBlock !== false) {
       blocks.push({ t: conduitText(chits), k: 'conduit', conduits: chits });
     }
@@ -1114,10 +1121,13 @@
      "开门时已经牵过线、过一会儿想再改宽"会被判成碰撞 ——
      用户原话："开门后如果再改尺寸，会判断成不能改，涉及到了碰撞，实际上并没有"。
      现在：只剩线管挡着、而且每根都绕得过去，就算过，只是要**再牵一次线**。 */
-  function rerouteForConduits(conduits, at, w, h, sill) {
+  function rerouteForConduits(conduits, at, w, h, sill, wall) {
     const E = window.BIM && window.BIM.elec;
     if (!E || !E.planReroute || !conduits || !conduits.length) return null;
-    const hole = { at0: at - w / 2, at1: at + w / 2, z0: sill || 0, z1: (sill || 0) + h };
+    /* hole 要带上墙 id：没挂在墙上的明敷段（配电箱层进线）自己 wall=null，
+       planReroute 只有靠 hole.wall 才知道该把它算到哪面墙上 */
+    const hole = { at0: at - w / 2, at1: at + w / 2, z0: sill || 0, z1: (sill || 0) + h,
+                   wall: wall ? wall.id : null };
     /* 一根一根排，后面的避开前面已占的标高（同一洞口的多根管不能排到同一高度） */
     const avoid = [];
     const plans = conduits.map(c => {
@@ -1152,7 +1162,7 @@
          以前写死 bl.length===1，同时报两条线管就判死 —— 用户看到的就是"明明能拓却不行"。 */
       const onlyCond = bl.length > 0 && bl.every(b => b.k === 'conduit');
       if (onlyCond) {
-        const pl = rerouteForConduits(chk.conduits || [], at2, w2, h, 0);
+        const pl = rerouteForConduits(chk.conduits || [], at2, w2, h, 0, wall);
         if (pl) return { chk: chk, pass: true, reroutes: pl, needReroute: true };
       }
       return { chk: chk, pass: false, reroutes: null, needReroute: false };

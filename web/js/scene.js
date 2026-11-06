@@ -2874,17 +2874,24 @@
     let wall = null;
     if (r.wall && typeof r.wall === 'object' && r.wall.id) wall = r.wall;
     else if (r.wall) wall = M.walls.find(w => w.id === r.wall) || null;
+    /* 明敷段（配电箱层进线）自己 wall=null，靠 wallId 才找得回那面墙 */
+    if (!wall && r.wallId) wall = M.walls.find(w => w.id === r.wallId) || null;
     if (!wall && r.c) wall = M.walls.find(w => w.id === r.c.wall) || null;
     if (!wall || !r.pts || !r.pts.length) return null;
 
     const a = E().axis(wall);
+    /* 明敷段离墙有一点距离（层进线从桥架斜着搭到箱顶），
+       绿线要跟着它偏出去，别贴在墙面里画 —— 否则看着像两条不相干的线。 */
+    const OP = (r.off && r.perp != null) ? r.perp : 0;
+    const OX = -a.uy * OP, OY = a.ux * OP;
+
     /* 改线的管子粗细跟**真管子**一个量级（用户："开门涉及到的管线也要对应减小直径"）。
        以前固定 0.10 m，比真管子粗两三倍，屏幕上像一根水管横穿墙里。
        留 1.4 倍和下限 0.04 只是为了在整层视角下还看得见，不是另一套管径。 */
     const sec = (r.c && r.c.s) || 0.04;
     const TH = Math.max(0.04, Math.min(0.08, sec * 1.4));
     const it = [];
-    const ptAt = p => ({ x: a.ax + a.ux * p.at, y: a.ay + a.uy * p.at, z: wall.base + p.z });
+    const ptAt = p => ({ x: a.ax + a.ux * p.at + OX, y: a.ay + a.uy * p.at + OY, z: wall.base + p.z });
 
     for (let i = 0; i < r.pts.length - 1; i++) {
       const p = r.pts[i], q = r.pts[i + 1];
@@ -2892,7 +2899,7 @@
       const len = Math.hypot(dx, dz);
       if (len < 1e-4) continue;
       const midAt = (p.at + q.at) / 2, midZ = (p.z + q.z) / 2;
-      const mx = a.ax + a.ux * midAt, my = a.ay + a.uy * midAt;
+      const mx = a.ax + a.ux * midAt + OX, my = a.ay + a.uy * midAt + OY;
       const ang = Math.atan2(dz, dx);
       const m = frame(mx, my, wall.base + midZ, a.ux, a.uy);
       m.multiply(new THREE.Matrix4().makeRotationZ(ang));
