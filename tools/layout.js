@@ -696,7 +696,7 @@ const H = t => console.log('\n' + t);
   const v14 = await p.evaluate(async () => {
     const E = window.BIM.elec, S = window.BIM.scene, M = window.BIM_MODEL, D = window.BIM.doorDbg, C = window.BIM.calc;
     E.ready();
-    let best = null;
+    let best = null, hitsRef = null;
     M.rooms.forEach(rm => {
       if (best) return;
       ['north', 'south', 'east', 'west'].forEach(side => {
@@ -715,6 +715,7 @@ const H = t => console.log('\n' + t);
           const hole = { at0: at - 0.5, at1: at + 0.5, z0: 0, z1: 2.1 };
           if (!hit.map(c => E.planReroute(c, hole)).every(q => q && q.ok)) continue;
           best = { room: rm.num, side: side, wall: wl.id, at: +at.toFixed(2), hit: hit.length };
+          hitsRef = hit;
         }
       });
     });
@@ -723,12 +724,48 @@ const H = t => console.log('\n' + t);
     S.setFocus(rm.floor);
     const gcount = name => { const g = S.root().getObjectByName(name); return g ? g.children.length : 0; };
     const S2 = window.BIM.state;
+    const wl = M.walls.find(w => w.id === best.wall);
+    const ax = E.axis(wl);
+    const hole = { at0: best.at - 0.5, at1: best.at + 0.5, z0: 0, z1: 2.1 };
+    /* 一根管子在这面墙上的占位（沿墙 × 标高），用来量"洞口里还剩没剩管子" */
+    const spans = () => (E.conduitsOf({ wall: wl.id }) || []).map(c => {
+      const sp = E.spanOnWall(wl, c, ax);
+      return sp ? { id: c.id, circ: c.circuit, a0: sp.a0, a1: sp.a1, s0: sp.s0, s1: sp.s1 } : null;
+    }).filter(Boolean);
+    const inHole = sp => sp.a1 > hole.at0 + 0.01 && sp.a0 < hole.at1 - 0.01 &&
+      sp.s1 > hole.z0 + 0.01 && sp.s0 < hole.z1 - 0.01;
+    const before = { n: spans().length, cross: spans().filter(inHole).map(s => s.id) };
+
     const o1 = D.openAt(rm, best.side, best.at, 1.0, 2.1);
     const plan = E.reroutes()[0];
     if (plan) S.showReroute(plan, 0x17a673);      // 等价于 UI 里 showHoleConflict 画的那条绿线
+    /* 开门之后洞口里必须一根管都不剩：按新洞口铺过的管子本来就该断在洞口两侧 */
+    const afterSpans = spans();
+    const cross = afterSpans.filter(inHole).map(s => s.id);
+
+    /* 红色标记的实际范围：只该是洞口两侧各 0.18 m 的断头 */
+    const stubs = (D.stubs && hitsRef) ? D.stubs(wl, hitsRef, hole) : [];
+    const stubLen = stubs.map(s => (s.vert ? Math.abs(s.z1 - s.z0) : Math.abs(s.at1 - s.at0)));
+    const stubInHole = stubs.filter(s => {
+      const sp = E.spanOnWall(wl, s, ax);
+      if (!sp) return true;
+      const mid = (sp.a0 + sp.a1) / 2;
+      return mid > hole.at0 + 0.02 && mid < hole.at1 - 0.02;
+    }).length;
+
+    /* 绿线（规划）的标高 与 实际铺出来的 DT-* 绕行段 必须是一回事 */
+    const dtH = afterSpans.filter(s => !s.vert && /^DT-/.test(s.id) && s.circ === (plan && plan.circuit));
+    const recZ = plan ? +plan.z.toFixed(3) : null;
+    const greenZ = plan && plan.pts && plan.pts.length
+      ? +Math.max.apply(null, plan.pts.map(q => q.z)).toFixed(3) : null;
+    const dtZ = dtH.length ? +((dtH[0].s0 + dtH[0].s1) / 2).toFixed(3) : null;
+
     const opened = {
       ok: !!(o1 && o1.ok), rerouted: (o1 && o1.rerouted) || 0,
-      rrData: Object.keys(E.data.reroutes || {}).length, sceneRr: gcount('reroutes')
+      rrData: Object.keys(E.data.reroutes || {}).length, sceneRr: gcount('reroutes'),
+      beforeCross: before.cross.length, cross: cross.length, crossIds: cross.slice(0, 4),
+      stubs: stubs.length, stubMax: stubLen.length ? +Math.max.apply(null, stubLen).toFixed(3) : 0,
+      stubInHole: stubInHole, recZ: recZ, greenZ: greenZ, dtZ: dtZ, dtN: dtH.length
     };
     E.rebuild();                                   // 开窗 / 打通 / 改尺寸都会走这里
     const afterRebuild = Object.keys(E.data.reroutes || {}).length;
@@ -757,6 +794,70 @@ const H = t => console.log('\n' + t);
     JSON.stringify(v14.undone.lastUndone));
   P('撤掉再点回来：同一个位置照样能开、照样改线',
     !!(v14.again.ok && v14.again.rerouted >= 1), JSON.stringify(v14.again));
+
+  /* ③ 画面口径：门洞里一根管都不能剩 · 红的是断头不是整根管 · 绿线跟真管子同标高
+     用户第二次反馈"这个地方还是没有修复"，看的就是这一屏：
+       门洞里还横着两根粗红管、绿线只贴着门底走一小段。
+     根子是三处各算一套：显示层拿的是开门**前**的旧线管对象（还跨着门洞），
+     红标把整根管罩粗（于是穿过门洞），规划与几何又各挑一个标高（2.47 vs 2.27）。
+     下面四条就是这三处各自的"量得出来"的口径。 */
+  H('【15】门洞画面口径：洞里不剩管 · 红的是断头 · 绿线与真管子同标高');
+  P('开门后洞口里一根线管都不剩（以前整根横着穿过去）',
+    v14.opened.cross === 0,
+    '开门前跨洞 ' + v14.opened.beforeCross + ' 根 → 开门后 ' + v14.opened.cross + ' 根' +
+    (v14.opened.crossIds && v14.opened.crossIds.length ? '：' + v14.opened.crossIds.join('、') : ''));
+  P('红色只点在洞口两侧的断头上（每段 ≤ 0.2 m，没有落在洞里的）',
+    v14.opened.stubs >= 2 && v14.opened.stubMax <= 0.2 && v14.opened.stubInHole === 0,
+    '断头 ' + v14.opened.stubs + ' 段，最长 ' + v14.opened.stubMax + ' m，落洞里 ' + v14.opened.stubInHole + ' 段');
+  P('绿色改线的标高就是实际绕行段的标高（不再规划一套、几何一套）',
+    v14.opened.recZ != null && v14.opened.dtN > 0 &&
+    Math.abs(v14.opened.recZ - v14.opened.dtZ) < 0.011 &&
+    Math.abs(v14.opened.recZ - v14.opened.greenZ) < 0.011,
+    '记录 ' + v14.opened.recZ + ' m / 绿线 ' + v14.opened.greenZ + ' m / 实铺 DT 段 ' +
+    v14.opened.dtZ + ' m（' + v14.opened.dtN + ' 段）');
+
+  /* ④ 同一个洞口好几根管时，每根要排到**互不相同**的标高上。
+     以前三根管全被排到"洞顶以上第一个空位"，画出来是一条绿线，实际三根叠死。 */
+  const mv = await p.evaluate(() => {
+    const E = window.BIM.elec, M = window.BIM_MODEL;
+    E.ready();
+    let found = null;
+    M.rooms.forEach(rm => {
+      if (found) return;
+      ['north', 'south', 'east', 'west'].forEach(side => {
+        if (found) return;
+        const wl = M.walls.find(w => w.id === (rm.sides || {})[side]);
+        if (!wl || wl.kind === 'ext') return;
+        const a = E.axis(wl);
+        const ts = [[rm.x0, rm.y0], [rm.x1, rm.y0], [rm.x0, rm.y1], [rm.x1, rm.y1]]
+          .map(q => (q[0] - a.ax) * a.ux + (q[1] - a.ay) * a.uy);
+        const lo = Math.min.apply(null, ts), hi = Math.max.apply(null, ts);
+        for (let at = lo + 0.6; at <= hi - 0.6; at += 0.1) {
+          const hit = (E.hitWall(wl, { at: at, w: 1.0, h: 2.1, sill: 0 }) || []).filter(c => !c.vert);
+          if (hit.length < 2) continue;
+          const hole = { at0: at - 0.5, at1: at + 0.5, z0: 0, z1: 2.1 };
+          const avoid = [];
+          const plans = hit.map(c => {
+            const pp = E.planReroute(c, hole, avoid);
+            if (pp && pp.ok) {
+              const hf = (c.s || 0.04) / 2 + 0.04;
+              avoid.push([pp.z - hf, pp.z + hf]);
+            }
+            return pp;
+          });
+          if (!plans.every(q => q && q.ok)) continue;
+          found = {
+            room: rm.num, side: side, at: +at.toFixed(2), n: hit.length,
+            zs: plans.map(q => +q.z.toFixed(2)),
+            distinct: new Set(plans.map(q => +q.z.toFixed(2))).size
+          };
+        }
+      });
+    });
+    return found;
+  });
+  P('一个洞口里好几根管时，每根排到互不相同的标高（不再叠死）',
+    !!(mv && mv.n >= 2 && mv.distinct === mv.n), JSON.stringify(mv));
 
   await b.close();
   console.log('\n控制台错误：' + (errs.length ? JSON.stringify(errs.slice(0, 3)) : 'none'));

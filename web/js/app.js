@@ -80,6 +80,9 @@
   window.BIM.doorDbg = {
     last: () => (ST.lastDoor && ST.lastDoor.d) || null,
     undo: d => undoDoor(d || (ST.lastDoor && ST.lastDoor.d), true),
+    /* 红色标记到底画的是"整根管"还是"洞口两侧的断头" —— 回归要能量出来，
+       光看截图数不出来（这也是上一轮"看着还是没修好"的坑）。 */
+    stubs: (wall, hits, hole) => cutStubs(wall, hits, hole),
     openAt: (room, side, at, w, h) => {
       if (!room) return null;
       const wall = M.walls.find(x => x.id === (room.sides || {})[side]);
@@ -96,6 +99,9 @@
       if (ids.length) d._reroutes = ids;
       syncElecAfterDoor();
       ST.lastDoor = { wall: wall, at: dec.at, w: W, d: d, chk: dec.chk, room: room };
+      /* 和鼠标点选完全一样地摆出那一屏（红断头 / 绿改线 / 半透明墙），
+         否则回归里看到的画面和用户看到的不一样。 */
+      if ((dec.hits && dec.hits.length) || dec.moved) showHoleConflict(wall, dec.hits, dec.reroutes);
       return { ok: true, id: d.id, code: d.code, at: +dec.at.toFixed(2), rerouted: n, moved: !!dec.moved };
     }
   };
@@ -1950,7 +1956,7 @@
           (dec.moved ? dec.moveNote + '；' : '') +
           (dec.rerouteNote ? dec.rerouteNote + '。' : '') +
           p.width.toFixed(2) + ' 米宽的门已经开在距墙端 ' + C.fmt(at, 2) + ' 米处。' +
-          '红色是原来的管线位置，绿色是改完的新走向，绕行多走的线也补上了。',
+          '红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向，绕行多走的线也补上了。',
           conduitCard(dec.hits, dec.reroutes || [], dec));
         doorPointChips(room, sideOfWall(room, wall) || p.side, p.width, p.height, '再挑个位置');
         return;
@@ -2915,7 +2921,7 @@
     if (dec.needReroute) {
       ai(head2 + '。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
         '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
-        '。红色是原来的管线位置，绿色是改完的新走向。', card2);
+        '。红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card2);
     } else if (dec.moved) {
       ai(head2 + '。' + dec.moveNote + '。', card2);
     } else {
@@ -3053,7 +3059,18 @@
     const hits = c0.conduits || [];
     const sill = o.kind === 'window' ? o.sill : 0;
     const hole = { at0: at - o.w / 2, at1: at + o.w / 2, z0: sill, z1: sill + o.h };
-    const plans = (E && hits.length) ? hits.map(c => E.planReroute(c, hole)) : [];
+    /* 同一个洞口常常不止一根管：一根一根排，后面的要避开前面已经占掉的标高，
+       否则三根管会被排到同一个高度上 —— 画出来是一条绿线，实际是三根叠在一起。
+       用户原话："在管线开门汇集处没有考虑所有管线的绕行"。 */
+    const avoidZ = [];
+    const plans = (E && hits.length) ? hits.map(c => {
+      const p = E.planReroute(c, hole, avoidZ);
+      if (p && p.ok) {
+        const hf = (c.s || 0.04) / 2 + 0.04;
+        avoidZ.push([p.z - hf, p.z + hf]);
+      }
+      return p;
+    }) : [];
     if (plans.length && plans.every(p => p && p.ok)) {
       const rn = plans.map(p => p.why).join('；');
       return {
@@ -3213,6 +3230,32 @@
     return inWall;
   }
 
+  /* 洞口两侧的"断口"：红色只标这一小截，不让整根管子横穿门洞。
+     ★ 这是用户那句"这个地方还是没有修复"的落点：
+       原来红色标记是把**开门前那根整管**罩粗画的，isolateConduits 也是拿旧对象画的，
+       所以门口明明已经改过线，画面上仍有一根粗管从门里穿过去 —— 看着就是"没修好"。
+       现在：洞外的管子用**重建之后**的真实线管（洞口处本来就断了），
+       红色只点在洞口两侧各 0.18 m 的断头上，读作"这里被打断了"。 */
+  function cutStubs(wall, list, hole) {
+    if (!hole) return list || [];
+    const out = [];
+    (list || []).forEach(c => {
+      const g = 0.18;
+      if (c.vert) {
+        const z0 = Math.min(c.z0, c.z1), z1 = Math.max(c.z0, c.z1);
+        if (z1 > hole.z1 + 0.01) out.push(Object.assign({}, c, { id: c.id + '-s1', z0: hole.z1, z1: Math.min(z1, hole.z1 + g) }));
+        if (z0 < hole.z0 - 0.01) out.push(Object.assign({}, c, { id: c.id + '-s0', z0: Math.max(z0, hole.z0 - g), z1: hole.z0 }));
+        return;
+      }
+      if (c.at0 == null) return;
+      const a0 = Math.max(c.at0, hole.at0 - g), a1 = Math.min(c.at1, hole.at0);
+      if (a1 - a0 > 0.02) out.push(Object.assign({}, c, { id: c.id + '-s0', at0: a0, at1: a1 }));
+      const b0 = Math.max(c.at0, hole.at1), b1 = Math.min(c.at1, hole.at1 + g);
+      if (b1 - b0 > 0.02) out.push(Object.assign({}, c, { id: c.id + '-s1', at0: b0, at1: b1 }));
+    });
+    return out;
+  }
+
   /* 把"撞上的线管 / 改线走向 / 半透明墙体"一次性摆到屏幕上。
      用户要的就是这一眼：墙里哪根管子挡着，新的线打算怎么走。 */
   function showHoleConflict(wall, hits, plans, alsoOpen) {
@@ -3233,9 +3276,18 @@
     /* 只留真正撞上的这几根：其它分路的线管全收起来。
        满屏管子的时候根本看不清撞点在哪儿，"只显示碰撞的管线"是这个功能的前提。
        这面墙里一根管都没有时也要调一次 —— 传空数组等于"一根都不画"，
-       画面只剩干净的墙体和空间关系，正是用户说的"隐藏管线的显示"。 */
-    S.isolateConduits(all);
-    S.markConduits(all, 0xff3b30);
+       画面只剩干净的墙体和空间关系，正是用户说的"隐藏管线的显示"。
+       ★ 显示层要用**重建之后**的线管（E.data 里已经按新洞口断开的那几段），
+         不能拿 hits 里的旧对象 —— 旧对象还跨着门洞，画出来就是"管子还穿过门"。
+         按"同墙、同回路"重新取一遍，拿不到才退回旧对象。 */
+    const E2 = window.BIM.elec;
+    const circOn = {};
+    all.forEach(c => { if (c && c.circuit) circOn[c.circuit] = 1; });
+    const fresh = (E2.conduitsOf ? (E2.conduitsOf({ wall: wall.id }) || []) : [])
+      .filter(c => circOn[c.circuit]);
+    S.isolateConduits(fresh.length ? fresh : all);
+    const hole = (plans && plans.length && plans[0] && plans[0].hole) || null;
+    S.markConduits(hole ? cutStubs(wall, all, hole) : all, 0xff3b30);
     (plans || []).forEach(pl => { if (pl && pl.ok) S.showReroute(pl, 0x17a673); });
     S.syncCircuitPower();
   }
@@ -3250,7 +3302,7 @@
         '线管' + (p.dir === 'up' ? '上翻' : '下翻') + '到 ' + C.fmt(p.z, 2) + ' m 处绕过，多走 ' +
         C.fmt(p.addLen, 2) + ' 米线').join('<br>');
     const moved = dec && dec.moved
-      ? '<s>·</s> 也可以不牵线，顺墙挪 ' + C.fmt(dec.movedBy, 2) + ' 米避开（绿色是改线方案，红色是冲突管线）'
+      ? '<s>·</s> 也可以不牵线，顺墙挪 ' + C.fmt(dec.movedBy, 2) + ' 米避开（绿色是改线方案，红色是门洞两侧被打断的断口）'
       : '';
     return '<div class="res warn"><div class="res-top"><span class="k">' +
       (dec && dec.moved ? '挪位后可以开' : '要牵线才能开') + '</span>' +
@@ -3316,7 +3368,7 @@
       ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
         ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + (dec.moved ? dec.moveNote + '；让过去之后，' : '') +
         '这个位置墙里有 ' + dec.hits.length + ' 根线管，' + dec.rerouteNote +
-        '。红色是原来的管线位置，绿色是改完的新走向。', card);
+        '。红色的两个断头是管子原来穿门洞的位置（已经凿断），绿色是改完的新走向。', card);
     } else if (dec.moved) {
       ai('在 ' + room.num + ' ' + N.SIDE_CN[side] + '墙开了 ' + w.toFixed(2) + ' 米宽、' + h.toFixed(2) +
         ' 米高的窗，窗台高 ' + sill.toFixed(2) + ' 米。' + dec.moveNote + '。', card);

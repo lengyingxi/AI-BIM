@@ -248,6 +248,13 @@
     const D = { panels: [], circuits: [], conduits: [], risers: [], joints: [], reroutes: {}, state: {}, trunk: null };
     if (!m || !m.walls) { E.data = D; return D; }
 
+    /* ★ 旧数据里的改线记录先搬过来 —— 铺管时 detourAt 要看它来决定"绕到多高"。
+       以前是铺完才搬，于是几何按老规矩拍一个标高（2.27），
+       规划却按"避开别的管"给另一个标高（2.47），画面上两条线各走各的。 */
+    if (E.data && E.data.reroutes) {
+      Object.keys(E.data.reroutes).forEach(k => { D.reroutes[k] = E.data.reroutes[k]; });
+    }
+
     const allRooms = m.rooms || [], allWalls = m.walls || [];
     const floors = (m.floors || []).slice().sort((a, b) => a.level - b.level);
     const byId = {};
@@ -338,12 +345,41 @@
     function detourAt(wall, g, z, sec, circ, layer, room) {
       if (!circ) return;
       const half = (sec.s || 0) / 2;
-      const up = g.top + 0.12 + half + 0.03;
-      const dn = g.sill - 0.12 - half - 0.03;
       const hMax = (wall.h || 3) - 0.10;
       let zr = null;
-      if (up <= hMax) zr = up;
-      else if (dn >= 0.08) zr = dn;
+
+      /* ★ 先看"规划"怎么说的：开门/开窗时已经算过一个真正避开别的线管的标高，
+         并且记在 D.reroutes 里。几何必须照着它画，否则规划一条线、实际一条线，
+         用户看到的就是"绿色改道叠在别的管子上、管子还是照老路走"。
+         记录按"同墙 + 同回路 + 洞口对得上"找（重建后线管会换 id，不能按 id 找）。 */
+      const rec = Object.keys(D.reroutes || {}).map(k => D.reroutes[k]).find(r =>
+        r && r.wall === wall.id && r.circuit === circ.id && r.hole && r.z != null &&
+        r.hole.at0 <= g.at0 + 0.25 && r.hole.at1 >= g.at1 - 0.25);
+      if (rec) zr = rec.z;
+
+      if (zr == null) {
+        /* 没规划过（比如这扇门是模型里本来就有的）：按老规矩取洞口上/下最近的空位，
+           但要避开**同一面墙上已经铺好的**别的线管，别把绕行段怼到人家身上。 */
+        const a0 = axis(wall);
+        const bands = [];
+        D.conduits.forEach(o => {
+          if (!o || o.circuit === circ.id || o.wall !== wall.id) return;
+          const sp = spanOnWall(wall, o, a0);
+          if (!sp) return;
+          if (sp.a1 <= g.at0 - 0.20 || sp.a0 >= g.at1 + 0.20) return;
+          bands.push([sp.s0 - 0.03, sp.s1 + 0.03]);
+        });
+        const clear2 = z2 => !bands.some(b => z2 + half + 0.03 > b[0] && z2 - half - 0.03 < b[1]);
+        const up0 = g.top + 0.12 + half + 0.03;
+        let zp = up0;
+        while (zp <= hMax && !clear2(zp)) zp += 0.04;
+        if (zp <= hMax) zr = zp;
+        else {
+          let zd = g.sill - 0.12 - half - 0.03;
+          while (zd >= 0.08 && !clear2(zd)) zd -= 0.04;
+          if (zd >= 0.08) zr = zd;
+        }
+      }
       if (zr == null) return;                       // 上下都翻不过去，只能留缺口
       if (Math.abs(zr - z) < 0.02) return;          // 洞口本身就比管高，不用绕
       const a = axis(wall);
@@ -864,19 +900,17 @@
     D.circuits.forEach(c => { c.on = prevC[c.id] !== false; });
     D.panels.forEach(p => { p.mainOn = prevP[p.id] !== false; });
 
-    /* 改线记录也要跟着活下来。
+    /* 改线记录活过重建。
        ★ 这里修的是"撤掉门再点回来就判碰撞"的根子：reroutes 原来只活在 E.data 里，
          E.rebuild() 一跑（开窗、打通、改尺寸、导入模型……任何一次重建都会跑）就整包清零。
-         于是墙上那扇门明明是"牵着线开出来的"，过一会儿再校核又变成"墙里有管、撞"，
-         用户看到的就是"刚才还能开，现在怎么撞了"。
-         现在重建时按 conduit id 把还存在的记录带过来；管子没了（墙被拆）就自然丢掉。 */
-    const prevR = (E.data && E.data.reroutes) || {};
-    const wallIds = {};
-    (D.conduits || []).forEach(c => { if (c.wall) wallIds[c.wall] = 1; });
-    Object.keys(prevR).forEach(id => {
-      const r = prevR[id];
-      /* 管子还在、或者这面墙还在（管子只是被洞口切成了新 id）→ 记录留着 */
-      if (D.conduits.some(c => c.id === id) || (r && r.wall && wallIds[r.wall])) D.reroutes[id] = r;
+         于是墙上那扇门明明是"牵着线开出来的"，过一会儿再校核又变成"墙里有管、撞"。
+         记录在开头就已经搬进 D.reroutes 了（铺管要用），这里只做清理：
+         墙都没了的记录留着没意义。 */
+    const wallSet = {};
+    (m.walls || []).forEach(w => { wallSet[w.id] = 1; });
+    Object.keys(D.reroutes || {}).forEach(k => {
+      const r = D.reroutes[k];
+      if (!r || (r.wall && !wallSet[r.wall])) delete D.reroutes[k];
     });
 
     applyLive(D);
@@ -1005,7 +1039,7 @@
   /* 某根线管在某个洞口的绕行方案
      往洞顶以上或洞底以下翻过去——真实施工就是"上翻/下翻"。
      哪边近走哪边；近了会顶梁或贴地就换另一边；两边都不行就明确说不行。 */
-  E.planReroute = function (c, hole) {
+  E.planReroute = function (c, hole, avoid) {
     const wall = (M().walls || []).find(w => w.id === c.wall);
     if (!wall || !c) return { ok: false, why: '找不到这根线管所在的墙' };
 
@@ -1024,10 +1058,27 @@
       const right = hole.at1 + GUARD + half;        // 让到洞口右边
       const lo = 0.10, hi = (a.L || 3) - 0.10;
       const okL = left >= lo, okR = right <= hi;
+      /* 让到洞口旁边时别撞上同一面墙上别的竖管：它俩的 at 太近就等于两根管叠在一起 */
+      const nearVert = at2 => (E.data.conduits || []).some(o => {
+        if (!o || o.id === c.id || !o.vert || o.wall !== wall.id) return false;
+        const sp2 = spanOnWall(wall, o, a);
+        return sp2 && Math.abs(sp2.at - at2) < 0.12;
+      });
+      const shift = (at2, sign) => {
+        let v = at2;
+        for (let i = 0; i < 6 && nearVert(v); i++) v += sign * 0.10;
+        return v;
+      };
+      const L2 = at2 => at2 >= lo && at2 <= hi;
       let to = null;
       if (okL && okR) to = (sp.at - left) <= (right - sp.at) ? left : right;
       else if (okL) to = left;
       else if (okR) to = right;
+      if (to != null) {
+        const backup = to;
+        to = shift(to, to < sp.at ? -1 : 1);
+        if (!L2(to)) to = backup;                 // 挪出墙端就退回原方案
+      }
       if (to == null) {
         return {
           ok: false, c: c, hole: hole,
@@ -1050,30 +1101,66 @@
     }
 
     const half = c.s / 2 + 0.03;
-    const up = hole.z1 + 0.12 + half;          // 洞顶以上
-    const dn = hole.z0 - 0.12 - half;          // 洞底以下
-    const upOK = up <= (wall.h || 3) - 0.10;
-    const dnOK = dn >= 0.08;
+    const seg = 0.18;                          // 洞两侧各让出的水平距离
+    const L = axis(wall).L;
+
+    /* ── 绕行标高不能撞别的管子 ──
+       以前只判断"洞顶以上还有没有空间"，于是同一个洞口的三根管会全部被安排到
+       **同一个标高**上：画出来是一条绿线，实际上是三根管叠在一起；
+       旁边紧挨着的那根（比如动力的 2.35 m）也照样贴着走。
+       用户原话："在管线开门汇集处没有考虑所有管线的绕行"。
+       所以先把"这段 at 区间里已经被占掉的标高"收集起来：
+         · 同一面墙上别的线管（含竖管的上下区间）
+         · 这一轮已经排好的其它绕行（avoid）
+       再在这个区间里找一个真正空着的标高。 */
+    const bands = [];
+    const a2 = axis(wall);
+    (E.data.conduits || []).forEach(o => {
+      if (!o || o.id === c.id) return;
+      if (o.wall !== wall.id) return;
+      const sp2 = spanOnWall(wall, o, a2);
+      if (!sp2) return;
+      if (sp2.a1 <= hole.at0 - seg || sp2.a0 >= hole.at1 + seg) return;   // 沿墙不搭界
+      bands.push([sp2.s0 - 0.03, sp2.s1 + 0.03]);
+    });
+    (avoid || []).forEach(b => bands.push(b));
+    const clearOf = (z2, h2) => !bands.some(b => z2 + h2 > b[0] && z2 - h2 < b[1]);
+    const stepPick = (dir2) => {
+      const st = 0.04;
+      if (dir2 === 'up') {
+        let z2 = hole.z1 + 0.12 + half;
+        while (z2 <= (wall.h || 3) - 0.10) { if (clearOf(z2, half)) return z2; z2 += st; }
+        return null;
+      }
+      let z2 = hole.z0 - 0.12 - half;
+      while (z2 >= 0.08) { if (clearOf(z2, half)) return z2; z2 -= st; }
+      return null;
+    };
+    const up = stepPick('up');
+    const dn = stepPick('down');
+
     let dir = null, z = null;
-    if (upOK && dnOK) {
+    if (up != null && dn != null) {
       // 线管本来就在洞上方 → 上翻更顺；否则比距离
       const preferUp = (c.z >= hole.z1) || (Math.abs(up - c.z) <= Math.abs(dn - c.z));
       dir = preferUp ? 'up' : 'down'; z = preferUp ? up : dn;
-    } else if (upOK) { dir = 'up'; z = up; }
-    else if (dnOK) { dir = 'down'; z = dn; }
+    } else if (up != null) { dir = 'up'; z = up; }
+    else if (dn != null) { dir = 'down'; z = dn; }
 
     if (!dir) {
+      const free2 = hole.z1 + 0.12 + half <= (wall.h || 3) - 0.10 || hole.z0 - 0.12 - half >= 0.08;
       return {
         ok: false, c: c, hole: hole,
-        why: '洞口高 ' + fmt(hole.z1 - hole.z0) + ' m，墙净高只有 ' + fmt(wall.h) +
-          ' m，线管上下都翻不过去（上翻要占 ' + fmt(hole.z1 + 0.15) + ' m，下翻要占 ' + fmt(0.15) + ' m）'
+        why: free2
+          ? '洞口顶以上、底以下都被这面墙里别的线管占着，这根管没地方翻过去（' +
+            (bands.length) + ' 处已被占用的标高）'
+          : '洞口高 ' + fmt(hole.z1 - hole.z0) + ' m，墙净高只有 ' + fmt(wall.h) +
+            ' m，线管上下都翻不过去（上翻要占 ' + fmt(hole.z1 + 0.15) + ' m，下翻要占 ' + fmt(0.15) + ' m）'
       };
     }
     /* 绕行折线：从这根管子的**真实起点**走过去，绕完再回到**真实终点**。
        以前只画洞口两侧那一小段，0.36 m 宽贴在墙里，屏幕上几乎看不见，
        用户反馈"改线看不到路线"。现在整根画出来，一眼就知道电改走哪儿了。 */
-    const seg = 0.18;     // 洞两侧各让出的水平距离
-    const L = axis(wall).L;
     const e0 = Math.max(0, c.at0), e1 = Math.min(L, c.at1);
     const pts = [];
     if (e0 < hole.at0 - seg - 0.02) pts.push({ at: e0, z: c.z });

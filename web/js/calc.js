@@ -1118,7 +1118,16 @@
     const E = window.BIM && window.BIM.elec;
     if (!E || !E.planReroute || !conduits || !conduits.length) return null;
     const hole = { at0: at - w / 2, at1: at + w / 2, z0: sill || 0, z1: (sill || 0) + h };
-    const plans = conduits.map(c => E.planReroute(c, hole));
+    /* 一根一根排，后面的避开前面已占的标高（同一洞口的多根管不能排到同一高度） */
+    const avoid = [];
+    const plans = conduits.map(c => {
+      const p2 = E.planReroute(c, hole, avoid);
+      if (p2 && p2.ok) {
+        const hf = (c.s || 0.04) / 2 + 0.04;
+        avoid.push([p2.z - hf, p2.z + hf]);
+      }
+      return p2;
+    });
     return plans.every(p => p && p.ok) ? plans : null;
   }
   C.rerouteForConduits = rerouteForConduits;
